@@ -22,12 +22,12 @@
 
 ---
 
-## Phase 3: Pipeline Transport & Ingress Gateway
-- [ ] Build point-to-point tensor transport worker using gRPC / PyTorch distributed RPC.
-- [ ] Implement layer-forwarding loop:
+## Phase 3: Pipeline Transport & Ingress Gateway (Complete)
+- [x] Build point-to-point tensor transport protocol (`frontiersplit/protocol.py`).
+- [x] Implement layer-forwarding pipeline worker (`frontiersplit/worker.py`):
   - Node 0 (Input + Embeddings + Layers 0..N) -> Node 1 -> Node 2 -> Node 3 (Output Head).
-- [ ] Implement an OpenAI-compatible API Gateway exposing `/v1/chat/completions`.
-- [ ] Verify basic single-stream and multi-stream text generation on the 4-node cluster.
+- [x] Implement an OpenAI-compatible API Gateway exposing `/v1/chat/completions` (`frontiersplit/gateway.py`).
+- [x] Verify basic single-stream and multi-stream text generation through full 4-stage pipeline tests (`tests/test_pipeline.py`).
 
 ---
 
