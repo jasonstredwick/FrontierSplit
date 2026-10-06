@@ -1,24 +1,24 @@
 # FrontierSplit: Project Roadmap
 
-## Phase 1: Local Foundation & Model Slicer (Current)
+## Phase 1: Local Foundation & Model Slicer (Complete)
 - [x] Configure Git repository, SSH credentials, and remote tracking.
 - [x] Provision GCP Project (`frontiersplit-proto`), link billing, and configure spend alerts.
 - [x] Verify GCP GPU quotas in `us-central1` (16x NVIDIA L4 confirmed).
 - [x] Initialize Python virtual environment (`.venv`) and repository `.gitignore`.
 - [x] Formalize `ARCHITECTURE.md` and `ROADMAP.md`.
-- [ ] Build **Model Slicer & Memory Profiler** (`frontiersplit/slicer.py`):
+- [x] Build **Model Slicer & Memory Profiler** (`frontiersplit/slicer.py`):
   - Read arbitrary HuggingFace model architectures (Mixtral 8x7B, Qwen2-57B-A14B, DeepSeek V2/V3).
   - Calculate exact parameter byte sizes for Attention ($Q, K, V, O$) and FFN/MoE matrices ($W_{gate}, W_{up}, W_{down}$).
   - Output partition plans for clusters of arbitrary GPU counts and VRAM capacities.
 
 ---
 
-## Phase 2: Cloud Cluster Provisioning (GCP)
-- [ ] Create reproducible cluster automation (Terraform or `gcloud` provisioning script):
-  - 4x `g2-standard-4` instances with NVIDIA L4 (24GB VRAM each) in `us-central1`.
-  - VPC network configuration with internal low-latency firewall rules.
-  - Startup scripts for NVIDIA drivers, CUDA, PyTorch, and environment dependencies.
-- [ ] Implement start/stop automation to preserve credits when not testing.
+## Phase 2: Cloud Cluster Provisioning Automation (Complete)
+- [x] Create reproducible cluster automation (`scripts/cluster_up.sh`):
+  - 4x `g2-standard-4` instances with NVIDIA L4 (24GB VRAM each) in `us-central1-a`.
+  - VPC network configuration with internal low-latency firewall rules (`frontiersplit-internal-mesh`).
+  - Startup scripts for NVIDIA drivers, CUDA, PyTorch, and environment dependencies (`scripts/startup_node.sh`).
+- [x] Implement start/stop/down automation to preserve credits when not testing (`scripts/cluster_stop.sh`, `scripts/cluster_down.sh`, `scripts/cluster_status.sh`).
 
 ---
 
