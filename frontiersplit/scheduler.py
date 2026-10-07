@@ -273,7 +273,7 @@ class PipelineScheduler:
             # Advance step and re-enqueue for next autoregressive decode step
             req.current_step += 1
             req.is_prefill = False
-            req.input_tokens = [gen_result.token_id]
+            req.input_tokens = req.prompt_tokens + req.generated_tokens
             await self.ready_queue.put(req)
 
     def _finalize_request(self, req: ScheduledRequest) -> None:

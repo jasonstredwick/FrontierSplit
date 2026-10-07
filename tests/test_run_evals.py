@@ -89,6 +89,35 @@ class TestRunEvals(unittest.TestCase):
                 self.assertTrue(os.path.exists(os.path.join(tmpdir, "eval_summary.json")))
                 self.assertTrue(os.path.exists(os.path.join(tmpdir, "eval_report.md")))
 
+    def test_run_suite_multi_run_stats(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("benchmarks.eval_ifeval.IFEvalRunner.run_evaluation", new_callable=AsyncMock) as mock_ifeval:
+                mock_ifeval.side_effect = [
+                    {"strict_prompt_accuracy": 60.0, "loose_prompt_accuracy": 70.0, "strict_instruction_accuracy": 65.0, "loose_instruction_accuracy": 75.0, "throughput_tok_per_sec": 100.0, "bubble_elimination_pct": 50.0},
+                    {"strict_prompt_accuracy": 64.0, "loose_prompt_accuracy": 74.0, "strict_instruction_accuracy": 69.0, "loose_instruction_accuracy": 79.0, "throughput_tok_per_sec": 120.0, "bubble_elimination_pct": 50.0},
+                    {"strict_prompt_accuracy": 62.0, "loose_prompt_accuracy": 72.0, "strict_instruction_accuracy": 67.0, "loose_instruction_accuracy": 77.0, "throughput_tok_per_sec": 110.0, "bubble_elimination_pct": 50.0},
+                ]
+
+                summary = asyncio.run(
+                    run_suite(
+                        base_url="http://mock-gw/v1",
+                        gateway_url="http://mock-gw",
+                        benchmarks="ifeval",
+                        concurrency=2,
+                        num_runs=3,
+                        output_dir=tmpdir,
+                    )
+                )
+
+                self.assertEqual(summary["num_runs"], 3)
+                self.assertIn("aggregated_statistics", summary)
+                if_stats = summary["aggregated_statistics"]["ifeval"]
+                self.assertEqual(if_stats["strict_prompt_accuracy"]["mean"], 62.0)
+                self.assertEqual(if_stats["strict_prompt_accuracy"]["min"], 60.0)
+                self.assertEqual(if_stats["strict_prompt_accuracy"]["max"], 64.0)
+                self.assertEqual(if_stats["throughput_tok_per_sec"]["mean"], 110.0)
+                self.assertTrue(os.path.exists(os.path.join(tmpdir, "eval_report.md")))
+
 
 if __name__ == "__main__":
     unittest.main()

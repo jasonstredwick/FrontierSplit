@@ -81,6 +81,8 @@ def create_worker_app(
 
         base_model = getattr(full_model, "model", getattr(full_model, "transformer", full_model))
         all_layers = getattr(base_model, "layers", getattr(base_model, "h", []))
+        raw_rotary = getattr(base_model, "rotary_emb", None)
+        rotary_emb = raw_rotary.to(resolved_device) if raw_rotary is not None else None
 
         if is_first_stage:
             raw_embed = getattr(base_model, "embed_tokens", getattr(base_model, "wte", None))
@@ -139,9 +141,19 @@ def create_worker_app(
                     arr = packet.get_tensor()
                     hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
 
+                # Compute position embeddings if rotary embedding is used
+                seq_len = hidden_states.shape[1]
+                pos_emb = None
+                if rotary_emb is not None:
+                    position_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
+                    pos_emb = rotary_emb(hidden_states, position_ids)
+
                 # Forward through assigned transformer layers
                 for layer in assigned_layers:
-                    layer_out = layer(hidden_states)
+                    if pos_emb is not None:
+                        layer_out = layer(hidden_states, position_embeddings=pos_emb)
+                    else:
+                        layer_out = layer(hidden_states)
                     hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
                 stage_compute_ms = (time.time() - start_time) * 1000
