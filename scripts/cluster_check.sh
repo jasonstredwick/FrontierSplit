@@ -37,6 +37,7 @@ QUICK_MODE=false
 SHOW_LOGS=false
 RUN_SMOKE=true
 OUTPUT_JSON=false
+PULL_UPDATE=false
 
 for arg in "$@"; do
   case "$arg" in
@@ -56,10 +57,14 @@ for arg in "$@"; do
     --json)
       OUTPUT_JSON=true
       ;;
+    --pull)
+      PULL_UPDATE=true
+      ;;
     --help|-h)
       echo "Usage: ./scripts/cluster_check.sh [OPTIONS]"
       echo ""
       echo "Options:"
+      echo "  --pull        Pull latest git commits on all nodes and restart services"
       echo "  --quick       Run fast HTTP/telemetry checks only (skip SSH and smoke test)"
       echo "  --smoke       Run end-to-end inference verification (enabled by default)"
       echo "  --no-smoke    Skip end-to-end inference verification"
@@ -146,6 +151,66 @@ if [ "${OUTPUT_JSON}" = true ]; then
 }
 EOF
   exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Cluster Synchronization & Service Restart (--pull)
+# ------------------------------------------------------------------------------
+if [ "${PULL_UPDATE}" = true ]; then
+  print_header "Synchronizing Codebase & Restarting Services across Cluster"
+  
+  # Restart from downstream stage up to stage 0
+  for node_idx in $(seq ${NUM_NODES} -1 1); do
+    NODE_IP=$(get_node_ip "${node_idx}")
+    print_info "Syncing Node ${node_idx} (${NODE_IP})..."
+    
+    PULL_CMD="sudo chown -R \$(whoami):\$(whoami) /opt/FrontierSplit 2>/dev/null || true; git config --global --add safe.directory /opt/FrontierSplit 2>/dev/null || true; cd /opt/FrontierSplit && git pull origin main"
+    PULL_OUT=$(ssh_cmd "${NODE_IP}" "${PULL_CMD}" || true)
+    echo -e "    * Git Pull: $(echo "${PULL_OUT}" | tail -n 1)"
+    
+    # Restart services
+    RESTART_CMD="systemctl --user restart fs-worker"
+    if [ "${node_idx}" -eq 1 ]; then
+      RESTART_CMD="systemctl --user restart fs-worker fs-gateway"
+    fi
+    ssh_cmd "${NODE_IP}" "${RESTART_CMD}" || true
+    print_ok "Restarted services on Node ${node_idx}"
+  done
+
+  print_info "Waiting for cluster stages to become healthy after restart..."
+  for node_idx in $(seq ${NUM_NODES} -1 1); do
+    NODE_IP=$(get_node_ip "${node_idx}")
+    PORT="${WORKER_PORT}"
+    HEALTH_KEY='"status":"healthy"'
+    READY=false
+    for attempt in $(seq 1 45); do
+      RES=$(curl -s --connect-timeout 2 "http://${NODE_IP}:${PORT}/health" 2>/dev/null || true)
+      if echo "${RES}" | grep -q "${HEALTH_KEY}"; then
+        READY=true
+        print_ok "Node ${node_idx} worker is ready!"
+        break
+      fi
+      sleep 2
+    done
+    if [ "${READY}" = false ]; then
+      print_fail "Node ${node_idx} failed to become healthy within 90s"
+    fi
+  done
+
+  # Also check gateway if Node 1
+  GW_READY=false
+  for attempt in $(seq 1 30); do
+    RES=$(curl -s --connect-timeout 2 "http://${NODE_1_IP}:${GATEWAY_PORT}/health" 2>/dev/null || true)
+    if echo "${RES}" | grep -q '"gateway":"healthy"'; then
+      GW_READY=true
+      print_ok "Ingress Gateway is ready!"
+      break
+    fi
+    sleep 2
+  done
+  if [ "${GW_READY}" = false ]; then
+    print_fail "Ingress Gateway failed to become healthy within 60s"
+  fi
 fi
 
 # ------------------------------------------------------------------------------
