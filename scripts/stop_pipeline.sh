@@ -7,7 +7,8 @@ source "${SCRIPT_DIR}/env.sh"
 
 echo "=== Stopping FrontierSplit Services on Cluster ==="
 
-for NODE in frontiersplit-node-1 frontiersplit-node-2 frontiersplit-node-3; do
+for i in $(seq 1 ${NUM_NODES}); do
+    NODE="${NODE_PREFIX}-${i}"
     echo "Stopping services on ${NODE}..."
     ${GCLOUD} compute ssh "${NODE}" --zone="${ZONE}" --project="${PROJECT_ID}" --tunnel-through-iap \
       --command="systemctl --user stop fs-worker fs-gateway 2>/dev/null || true" &

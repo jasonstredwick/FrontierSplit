@@ -2,8 +2,8 @@
 # FrontierSplit: Cluster Configuration & Environment Variables
 
 PROJECT_ID="frontiersplit-proto"
-REGION="us-east4"
-ZONE="us-east4-a"
+REGION="us-central1"
+ZONE="us-central1-a"
 NUM_NODES=4
 MACHINE_TYPE="g2-standard-4"
 ACCELERATOR="type=nvidia-l4,count=1"
