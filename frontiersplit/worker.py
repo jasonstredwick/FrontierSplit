@@ -18,7 +18,12 @@ from fastapi import FastAPI, HTTPException
 import uvicorn
 
 from frontiersplit.models import resolve_model_spec
-from frontiersplit.protocol import ActivationPacket, GenerationResponse
+from frontiersplit.protocol import (
+    ActivationPacket,
+    BatchedActivationPacket,
+    BatchedGenerationResponse,
+    GenerationResponse,
+)
 
 # Optional PyTorch and Hugging Face imports
 try:
@@ -262,6 +267,156 @@ def create_worker_app(
                     text=mock_word,
                     is_finished=(packet.sequence_step >= 32),
                     latency_ms=elapsed_ms,
+                    stage_timings=timings,
+                )
+
+    @app.post("/forward_batched", response_model=BatchedGenerationResponse)
+    def forward_batched(packet: BatchedActivationPacket):
+        start_time = time.time()
+        batch_size = len(packet.request_ids)
+
+        if use_real_model:
+            with torch.no_grad():
+                if is_first_stage and packet.tokens_batch:
+                    token_tensor = torch.tensor(packet.tokens_batch, device=resolved_device, dtype=torch.long)
+                    hidden_states = embed_tokens(token_tensor)
+                else:
+                    arr = packet.get_tensor()
+                    hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
+
+                seq_len = hidden_states.shape[1]
+                pos_emb = None
+                if rotary_emb is not None:
+                    if packet.attention_mask:
+                        mask_tensor = torch.tensor(packet.attention_mask, device=resolved_device, dtype=torch.long)
+                        position_ids = (mask_tensor.cumsum(dim=-1) - 1).clamp(min=0)
+                    else:
+                        position_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0).expand(batch_size, -1)
+                    pos_emb = rotary_emb(hidden_states, position_ids)
+
+                for layer in assigned_layers:
+                    if pos_emb is not None:
+                        layer_out = layer(hidden_states, position_embeddings=pos_emb)
+                    else:
+                        layer_out = layer(hidden_states)
+                    hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+
+                stage_compute_ms = (time.time() - start_time) * 1000
+                timings = dict(packet.stage_timings)
+                timings[f"stage_{stage_id}_compute_ms"] = stage_compute_ms
+
+                if not is_final_stage:
+                    if not downstream_url:
+                        raise HTTPException(status_code=500, detail="Missing downstream_url for intermediate stage")
+
+                    next_act = hidden_states.detach().cpu().to(torch.float32).numpy()
+                    next_packet = BatchedActivationPacket(
+                        request_ids=packet.request_ids,
+                        sequence_steps=packet.sequence_steps,
+                        stage_id=stage_id + 1,
+                        is_prefill=packet.is_prefill,
+                        attention_mask=packet.attention_mask,
+                        stage_timings=timings,
+                    )
+                    next_packet.set_tensor(next_act)
+
+                    try:
+                        resp = requests.post(f"{downstream_url}/forward_batched", json=next_packet.model_dump(), timeout=600)
+                        resp.raise_for_status()
+                        return resp.json()
+                    except Exception as e:
+                        raise HTTPException(status_code=502, detail=f"Downstream batched handoff to {downstream_url} failed: {e}")
+
+                else:
+                    if final_norm is not None:
+                        hidden_states = final_norm(hidden_states)
+
+                    last_token_hidden = hidden_states[:, -1, :]  # shape: [B, hidden_size]
+                    logits = lm_head(last_token_hidden)  # shape: [B, vocab_size]
+
+                    next_token_ids = torch.argmax(logits, dim=-1).tolist()
+                    elapsed_ms = (time.time() - start_time) * 1000
+
+                    responses = []
+                    for req_id, seq_step, next_tok in zip(packet.request_ids, packet.sequence_steps, next_token_ids):
+                        if tokenizer is not None:
+                            decoded_text = tokenizer.decode([next_tok])
+                            is_finished = (next_tok in model_spec.stop_token_ids) or (seq_step >= model_spec.context_window)
+                        else:
+                            decoded_text = f"tok_{next_tok % 100} "
+                            is_finished = False
+
+                        responses.append(
+                            GenerationResponse(
+                                request_id=req_id,
+                                token_id=next_tok,
+                                text=decoded_text,
+                                is_finished=is_finished,
+                                latency_ms=elapsed_ms,
+                                stage_timings=timings,
+                            )
+                        )
+
+                    return BatchedGenerationResponse(
+                        responses=responses,
+                        batch_size=len(responses),
+                        stage_timings=timings,
+                    )
+
+        else:
+            # Synthetic batched matrix compute
+            if is_first_stage and packet.tokens_batch:
+                tokens_arr = np.array(packet.tokens_batch)
+                activation = embeddings[tokens_arr]
+            else:
+                activation = packet.get_tensor()
+
+            activation = np.matmul(activation, layer_proj)
+            stage_compute_ms = (time.time() - start_time) * 1000
+            timings = dict(packet.stage_timings)
+            timings[f"stage_{stage_id}_compute_ms"] = stage_compute_ms
+
+            if not is_final_stage:
+                if not downstream_url:
+                    raise HTTPException(status_code=500, detail="Missing downstream_url for intermediate stage")
+
+                next_packet = BatchedActivationPacket(
+                    request_ids=packet.request_ids,
+                    sequence_steps=packet.sequence_steps,
+                    stage_id=stage_id + 1,
+                    is_prefill=packet.is_prefill,
+                    attention_mask=packet.attention_mask,
+                    stage_timings=timings,
+                )
+                next_packet.set_tensor(activation)
+
+                try:
+                    resp = requests.post(f"{downstream_url}/forward_batched", json=next_packet.model_dump(), timeout=30)
+                    resp.raise_for_status()
+                    return resp.json()
+                except Exception as e:
+                    raise HTTPException(status_code=502, detail=f"Downstream batched handoff to {downstream_url} failed: {e}")
+
+            else:
+                last_token_hidden = activation[:, -1, :]
+                logits = np.matmul(last_token_hidden, lm_head_synth)
+                next_token_ids = np.argmax(logits, axis=-1).tolist()
+                elapsed_ms = (time.time() - start_time) * 1000
+
+                responses = [
+                    GenerationResponse(
+                        request_id=req_id,
+                        token_id=tok,
+                        text=f"tok_{tok % 100} ",
+                        is_finished=(seq_step >= 32),
+                        latency_ms=elapsed_ms,
+                        stage_timings=timings,
+                    )
+                    for req_id, seq_step, tok in zip(packet.request_ids, packet.sequence_steps, next_token_ids)
+                ]
+                return BatchedGenerationResponse(
+                    responses=responses,
+                    batch_size=len(responses),
                     stage_timings=timings,
                 )
 

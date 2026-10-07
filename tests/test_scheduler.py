@@ -103,16 +103,36 @@ class TestConcurrentScheduler(unittest.TestCase):
             class MockResp:
                 status_code = 200
                 def json(self):
-                    step = json.get("sequence_step", 0)
-                    req_id = json.get("request_id", "")
-                    return {
-                        "request_id": req_id,
-                        "token_id": 100 + step,
-                        "text": f"ans_{req_id[-4:]} ",
-                        "is_finished": False,
-                        "latency_ms": 1.5,
-                        "stage_timings": {},
-                    }
+                    if "request_ids" in json:
+                        req_ids = json.get("request_ids", [])
+                        seq_steps = json.get("sequence_steps", [0] * len(req_ids))
+                        responses = [
+                            {
+                                "request_id": r_id,
+                                "token_id": 100 + s,
+                                "text": f"ans_{r_id[-4:]} ",
+                                "is_finished": False,
+                                "latency_ms": 1.5,
+                                "stage_timings": {},
+                            }
+                            for r_id, s in zip(req_ids, seq_steps)
+                        ]
+                        return {
+                            "responses": responses,
+                            "batch_size": len(responses),
+                            "stage_timings": {},
+                        }
+                    else:
+                        step = json.get("sequence_step", 0)
+                        req_id = json.get("request_id", "")
+                        return {
+                            "request_id": req_id,
+                            "token_id": 100 + step,
+                            "text": f"ans_{req_id[-4:]} ",
+                            "is_finished": False,
+                            "latency_ms": 1.5,
+                            "stage_timings": {},
+                        }
                 def raise_for_status(self):
                     pass
             return MockResp()

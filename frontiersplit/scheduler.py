@@ -14,7 +14,12 @@ import requests
 from pydantic import BaseModel, Field
 
 from frontiersplit.models import resolve_model_spec
-from frontiersplit.protocol import ActivationPacket, GenerationResponse
+from frontiersplit.protocol import (
+    ActivationPacket,
+    BatchedActivationPacket,
+    BatchedGenerationResponse,
+    GenerationResponse,
+)
 
 
 class ScheduledRequest:
@@ -122,11 +127,13 @@ class PipelineScheduler:
         num_workers: int = 8,
         total_stages: int = 4,
         tokenizer: Optional[Any] = None,
+        max_batch_size: int = 16,
     ):
         self.stage0_url = stage0_url
         self.num_workers = num_workers
         self.total_stages = total_stages
         self.tokenizer = tokenizer
+        self.max_batch_size = max_batch_size
 
         self.active_requests: Dict[str, ScheduledRequest] = {}
         self.ready_queue: asyncio.Queue[ScheduledRequest] = asyncio.Queue()
@@ -216,24 +223,116 @@ class PipelineScheduler:
         return req
 
     async def _worker_loop(self, worker_id: int) -> None:
-        """Continuous pipeline step dispatcher worker."""
+        """Continuous pipeline step dispatcher worker with continuous batching."""
         while self.is_running:
             try:
-                req = await self.ready_queue.get()
+                first_req = await self.ready_queue.get()
             except asyncio.CancelledError:
                 break
 
+            # Dynamic Continuous Batching: drain pending requests up to max_batch_size
+            batch = [first_req]
+            while len(batch) < self.max_batch_size and not self.ready_queue.empty():
+                try:
+                    next_req = self.ready_queue.get_nowait()
+                    batch.append(next_req)
+                except asyncio.QueueEmpty:
+                    break
+
             try:
-                await self._execute_step(req)
+                if len(batch) == 1:
+                    await self._execute_step(batch[0])
+                else:
+                    await self._execute_batched_step(batch)
             except Exception as e:
-                req.error = str(e)
+                for req in batch:
+                    req.error = str(e)
+                    req.is_finished = True
+                    if req.stream:
+                        await req.stream_queue.put(None)
+                    req.done_event.set()
+                    self._finalize_request(req)
+            finally:
+                for _ in batch:
+                    self.ready_queue.task_done()
+
+    async def _execute_batched_step(self, batch: List[ScheduledRequest]) -> None:
+        """Execute a batched forward pass across all requests in the batch."""
+        max_len = max(len(r.input_tokens) for r in batch)
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self.tokenizer, "eos_token_id", None) or 0
+
+        padded_tokens = []
+        attention_masks = []
+        for r in batch:
+            pad_len = max_len - len(r.input_tokens)
+            padded_tokens.append([pad_id] * pad_len + r.input_tokens)
+            attention_masks.append([0] * pad_len + [1] * len(r.input_tokens))
+
+        packet = BatchedActivationPacket(
+            request_ids=[r.request_id for r in batch],
+            sequence_steps=[r.current_step for r in batch],
+            stage_id=0,
+            is_prefill=any(r.is_prefill for r in batch),
+            tokens_batch=padded_tokens,
+            attention_mask=attention_masks,
+        )
+
+        def _post_batched() -> Dict[str, Any]:
+            resp = requests.post(f"{self.stage0_url}/forward_batched", json=packet.model_dump(), timeout=600)
+            resp.raise_for_status()
+            return resp.json()
+
+        step_start = time.time()
+        result_dict = await asyncio.to_thread(_post_batched)
+        if "responses" in result_dict:
+            batched_result = BatchedGenerationResponse.model_validate(result_dict)
+        elif "token_id" in result_dict:
+            single_res = GenerationResponse.model_validate(result_dict)
+            batched_result = BatchedGenerationResponse(responses=[single_res], batch_size=1)
+        else:
+            batched_result = BatchedGenerationResponse.model_validate(result_dict)
+        step_latency = (time.time() - step_start) * 1000
+
+        # Update telemetry
+        self.total_tokens_generated += len(batched_result.responses)
+        self.step_latencies.append(step_latency)
+        if len(self.step_latencies) > 200:
+            self.step_latencies.pop(0)
+
+        # Map responses back to requests
+        response_map = {r.request_id: r for r in batched_result.responses}
+        for req in batch:
+            gen_result = response_map.get(req.request_id)
+            if not gen_result:
+                continue
+
+            req.generated_tokens.append(gen_result.token_id)
+            req.generated_chunks.append(gen_result.text)
+            req.step_latencies.append(step_latency)
+            req.stage_timings.append(gen_result.stage_timings)
+
+            if req.stream:
+                chunk = req.to_chunk_dict(gen_result.text, finish_reason=None)
+                await req.stream_queue.put(chunk)
+
+            # Check termination condition
+            reached_max = (req.max_tokens is not None and req.current_step >= req.max_tokens - 1)
+            if gen_result.is_finished or reached_max:
                 req.is_finished = True
+                req.finish_reason = "stop" if gen_result.is_finished else "length"
                 if req.stream:
+                    finish_chunk = req.to_chunk_dict("", finish_reason=req.finish_reason)
+                    await req.stream_queue.put(finish_chunk)
                     await req.stream_queue.put(None)
                 req.done_event.set()
                 self._finalize_request(req)
-            finally:
-                self.ready_queue.task_done()
+            else:
+                req.current_step += 1
+                req.is_prefill = False
+                req.input_tokens = req.prompt_tokens + req.generated_tokens
+                await self.ready_queue.put(req)
 
     async def _execute_step(self, req: ScheduledRequest) -> None:
         """Execute a single pipeline forward pass for a request."""
