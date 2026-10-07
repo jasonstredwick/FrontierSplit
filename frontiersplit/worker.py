@@ -175,7 +175,7 @@ def create_worker_app(
                     next_packet.set_tensor(next_act)
 
                     try:
-                        resp = requests.post(f"{downstream_url}/forward", json=next_packet.model_dump(), timeout=30)
+                        resp = requests.post(f"{downstream_url}/forward", json=next_packet.model_dump(), timeout=180)
                         resp.raise_for_status()
                         return resp.json()
                     except Exception as e:
@@ -195,10 +195,11 @@ def create_worker_app(
                     if tokenizer is not None:
                         decoded_text = tokenizer.decode([next_token_id])
                         eos_id = getattr(tokenizer, "eos_token_id", None)
-                        is_finished = (next_token_id == eos_id) or (packet.sequence_step >= 256)
+                        # Natural termination on EOS token (scheduler enforces max_tokens)
+                        is_finished = (next_token_id == eos_id)
                     else:
                         decoded_text = f"tok_{next_token_id % 100} "
-                        is_finished = (packet.sequence_step >= 32)
+                        is_finished = False
 
                     return GenerationResponse(
                         request_id=packet.request_id,

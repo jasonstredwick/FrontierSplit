@@ -33,8 +33,7 @@ NUM_RUNS="${2:-3}"
 CONCURRENCY="${3:-4}"
 EXP_ID="${4:-20261007_mistral7b_fp16_2x_t4}"
 
-# Configuration
-NODE_1_IP="${NODE_1_IP:-136.80.22.76}"
+# Configuration (sourced dynamically from cluster_config.json via env.sh)
 GATEWAY_PORT="${GATEWAY_PORT:-8000}"
 BASE_URL="http://${NODE_1_IP}:${GATEWAY_PORT}/v1"
 GATEWAY_URL="http://${NODE_1_IP}:${GATEWAY_PORT}"

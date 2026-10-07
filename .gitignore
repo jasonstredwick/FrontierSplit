@@ -58,3 +58,9 @@ data/
 wandb/
 .system_generated/
 eval_results/
+
+# Cluster & Hardware Configuration (Dynamic Ephemeral State)
+cluster_config.json
+.env.cluster
+*.local.json
+

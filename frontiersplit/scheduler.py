@@ -25,7 +25,7 @@ class ScheduledRequest:
         model: str,
         prompt_text: str,
         prompt_tokens: List[int],
-        max_tokens: int = 64,
+        max_tokens: int = 512,
         temperature: float = 0.7,
         stream: bool = False,
         tokenizer: Optional[Any] = None,
@@ -161,7 +161,7 @@ class PipelineScheduler:
         self,
         model: str,
         messages: List[Any],
-        max_tokens: int = 64,
+        max_tokens: int = 512,
         temperature: float = 0.7,
         stream: bool = False,
     ) -> ScheduledRequest:
@@ -238,7 +238,7 @@ class PipelineScheduler:
 
         # Offload blocking HTTP call to Stage 0 so async loop remains responsive
         def _post_forward() -> Dict[str, Any]:
-            resp = requests.post(f"{self.stage0_url}/forward", json=packet.model_dump(), timeout=30)
+            resp = requests.post(f"{self.stage0_url}/forward", json=packet.model_dump(), timeout=180)
             resp.raise_for_status()
             return resp.json()
 

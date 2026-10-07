@@ -24,11 +24,11 @@ else
   exit 1
 fi
 
-# Configuration defaults
-NODE_1_IP="${NODE_1_IP:-136.80.22.76}"
-NODE_2_IP="${NODE_2_IP:-34.30.176.33}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/google_compute_engine}"
-SSH_USER="${SSH_USER:-pixel}"
+# Configuration defaults (sourced dynamically from cluster_config.json via env.sh)
+NODE_1_IP="${NODE_1_IP}"
+NODE_2_IP="${NODE_2_IP}"
+SSH_KEY="${SSH_KEY}"
+SSH_USER="${SSH_USER}"
 GATEWAY_PORT="${GATEWAY_PORT:-8000}"
 WORKER_PORT="${WORKER_PORT:-50051}"
 

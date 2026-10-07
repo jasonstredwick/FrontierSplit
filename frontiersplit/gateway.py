@@ -30,9 +30,10 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str = "frontiersplit-mixtral-8x7b"
     messages: List[ChatMessage]
-    max_tokens: int = 64
+    max_tokens: int = 512
     temperature: float = 0.7
     stream: bool = False
+
 
 
 class CompletionChoice(BaseModel):

@@ -214,6 +214,7 @@ async def run_single_pass(
     model: str,
     benchmarks: str,
     concurrency: int,
+    max_tokens: int = 512,
 ) -> Dict[str, Any]:
     """Execute a single pass of the selected benchmarks."""
     run_start = time.time()
@@ -225,12 +226,14 @@ async def run_single_pass(
     if benchmarks in ("ifeval", "all"):
         print("\n  [Trial] Starting IFEval Evaluation Phase...")
         runner = IFEvalRunner(base_url=base_url, model=model, concurrency=concurrency)
-        ifeval_results = await runner.run_evaluation()
+        ifeval_results = await runner.run_evaluation(max_tokens=max_tokens)
 
     if benchmarks in ("swebench", "all"):
         print("\n  [Trial] Starting SWE-bench Lite Evaluation Phase...")
         runner = SWEBenchAgentRunner(base_url=base_url, model=model, concurrency=concurrency)
-        swebench_results = await runner.run_evaluation()
+        tokens_per_step = max(128, max_tokens // 4)
+        swebench_results = await runner.run_evaluation(tokens_per_step=tokens_per_step)
+
 
     telemetry_after = fetch_gateway_telemetry(gateway_url)
     duration_s = time.time() - run_start
@@ -252,6 +255,7 @@ async def run_suite(
     benchmarks: str = "all",
     concurrency: int = 4,
     num_runs: int = 1,
+    max_tokens: int = 512,
     output_dir: str = "eval_results",
     experiment_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -261,7 +265,7 @@ async def run_suite(
 
     print(f"\n============================================================================")
     print(f" FrontierSplit Benchmark Suite: {num_runs} Runs (Concurrency M={concurrency})")
-    print(f" Model: {model} | Benchmarks: {benchmarks}")
+    print(f" Model: {model} | Benchmarks: {benchmarks} | Max Tokens: {max_tokens}")
     print(f"============================================================================")
 
     for run_idx in range(1, num_runs + 1):
@@ -272,6 +276,7 @@ async def run_suite(
             model=model,
             benchmarks=benchmarks,
             concurrency=concurrency,
+            max_tokens=max_tokens,
         )
         trial_data["run_index"] = run_idx
         runs_data.append(trial_data)
@@ -381,28 +386,69 @@ async def run_suite(
 
 def main():
     parser = argparse.ArgumentParser(description="FrontierSplit Unified Benchmark Suite")
-    parser.add_argument("--base-url", type=str, default="http://localhost:8000/v1", help="API Gateway URL")
-    parser.add_argument("--gateway-url", type=str, default="http://localhost:8000", help="Root Gateway URL for telemetry")
-    parser.add_argument("--model", type=str, default="frontiersplit-mixtral-8x7b", help="Model name")
+    parser.add_argument("--base-url", type=str, default=None, help="API Gateway URL")
+    parser.add_argument("--gateway-url", type=str, default=None, help="Root Gateway URL for telemetry")
+    parser.add_argument("--model", type=str, default=None, help="Model name")
     parser.add_argument("--benchmarks", type=str, choices=["ifeval", "swebench", "all"], default="all", help="Benchmarks to execute")
     parser.add_argument("--concurrency", type=int, default=4, help="Concurrent streams")
     parser.add_argument("--num-runs", type=int, default=1, help="Number of repeated runs for statistical relevance")
+    parser.add_argument("--max-tokens", type=int, default=512, help="Max output tokens for generations")
     parser.add_argument("--output-dir", type=str, default="eval_results", help="Directory for evaluation reports")
     parser.add_argument("--experiment-dir", type=str, default=None, help="Path to siloed experiment directory")
     args = parser.parse_args()
 
+    # Auto-load from cluster_config.json if URLs not explicitly passed
+    base_url = args.base_url
+    gateway_url = args.gateway_url
+    model = args.model
+
+    cfg_path = os.environ.get("CLUSTER_CONFIG", "cluster_config.json")
+    if not os.path.isabs(cfg_path):
+        candidate_paths = [
+            cfg_path,
+            os.path.join(os.path.dirname(__file__), "..", cfg_path),
+            os.path.join(os.getcwd(), cfg_path),
+        ]
+    else:
+        candidate_paths = [cfg_path]
+
+    for p in candidate_paths:
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    gw = cfg.get("gateway", {})
+                    host = gw.get("host", "127.0.0.1")
+                    port = gw.get("port", 8000)
+                    if base_url is None:
+                        base_url = f"http://{host}:{port}/v1"
+                    if gateway_url is None:
+                        gateway_url = f"http://{host}:{port}"
+                    if model is None:
+                        model = cfg.get("model_id", "frontiersplit-mixtral-8x7b")
+                    break
+            except Exception:
+                pass
+
+    # Defaults if still unset
+    base_url = base_url or "http://localhost:8000/v1"
+    gateway_url = gateway_url or "http://localhost:8000"
+    model = model or "frontiersplit-mixtral-8x7b"
+
     asyncio.run(
         run_suite(
-            base_url=args.base_url,
-            gateway_url=args.gateway_url,
-            model=args.model,
+            base_url=base_url,
+            gateway_url=gateway_url,
+            model=model,
             benchmarks=args.benchmarks,
             concurrency=args.concurrency,
             num_runs=args.num_runs,
+            max_tokens=args.max_tokens,
             output_dir=args.output_dir,
             experiment_dir=args.experiment_dir,
         )
     )
+
 
 
 if __name__ == "__main__":

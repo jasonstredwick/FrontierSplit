@@ -1,0 +1,38 @@
+{
+  "cluster_name": "frontiersplit-t4-cluster",
+  "provider": "gcp",
+  "project_id": "frontiersplit-proto",
+  "region": "us-central1",
+  "zone": "us-central1-a",
+  "model_id": "mistralai/Mistral-7B-Instruct-v0.3",
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 8000
+  },
+  "nodes": [
+    {
+      "node_id": 1,
+      "name": "frontiersplit-node-1",
+      "stage_id": 0,
+      "external_ip": "127.0.0.1",
+      "internal_ip": "10.128.0.50",
+      "worker_port": 50051,
+      "roles": ["gateway", "stage_0"],
+      "layer_range": [0, 15]
+    },
+    {
+      "node_id": 2,
+      "name": "frontiersplit-node-2",
+      "stage_id": 1,
+      "external_ip": "127.0.0.1",
+      "internal_ip": "10.128.0.49",
+      "worker_port": 50051,
+      "roles": ["stage_1"],
+      "layer_range": [16, 31]
+    }
+  ],
+  "ssh": {
+    "user": "pixel",
+    "key_path": "~/.ssh/google_compute_engine"
+  }
+}
