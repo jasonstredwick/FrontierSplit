@@ -28,6 +28,7 @@ class ScheduledRequest:
         max_tokens: int = 64,
         temperature: float = 0.7,
         stream: bool = False,
+        tokenizer: Optional[Any] = None,
     ):
         self.request_id = request_id
         self.model = model
@@ -36,6 +37,7 @@ class ScheduledRequest:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.stream = stream
+        self.tokenizer = tokenizer
 
         self.created_at = time.time()
         self.current_step = 0
@@ -56,7 +58,10 @@ class ScheduledRequest:
 
     def to_chat_completion_response(self) -> Dict[str, Any]:
         """Format as standard OpenAI ChatCompletion response."""
-        content = "".join(self.generated_chunks)
+        if self.tokenizer is not None and self.generated_tokens:
+            content = self.tokenizer.decode(self.generated_tokens, skip_special_tokens=True)
+        else:
+            content = "".join(self.generated_chunks)
         prompt_count = len(self.prompt_tokens)
         completion_count = len(self.generated_tokens)
         return {
@@ -191,6 +196,7 @@ class PipelineScheduler:
             max_tokens=max_tokens,
             temperature=temperature,
             stream=stream,
+            tokenizer=self.tokenizer,
         )
 
         self.active_requests[request_id] = req
