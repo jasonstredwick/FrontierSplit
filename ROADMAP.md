@@ -47,6 +47,15 @@
 ---
 
 ## Phase 5: Showcases & Evaluations
-- [ ] **Living Demo**: Benchmark IFEval and SWE-bench Lite on the 4x L4 cluster.
+- [x] **IFEval Benchmark Runner & Verifier** (`benchmarks/eval_ifeval.py`, `tests/test_eval_ifeval.py`):
+  - Verifiable instruction constraints (word counts, JSON schemas, letter exclusions, casing, bullet points).
+  - Strict and loose accuracy evaluation across concurrent multi-stream traffic.
+- [x] **SWE-bench Lite Compound Agent Harness** (`benchmarks/eval_swebench.py`, `tests/test_eval_swebench.py`):
+  - Autonomous multi-turn software agent loop (Issue Analysis -> Plan -> Unified Diff Generation -> Patch Verification).
+  - Diff syntax validation and target file localization tracking under concurrent multi-agent dispatch.
+- [x] **Unified Evaluation CLI & Markdown Reporter** (`benchmarks/run_evals.py`, `tests/test_run_evals.py`):
+  - Correlates cognitive scores with real-time cluster telemetry (tok/s, latency, $F_{bubble}$ idle bubble reduction).
+  - Automated report generation (`eval_results/eval_report.md`, `eval_results/eval_summary.json`).
+- [ ] **Living Demo Cluster Run**: Execute live benchmark sprint on the 4x L4 GCP cluster.
 - [ ] **Tier 2 (Google TPU Showcase)**: Port pipeline orchestration to Cloud TPU v5e (comparing ICI vs. VPC mesh).
 - [ ] **Tier 3 (Flagship Benchmark Sprint)**: Execute scaled-out benchmark on a frontier 1.6T–2TB model.
