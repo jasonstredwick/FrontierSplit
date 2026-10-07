@@ -1,0 +1,192 @@
+Oct 07 14:39:10 frontiersplit-node-1 systemd[2397]: Started /usr/bin/python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 --port=8000 --total-stages=2 --model-name=mistralai/Mistral-7B-Instruct-v0.3.
+Oct 07 14:39:15 frontiersplit-node-1 python3[2478]: Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Oct 07 14:39:16 frontiersplit-node-1 python3[2478]: INFO:     Started server process [2478]
+Oct 07 14:39:16 frontiersplit-node-1 python3[2478]: INFO:     Waiting for application startup.
+Oct 07 14:39:16 frontiersplit-node-1 python3[2478]: INFO:     Application startup complete.
+Oct 07 14:39:16 frontiersplit-node-1 python3[2478]: INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+Oct 07 14:39:20 frontiersplit-node-1 systemd[2397]: Stopping /usr/bin/python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 --port=8000 --total-stages=2 --model-name=mistralai/Mistral-7B-Instruct-v0.3...
+Oct 07 14:39:20 frontiersplit-node-1 python3[2478]: INFO:     Shutting down
+Oct 07 14:39:20 frontiersplit-node-1 python3[2478]: INFO:     Waiting for application shutdown.
+Oct 07 14:39:20 frontiersplit-node-1 python3[2478]: INFO:     Application shutdown complete.
+Oct 07 14:39:20 frontiersplit-node-1 python3[2478]: INFO:     Finished server process [2478]
+Oct 07 14:39:20 frontiersplit-node-1 systemd[2397]: Stopped /usr/bin/python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 --port=8000 --total-stages=2 --model-name=mistralai/Mistral-7B-Instruct-v0.3.
+Oct 07 14:39:20 frontiersplit-node-1 systemd[2397]: fs-gateway.service: Consumed 5.844s CPU time.
+Oct 07 14:40:05 frontiersplit-node-1 systemd[2569]: Started /usr/bin/python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 --port=8000 --total-stages=2 --model-name=mistralai/Mistral-7B-Instruct-v0.3.
+Oct 07 14:40:10 frontiersplit-node-1 python3[2640]: INFO:     Started server process [2640]
+Oct 07 14:40:10 frontiersplit-node-1 python3[2640]: INFO:     Waiting for application startup.
+Oct 07 14:40:10 frontiersplit-node-1 python3[2640]: INFO:     Application startup complete.
+Oct 07 14:40:10 frontiersplit-node-1 python3[2640]: INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+Oct 07 14:40:15 frontiersplit-node-1 systemd[2569]: Stopping /usr/bin/python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 --port=8000 --total-stages=2 --model-name=mistralai/Mistral-7B-Instruct-v0.3...
+Oct 07 14:40:15 frontiersplit-node-1 python3[2640]: INFO:     Shutting down
+Oct 07 14:40:15 frontiersplit-node-1 python3[2640]: INFO:     Waiting for application shutdown.
+Oct 07 14:40:15 frontiersplit-node-1 python3[2640]: INFO:     Application shutdown complete.
+Oct 07 14:40:15 frontiersplit-node-1 python3[2640]: INFO:     Finished server process [2640]
+Oct 07 14:40:15 frontiersplit-node-1 systemd[2569]: Stopped /usr/bin/python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 --port=8000 --total-stages=2 --model-name=mistralai/Mistral-7B-Instruct-v0.3.
+Oct 07 14:40:15 frontiersplit-node-1 systemd[2569]: fs-gateway.service: Consumed 5.524s CPU time.
+Oct 07 15:12:23 frontiersplit-node-1 systemd[2803]: Started /usr/bin/python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 --port=8000 --total-stages=2 --model-name=mistralai/Mistral-7B-Instruct-v0.3.
+Oct 07 15:12:33 frontiersplit-node-1 python3[4500]: INFO:     Started server process [4500]
+Oct 07 15:12:33 frontiersplit-node-1 python3[4500]: INFO:     Waiting for application startup.
+Oct 07 15:12:33 frontiersplit-node-1 python3[4500]: INFO:     Application startup complete.
+Oct 07 15:12:33 frontiersplit-node-1 python3[4500]: INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+Oct 07 15:12:42 frontiersplit-node-1 python3[4500]: Starting FrontierSplit Gateway on port 8000, connected to Stage 0 at http://localhost:50051...
+Oct 07 15:12:42 frontiersplit-node-1 python3[4500]: INFO:     50.47.200.81:19056 - "GET /health HTTP/1.1" 200 OK
+Oct 07 15:12:56 frontiersplit-node-1 python3[4500]: INFO:     50.47.200.81:55411 - "GET /v1/models HTTP/1.1" 200 OK
+Oct 07 15:13:01 frontiersplit-node-1 python3[4500]: INFO:     50.47.200.81:8981 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:13:14 frontiersplit-node-1 python3[4500]: INFO:     50.47.200.81:60340 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:14:00 frontiersplit-node-1 systemd[2803]: Stopping /usr/bin/python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 --port=8000 --total-stages=2 --model-name=mistralai/Mistral-7B-Instruct-v0.3...
+Oct 07 15:14:00 frontiersplit-node-1 python3[4500]: INFO:     Shutting down
+Oct 07 15:14:01 frontiersplit-node-1 python3[4500]: INFO:     Waiting for application shutdown.
+Oct 07 15:14:01 frontiersplit-node-1 python3[4500]: INFO:     Application shutdown complete.
+Oct 07 15:14:01 frontiersplit-node-1 python3[4500]: INFO:     Finished server process [4500]
+Oct 07 15:14:01 frontiersplit-node-1 systemd[2803]: Stopped /usr/bin/python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 --port=8000 --total-stages=2 --model-name=mistralai/Mistral-7B-Instruct-v0.3.
+Oct 07 15:14:01 frontiersplit-node-1 systemd[2803]: fs-gateway.service: Consumed 6.341s CPU time.
+Oct 07 15:14:01 frontiersplit-node-1 systemd[2803]: Started /usr/bin/python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 --port=8000 --total-stages=2 --model-name=mistralai/Mistral-7B-Instruct-v0.3.
+Oct 07 15:14:06 frontiersplit-node-1 python3[4657]: INFO:     Started server process [4657]
+Oct 07 15:14:06 frontiersplit-node-1 python3[4657]: INFO:     Waiting for application startup.
+Oct 07 15:14:06 frontiersplit-node-1 python3[4657]: INFO:     Application startup complete.
+Oct 07 15:14:06 frontiersplit-node-1 python3[4657]: INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+Oct 07 15:14:07 frontiersplit-node-1 python3[4657]: Starting FrontierSplit Gateway on port 8000, connected to Stage 0 at http://localhost:50051...
+Oct 07 15:14:07 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:50541 - "GET /health HTTP/1.1" 200 OK
+Oct 07 15:14:30 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:61712 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:14:51 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:63315 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:15:01 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:16605 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:15:14 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:43596 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:15:26 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:63525 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:15:26 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:27077 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:15:30 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:63525 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:15:32 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:16605 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:15:34 frontiersplit-node-1 python3[4657]: INFO:     127.0.0.1:44836 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:15:48 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:16605 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:15:50 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:43596 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:15:58 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:27077 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:16:01 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:63525 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:16:01 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:4560 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:16:01 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:26129 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:16:12 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:38378 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:16:25 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:60221 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:16:37 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64587 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:16:37 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:17038 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:16:41 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64587 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:16:43 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:38378 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:16:48 frontiersplit-node-1 python3[4657]: INFO:     127.0.0.1:60416 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:17:00 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:38378 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:17:02 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:60221 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:17:05 frontiersplit-node-1 python3[4657]: INFO:     127.0.0.1:41516 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:17:09 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:17038 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:17:12 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64587 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:17:13 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:40587 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:17:13 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64787 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:17:18 frontiersplit-node-1 python3[4657]: INFO:     127.0.0.1:40560 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:17:24 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:17178 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:17:28 frontiersplit-node-1 python3[4657]: INFO:     127.0.0.1:46870 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:17:34 frontiersplit-node-1 python3[4657]: INFO:     127.0.0.1:46874 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:17:37 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64194 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:17:40 frontiersplit-node-1 python3[4657]: INFO:     127.0.0.1:41878 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:17:51 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:28422 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:17:51 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:57694 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:17:55 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:28422 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:17:57 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:17178 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:18:13 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:17178 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:18:15 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64194 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:18:24 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:57694 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:18:24 frontiersplit-node-1 python3[4657]: INFO:     127.0.0.1:41350 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:18:27 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:28422 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:18:27 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:6145 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:18:33 frontiersplit-node-1 python3[4657]: INFO:     127.0.0.1:41490 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:18:46 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:16057 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:19:08 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:9033 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:19:19 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:11158 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:19:32 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:25464 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:19:36 frontiersplit-node-1 python3[4657]: INFO:     127.0.0.1:59908 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:19:46 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64191 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:19:46 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:55287 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:19:50 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64191 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:19:52 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:11158 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:20:08 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:11158 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:20:11 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:25464 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:20:19 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:55287 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:20:22 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64191 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:20:52 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:33750 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:20:53 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:62045 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:20:53 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:58860 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:20:53 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:2234 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:22:22 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:52312 - "GET /health HTTP/1.1" 200 OK
+Oct 07 15:27:36 frontiersplit-node-1 python3[4657]: INFO:     143.110.170.194:45428 - "GET / HTTP/1.1" 404 Not Found
+Oct 07 15:39:55 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:19504 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:40:22 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:36639 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:40:22 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:7463 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:40:22 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:17281 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:40:22 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:2078 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:42:29 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:36639 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:42:29 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:2078 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:42:30 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:7463 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:42:30 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:17281 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:42:42 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:36639 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:43:41 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:36639 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:43:41 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:22247 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:44:31 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:33674 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:44:42 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:57847 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:44:55 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:12487 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:45:08 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:24070 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:45:08 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:59628 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:45:12 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:24070 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:45:14 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:57847 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:45:30 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:57847 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:45:33 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:12487 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:45:40 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:59628 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:45:44 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:24070 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:46:13 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:7957 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:46:13 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:33827 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:46:13 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:2233 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:46:13 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64374 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:48:32 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:33827 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:48:32 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:7957 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:48:33 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:64374 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:48:33 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:2233 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:48:45 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:33827 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:49:46 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:33827 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:49:46 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:60612 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:49:46 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:29305 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:49:57 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:3291 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:50:11 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:28199 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:50:25 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:4760 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:50:25 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:44135 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:50:29 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:4760 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:50:31 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:3291 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:50:48 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:3291 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:50:50 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:28199 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:50:58 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:44135 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:51:02 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:4760 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:51:31 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:63052 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:51:31 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:37001 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:51:31 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:62582 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:51:32 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:49142 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:53:51 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:37001 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:53:51 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:63052 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:53:52 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:62582 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:53:52 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:49142 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:54:04 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:37001 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:55:03 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:37001 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:55:03 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:24945 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:55:03 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:39700 - "GET /v1/telemetry HTTP/1.1" 200 OK
+Oct 07 15:55:14 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:30015 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:55:27 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:61662 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:55:40 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:13434 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:55:40 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:20720 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:55:44 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:13434 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:55:46 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:30015 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:56:03 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:30015 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:56:05 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:61662 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:56:12 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:20720 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:56:16 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:13434 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:56:45 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:37696 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:56:45 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:19468 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:56:46 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:40480 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:56:46 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:48470 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:59:01 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:19468 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:59:01 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:37696 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:59:01 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:48470 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:59:02 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:40480 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 15:59:13 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:19468 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 16:00:13 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:19468 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+Oct 07 16:00:13 frontiersplit-node-1 python3[4657]: INFO:     50.47.200.81:33193 - "GET /v1/telemetry HTTP/1.1" 200 OK

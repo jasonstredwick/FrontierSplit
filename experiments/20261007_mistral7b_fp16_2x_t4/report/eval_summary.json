@@ -1,0 +1,1688 @@
+{
+  "timestamp": 1791388813.519427,
+  "model": "mistralai/Mistral-7B-Instruct-v0.3",
+  "concurrency": 4,
+  "num_runs": 3,
+  "total_stages": 2,
+  "aggregated_statistics": {
+    "ifeval": {
+      "strict_prompt_accuracy": {
+        "mean": 20.0,
+        "std": 0.0,
+        "min": 20.0,
+        "max": 20.0,
+        "median": 20.0
+      },
+      "loose_prompt_accuracy": {
+        "mean": 20.0,
+        "std": 0.0,
+        "min": 20.0,
+        "max": 20.0,
+        "median": 20.0
+      },
+      "strict_instruction_accuracy": {
+        "mean": 38.46,
+        "std": 0.0,
+        "min": 38.46,
+        "max": 38.46,
+        "median": 38.46
+      },
+      "loose_instruction_accuracy": {
+        "mean": 38.46,
+        "std": 0.0,
+        "min": 38.46,
+        "max": 38.46,
+        "median": 38.46
+      },
+      "throughput_tok_per_sec": {
+        "mean": 13.0,
+        "std": 0.22,
+        "min": 12.68,
+        "max": 13.17,
+        "median": 13.14
+      },
+      "bubble_elimination_pct": {
+        "mean": 57.1,
+        "std": 0.0,
+        "min": 57.1,
+        "max": 57.1,
+        "median": 57.1
+      }
+    },
+    "swebench": {
+      "valid_diff_rate_pct": {
+        "mean": 100.0,
+        "std": 0.0,
+        "min": 100.0,
+        "max": 100.0,
+        "median": 100.0
+      },
+      "target_files_matched_pct": {
+        "mean": 100.0,
+        "std": 0.0,
+        "min": 100.0,
+        "max": 100.0,
+        "median": 100.0
+      },
+      "throughput_tok_per_sec": {
+        "mean": 4.0,
+        "std": 0.04,
+        "min": 3.97,
+        "max": 4.06,
+        "median": 3.98
+      },
+      "bubble_elimination_pct": {
+        "mean": 57.1,
+        "std": 0.0,
+        "min": 57.1,
+        "max": 57.1,
+        "median": 57.1
+      }
+    }
+  },
+  "runs": [
+    {
+      "timestamp": 1791388186.5510552,
+      "duration_s": 315.0364499092102,
+      "ifeval": {
+        "benchmark": "IFEval",
+        "model": "mistralai/Mistral-7B-Instruct-v0.3",
+        "concurrency": 4,
+        "total_prompts": 10,
+        "total_instructions": 13,
+        "strict_prompt_accuracy": 20.0,
+        "loose_prompt_accuracy": 20.0,
+        "strict_instruction_accuracy": 38.46,
+        "loose_instruction_accuracy": 38.46,
+        "total_tokens": 958,
+        "elapsed_s": 72.732,
+        "throughput_tok_per_sec": 13.17,
+        "avg_latency_s": 26.243,
+        "bubble_fraction": 0.4286,
+        "bubble_elimination_pct": 57.1,
+        "results": [
+          {
+            "prompt_id": "ifeval-001",
+            "prompt": "Write a short summary of how Mixture-of-Experts routing works. Your response must be at least 30 words and at most 60 words.",
+            "response": "\n\nMixture-of-Experts routing is a method in machine learning where a set of \"experts\" (models) are combined to solve complex tasks. Each expert specializes in a specific sub-task, and a gating network determines which expert is best for a given input, routing it to the appropriate expert for processing. This approach allows for more efficient and accurate solutions, especially for large and diverse datasets.",
+            "tokens_count": 90,
+            "latency_s": 24.141,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-1a",
+                "rule_type": "number_words",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-002",
+            "prompt": "Explain the purpose of pipeline parallelism. Do NOT use the word 'latency' or the word 'network' in your response.",
+            "response": "\n\nPipeline parallelism is a technique used in computer systems to improve the efficiency of a sequence of dependent tasks by overlapping the execution of multiple stages of the same task. The goal is to hide the internal latency of each task by starting the processing of the next task as soon as possible, even if the previous task is not yet complete.\n\nIn a pipeline, each stage processes a part of the data and passes it to the next stage. For example, in a video processing pipeline, one stage might be responsible for decoding the video data, another for decompressing it, and another for rendering it. By the",
+            "tokens_count": 128,
+            "latency_s": 36.566,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-2a",
+                "rule_type": "forbidden_words",
+                "strict_pass": false,
+                "loose_pass": false
+              },
+              {
+                "instruction_id": "inst-2b",
+                "rule_type": "number_words",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-003",
+            "prompt": "Output a valid JSON object describing a GPU cluster with keys 'gpus', 'vram_per_gpu_gb', and 'interconnect'. Do not include extra text.",
+            "response": "\n\n{\n  \"gpus\": 100,\n  \"vram_per_gpu_gb\": 16,\n  \"interconnect\": \"NVLink\"\n}",
+            "tokens_count": 43,
+            "latency_s": 10.641,
+            "prompt_strict_pass": true,
+            "prompt_loose_pass": true,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-3a",
+                "rule_type": "json_format",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-004",
+            "prompt": "Write a 2-paragraph essay comparing NVLink to VPC Ethernet. Separate the paragraphs with a blank line.",
+            "response": "\n\nIn the realm of high-performance computing, two technologies have emerged as key players in interconnecting multiple GPUs: NVLink and VPC Ethernet. NVLink, a proprietary interconnect technology developed by NVIDIA, offers an unprecedented level of bandwidth and low latency, making it an ideal choice for data-intensive applications. With a maximum bandwidth of 300 GB/s and a latency as low as 30 ns, NVLink enables seamless communication between GPUs, accelerating the performance of complex computations. Furthermore, NVLink's ability",
+            "tokens_count": 128,
+            "latency_s": 36.549,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-4a",
+                "rule_type": "number_paragraphs",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-005",
+            "prompt": "Describe the concept of an activation vector in ALL UPPERCASE letters.",
+            "response": "\n\nACTIVATION VECTOR refers to a set of values that represent the activation level of a neuron or a node in a neural network. Each component of the vector corresponds to the strength of the input connection from a specific input feature. The activation level is calculated using an activation function, which transforms the weighted sum of the inputs into a single output value. This output value indicates the neuron's response to the input pattern. The activation vector is essential for the learning and decision-making process in neural networks.",
+            "tokens_count": 109,
+            "latency_s": 32.256,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-5a",
+                "rule_type": "casing",
+                "strict_pass": false,
+                "loose_pass": false
+              },
+              {
+                "instruction_id": "inst-5b",
+                "rule_type": "number_words",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-006",
+            "prompt": "Write a list of exactly 4 bullet points explaining why pipeline bubbles occur during single-stream inference.",
+            "response": "\n\n1. **Data Pacing**: In single-stream inference, the input data is fed into the model at a constant rate. However, the model's processing speed can vary, leading to periods where the model is not fully utilizing the input data. This results in a buffer of data waiting to be processed, causing a bubble in the pipeline.\n\n2. **Model Complexity**: More complex models require more computational resources and time to process each input. If the computational resources are not sufficient, the model may not be able to keep up with the input data, causing a pipeline bubble.\n\n3",
+            "tokens_count": 128,
+            "latency_s": 37.511,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-6a",
+                "rule_type": "bullet_points",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-007",
+            "prompt": "Write a short sentence about AI hardware without using the letter 'e'.",
+            "response": "\n\nAI hardware: Rapidly advancing silicon-based systems.",
+            "tokens_count": 17,
+            "latency_s": 4.276,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-7a",
+                "rule_type": "letter_frequency",
+                "strict_pass": false,
+                "loose_pass": false
+              },
+              {
+                "instruction_id": "inst-7b",
+                "rule_type": "number_words",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-008",
+            "prompt": "Explain continuous micro-batch interleaving. Your entire response must be written in lowercase letters only.",
+            "response": "\n\ncontinuous micro-batch interleaving is a technique used in machine learning to efficiently process large datasets. it involves dividing the data into small batches, processing each batch independently, and then updating the model parameters continuously.\n\nthe \"continuous\" part refers to the fact that the model updates are applied after each batch, rather than waiting until all batches have been processed. this allows the model to adapt to new data as it arrives, making it suitable for online learning scenarios.\n\nthe \"micro-batch\" part refers to the small size of the batches. this is in contrast to traditional batch",
+            "tokens_count": 128,
+            "latency_s": 32.234,
+            "prompt_strict_pass": true,
+            "prompt_loose_pass": true,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-8a",
+                "rule_type": "casing",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-009",
+            "prompt": "Summarize the benefits of FP8 quantization. End your response with the exact phrase: 'Efficiency unlocked.'",
+            "response": "\n\nFP8 quantization offers several significant benefits, primarily focused on improving the efficiency of deep learning models. Here's a brief summary:\n\n1. Reduced Memory Usage: FP8 quantization allows for a significant reduction in memory usage, as it uses fewer bits to represent the floating-point numbers. This makes it possible to train and deploy larger models on devices with limited memory.\n\n2. Faster Inference Speed: Due to the reduced memory footprint, FP8 quantization also leads to faster inference speeds. This is crucial for real-time applications where speed is of the essence.",
+            "tokens_count": 128,
+            "latency_s": 31.869,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-9a",
+                "rule_type": "start_end",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-010",
+            "prompt": "Provide a JSON response with keys 'project' and 'target_model'.",
+            "response": "\n\nproject: \"Deep Learning Project\"\ntarget_model: \"Convolutional Neural Network (CNN)\"\n\n{\n  \"project\": \"Deep Learning Project\",\n  \"target_model\": \"Convolutional Neural Network (CNN)\"\n}",
+            "tokens_count": 59,
+            "latency_s": 16.385,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-10a",
+                "rule_type": "json_format",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          }
+        ]
+      },
+      "swebench": {
+        "benchmark": "SWE-bench Lite",
+        "model": "mistralai/Mistral-7B-Instruct-v0.3",
+        "concurrency": 4,
+        "total_instances": 5,
+        "valid_diff_count": 5,
+        "valid_diff_rate_pct": 100.0,
+        "target_files_matched_count": 5,
+        "target_files_matched_pct": 100.0,
+        "total_tokens": 960,
+        "elapsed_s": 242.089,
+        "throughput_tok_per_sec": 3.97,
+        "avg_latency_s": 149.915,
+        "bubble_fraction": 0.4286,
+        "bubble_elimination_pct": 57.1,
+        "results": [
+          {
+            "instance_id": "django__django-11099",
+            "repo": "django/django",
+            "total_tokens": 192,
+            "elapsed_s": 168.559,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.03
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 139.53
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/django/contrib/auth/validators.py\n+++ b/django/contrib/auth/validators.py\n@@ -10,7 +10,7 @@ from re import ASCII, UNICODE, U\n from django.utils.translation import gettext_lazy as _\n\n-ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$'\n+ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$[\\n\\r]?$'",
+            "is_valid_diff": true,
+            "affected_files": [
+              "django/contrib/auth/validators.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "psf__requests-2148",
+            "repo": "psf/requests",
+            "total_tokens": 192,
+            "elapsed_s": 168.441,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.071
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 139.37
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/requests/models.py\n+++ b/requests/models.py\n@@ -114,16 +114,16 @@ class Response(BaseHTTPResponse):\n         if not self.raw:\n             self.raw = Response(self.content, status=self.status_code,\n                                  headers=self._headers,\n                                  url=self.url, request=self.request)\n\n-    def raise_for_status(self):\n+    def raise_for_status(self):",
+            "is_valid_diff": true,
+            "affected_files": [
+              "requests/models.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "sympy__sympy-13480",
+            "repo": "sympy/sympy",
+            "total_tokens": 192,
+            "elapsed_s": 169.482,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.479
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 140.003
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/sympy/functions/elementary/hyperbolic.py\n+++ b/sympy/functions/elementary/hyperbolic.py\n@@ -104,16 +104,16 @@ class Coth(HyperbolicFunction):\n         if not is_number(x):\n             if not is_symbol(x):\n                 raise TypeError(\"x must be a number or symbol\")\n-            if x not in self.args:\n+            if x not in self.free_symbols:\n",
+            "is_valid_diff": true,
+            "affected_files": [
+              "sympy/functions/elementary/hyperbolic.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "pytest-dev__pytest-5221",
+            "repo": "pytest-dev/pytest",
+            "total_tokens": 192,
+            "elapsed_s": 169.457,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.48
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 139.977
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/src/_pytest/python.py\n+++ b/src/_pytest/python.py\n@@ -104,6 +104,10 @@ def main(argv=sys.argv[1:], options=None):\n         if options.fixtures:\n             print_fixtures(fixtures, options)\n             return\n\n+        # Add fixture scope information\n+        for fixture in fixtures:\n+            scope = fixture.scope\n+            print(f\"{fixture.name} ({scope})",
+            "is_valid_diff": true,
+            "affected_files": [
+              "src/_pytest/python.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 4,
+            "lines_removed": 0,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "pallets__flask-4045",
+            "repo": "pallets/flask",
+            "total_tokens": 192,
+            "elapsed_s": 73.637,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 13.058
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 60.579
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -114,7 +114,8 @@ def register_blueprint(app, blueprint):\n         if not isinstance(blueprint, Blueprint):\n             raise TypeError('Expected a Flask Blueprint but got %s' % type(blueprint).__name__)\n         if blueprint.name is None:\n-            blueprint.name = blueprint.__name__\n+            if '.' in blue",
+            "is_valid_diff": true,
+            "affected_files": [
+              "src/flask/blueprints.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          }
+        ]
+      },
+      "cluster_telemetry_before": {
+        "active_streams": 0,
+        "total_stages": 2,
+        "total_submitted": 61,
+        "total_completed": 61,
+        "total_tokens_generated": 5713,
+        "throughput_tokens_per_sec": 3.13,
+        "avg_step_latency_ms": 403.57,
+        "theoretical_bubble_fraction": 0.5,
+        "bubble_elimination_pct": 50.0
+      },
+      "cluster_telemetry_after": {
+        "active_streams": 0,
+        "total_stages": 2,
+        "total_submitted": 81,
+        "total_completed": 81,
+        "total_tokens_generated": 7631,
+        "throughput_tokens_per_sec": 3.57,
+        "avg_step_latency_ms": 417.79,
+        "theoretical_bubble_fraction": 0.5,
+        "bubble_elimination_pct": 50.0
+      },
+      "run_index": 1
+    },
+    {
+      "timestamp": 1791388503.67007,
+      "duration_s": 317.11896300315857,
+      "ifeval": {
+        "benchmark": "IFEval",
+        "model": "mistralai/Mistral-7B-Instruct-v0.3",
+        "concurrency": 4,
+        "total_prompts": 10,
+        "total_instructions": 13,
+        "strict_prompt_accuracy": 20.0,
+        "loose_prompt_accuracy": 20.0,
+        "strict_instruction_accuracy": 38.46,
+        "loose_instruction_accuracy": 38.46,
+        "total_tokens": 958,
+        "elapsed_s": 75.542,
+        "throughput_tok_per_sec": 12.68,
+        "avg_latency_s": 27.334,
+        "bubble_fraction": 0.4286,
+        "bubble_elimination_pct": 57.1,
+        "results": [
+          {
+            "prompt_id": "ifeval-001",
+            "prompt": "Write a short summary of how Mixture-of-Experts routing works. Your response must be at least 30 words and at most 60 words.",
+            "response": "\n\nMixture-of-Experts routing is a method in machine learning where a set of \"experts\" (models) are combined to solve complex tasks. Each expert specializes in a specific sub-task, and a gating network determines which expert is best for a given input, routing it to the appropriate expert for processing. This approach allows for more efficient and accurate solutions, especially for large and diverse datasets.",
+            "tokens_count": 90,
+            "latency_s": 24.882,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-1a",
+                "rule_type": "number_words",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-002",
+            "prompt": "Explain the purpose of pipeline parallelism. Do NOT use the word 'latency' or the word 'network' in your response.",
+            "response": "\n\nPipeline parallelism is a technique used in computer systems to improve the efficiency of a sequence of dependent tasks by overlapping the execution of multiple stages of the same task. The goal is to hide the internal latency of each task by starting the processing of the next task as soon as possible, even if the previous task is not yet complete.\n\nIn a pipeline, each stage processes a part of the data and passes it to the next stage. For example, in a video processing pipeline, one stage might be responsible for decoding the video data, another for decompressing it, and another for rendering it. By the",
+            "tokens_count": 128,
+            "latency_s": 38.463,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-2a",
+                "rule_type": "forbidden_words",
+                "strict_pass": false,
+                "loose_pass": false
+              },
+              {
+                "instruction_id": "inst-2b",
+                "rule_type": "number_words",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-003",
+            "prompt": "Output a valid JSON object describing a GPU cluster with keys 'gpus', 'vram_per_gpu_gb', and 'interconnect'. Do not include extra text.",
+            "response": "\n\n{\n  \"gpus\": 100,\n  \"vram_per_gpu_gb\": 16,\n  \"interconnect\": \"NVLink\"\n}",
+            "tokens_count": 43,
+            "latency_s": 10.915,
+            "prompt_strict_pass": true,
+            "prompt_loose_pass": true,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-3a",
+                "rule_type": "json_format",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-004",
+            "prompt": "Write a 2-paragraph essay comparing NVLink to VPC Ethernet. Separate the paragraphs with a blank line.",
+            "response": "\n\nIn the realm of high-performance computing, two technologies have emerged as key players in interconnecting multiple GPUs: NVLink and VPC Ethernet. NVLink, a proprietary interconnect technology developed by NVIDIA, offers an unprecedented level of bandwidth and low latency, making it an ideal choice for data-intensive applications. With a maximum bandwidth of 300 GB/s and a latency as low as 30 ns, NVLink enables seamless communication between GPUs, accelerating the performance of complex computations. Furthermore, NVLink's ability",
+            "tokens_count": 128,
+            "latency_s": 38.577,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-4a",
+                "rule_type": "number_paragraphs",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-005",
+            "prompt": "Describe the concept of an activation vector in ALL UPPERCASE letters.",
+            "response": "\n\nACTIVATION VECTOR refers to a set of values that represent the activation level of a neuron or a node in a neural network. Each component of the vector corresponds to the strength of the input connection from a specific input feature. The activation level is calculated using an activation function, which transforms the weighted sum of the inputs into a single output value. This output value indicates the neuron's response to the input pattern. The activation vector is essential for the learning and decision-making process in neural networks.",
+            "tokens_count": 109,
+            "latency_s": 33.895,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-5a",
+                "rule_type": "casing",
+                "strict_pass": false,
+                "loose_pass": false
+              },
+              {
+                "instruction_id": "inst-5b",
+                "rule_type": "number_words",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-006",
+            "prompt": "Write a list of exactly 4 bullet points explaining why pipeline bubbles occur during single-stream inference.",
+            "response": "\n\n1. **Data Pacing**: In single-stream inference, the input data is fed into the model at a constant rate. However, the model's processing speed can vary, leading to periods where the model is not fully utilizing the input data. This results in a buffer of data waiting to be processed, causing a bubble in the pipeline.\n\n2. **Model Complexity**: More complex models require more computational resources and time to process each input. If the computational resources are not sufficient, the model may not be able to keep up with the input data, causing a pipeline bubble.\n\n3",
+            "tokens_count": 128,
+            "latency_s": 39.181,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-6a",
+                "rule_type": "bullet_points",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-007",
+            "prompt": "Write a short sentence about AI hardware without using the letter 'e'.",
+            "response": "\n\nAI hardware: Rapidly advancing silicon-based systems.",
+            "tokens_count": 17,
+            "latency_s": 4.402,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-7a",
+                "rule_type": "letter_frequency",
+                "strict_pass": false,
+                "loose_pass": false
+              },
+              {
+                "instruction_id": "inst-7b",
+                "rule_type": "number_words",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-008",
+            "prompt": "Explain continuous micro-batch interleaving. Your entire response must be written in lowercase letters only.",
+            "response": "\n\ncontinuous micro-batch interleaving is a technique used in machine learning to efficiently process large datasets. it involves dividing the data into small batches, processing each batch independently, and then updating the model parameters continuously.\n\nthe \"continuous\" part refers to the fact that the model updates are applied after each batch, rather than waiting until all batches have been processed. this allows the model to adapt to new data as it arrives, making it suitable for online learning scenarios.\n\nthe \"micro-batch\" part refers to the small size of the batches. this is in contrast to traditional batch",
+            "tokens_count": 128,
+            "latency_s": 33.301,
+            "prompt_strict_pass": true,
+            "prompt_loose_pass": true,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-8a",
+                "rule_type": "casing",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-009",
+            "prompt": "Summarize the benefits of FP8 quantization. End your response with the exact phrase: 'Efficiency unlocked.'",
+            "response": "\n\nFP8 quantization offers several significant benefits, primarily focused on improving the efficiency of deep learning models. Here's a brief summary:\n\n1. Reduced Memory Usage: FP8 quantization allows for a significant reduction in memory usage, as it uses fewer bits to represent the floating-point numbers. This makes it possible to train and deploy larger models on devices with limited memory.\n\n2. Faster Inference Speed: Due to the reduced memory footprint, FP8 quantization also leads to faster inference speeds. This is crucial for real-time applications where speed is of the essence.",
+            "tokens_count": 128,
+            "latency_s": 32.665,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-9a",
+                "rule_type": "start_end",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-010",
+            "prompt": "Provide a JSON response with keys 'project' and 'target_model'.",
+            "response": "\n\nproject: \"Deep Learning Project\"\ntarget_model: \"Convolutional Neural Network (CNN)\"\n\n{\n  \"project\": \"Deep Learning Project\",\n  \"target_model\": \"Convolutional Neural Network (CNN)\"\n}",
+            "tokens_count": 59,
+            "latency_s": 17.058,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-10a",
+                "rule_type": "json_format",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          }
+        ]
+      },
+      "swebench": {
+        "benchmark": "SWE-bench Lite",
+        "model": "mistralai/Mistral-7B-Instruct-v0.3",
+        "concurrency": 4,
+        "total_instances": 5,
+        "valid_diff_count": 5,
+        "valid_diff_rate_pct": 100.0,
+        "target_files_matched_count": 5,
+        "target_files_matched_pct": 100.0,
+        "total_tokens": 960,
+        "elapsed_s": 241.351,
+        "throughput_tok_per_sec": 3.98,
+        "avg_latency_s": 150.177,
+        "bubble_fraction": 0.4286,
+        "bubble_elimination_pct": 57.1,
+        "results": [
+          {
+            "instance_id": "django__django-11099",
+            "repo": "django/django",
+            "total_tokens": 192,
+            "elapsed_s": 169.316,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.414
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 139.903
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/django/contrib/auth/validators.py\n+++ b/django/contrib/auth/validators.py\n@@ -10,7 +10,7 @@ from re import ASCII, UNICODE, U\n from django.utils.translation import gettext_lazy as _\n\n-ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$'\n+ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$[\\n\\r]?$'",
+            "is_valid_diff": true,
+            "affected_files": [
+              "django/contrib/auth/validators.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "psf__requests-2148",
+            "repo": "psf/requests",
+            "total_tokens": 192,
+            "elapsed_s": 169.147,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.514
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 139.633
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/requests/models.py\n+++ b/requests/models.py\n@@ -114,16 +114,16 @@ class Response(BaseHTTPResponse):\n         if not self.raw:\n             self.raw = Response(self.content, status=self.status_code,\n                                  headers=self._headers,\n                                  url=self.url, request=self.request)\n\n-    def raise_for_status(self):\n+    def raise_for_status(self):",
+            "is_valid_diff": true,
+            "affected_files": [
+              "requests/models.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "sympy__sympy-13480",
+            "repo": "sympy/sympy",
+            "total_tokens": 192,
+            "elapsed_s": 170.159,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.8
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 140.359
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/sympy/functions/elementary/hyperbolic.py\n+++ b/sympy/functions/elementary/hyperbolic.py\n@@ -104,16 +104,16 @@ class Coth(HyperbolicFunction):\n         if not is_number(x):\n             if not is_symbol(x):\n                 raise TypeError(\"x must be a number or symbol\")\n-            if x not in self.args:\n+            if x not in self.free_symbols:\n",
+            "is_valid_diff": true,
+            "affected_files": [
+              "sympy/functions/elementary/hyperbolic.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "pytest-dev__pytest-5221",
+            "repo": "pytest-dev/pytest",
+            "total_tokens": 192,
+            "elapsed_s": 170.069,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.697
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 140.372
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/src/_pytest/python.py\n+++ b/src/_pytest/python.py\n@@ -104,6 +104,10 @@ def main(argv=sys.argv[1:], options=None):\n         if options.fixtures:\n             print_fixtures(fixtures, options)\n             return\n\n+        # Add fixture scope information\n+        for fixture in fixtures:\n+            scope = fixture.scope\n+            print(f\"{fixture.name} ({scope})",
+            "is_valid_diff": true,
+            "affected_files": [
+              "src/_pytest/python.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 4,
+            "lines_removed": 0,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "pallets__flask-4045",
+            "repo": "pallets/flask",
+            "total_tokens": 192,
+            "elapsed_s": 72.194,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 12.758
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 59.435
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -114,7 +114,8 @@ def register_blueprint(app, blueprint):\n         if not isinstance(blueprint, Blueprint):\n             raise TypeError('Expected a Flask Blueprint but got %s' % type(blueprint).__name__)\n         if blueprint.name is None:\n-            blueprint.name = blueprint.__name__\n+            if '.' in blue",
+            "is_valid_diff": true,
+            "affected_files": [
+              "src/flask/blueprints.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          }
+        ]
+      },
+      "cluster_telemetry_before": {
+        "active_streams": 0,
+        "total_stages": 2,
+        "total_submitted": 81,
+        "total_completed": 81,
+        "total_tokens_generated": 7631,
+        "throughput_tokens_per_sec": 3.57,
+        "avg_step_latency_ms": 417.79,
+        "theoretical_bubble_fraction": 0.5,
+        "bubble_elimination_pct": 50.0
+      },
+      "cluster_telemetry_after": {
+        "active_streams": 0,
+        "total_stages": 2,
+        "total_submitted": 101,
+        "total_completed": 101,
+        "total_tokens_generated": 9549,
+        "throughput_tokens_per_sec": 3.89,
+        "avg_step_latency_ms": 404.7,
+        "theoretical_bubble_fraction": 0.5,
+        "bubble_elimination_pct": 50.0
+      },
+      "run_index": 2
+    },
+    {
+      "timestamp": 1791388813.5193238,
+      "duration_s": 309.8491747379303,
+      "ifeval": {
+        "benchmark": "IFEval",
+        "model": "mistralai/Mistral-7B-Instruct-v0.3",
+        "concurrency": 4,
+        "total_prompts": 10,
+        "total_instructions": 13,
+        "strict_prompt_accuracy": 20.0,
+        "loose_prompt_accuracy": 20.0,
+        "strict_instruction_accuracy": 38.46,
+        "loose_instruction_accuracy": 38.46,
+        "total_tokens": 958,
+        "elapsed_s": 72.928,
+        "throughput_tok_per_sec": 13.14,
+        "avg_latency_s": 26.31,
+        "bubble_fraction": 0.4286,
+        "bubble_elimination_pct": 57.1,
+        "results": [
+          {
+            "prompt_id": "ifeval-001",
+            "prompt": "Write a short summary of how Mixture-of-Experts routing works. Your response must be at least 30 words and at most 60 words.",
+            "response": "\n\nMixture-of-Experts routing is a method in machine learning where a set of \"experts\" (models) are combined to solve complex tasks. Each expert specializes in a specific sub-task, and a gating network determines which expert is best for a given input, routing it to the appropriate expert for processing. This approach allows for more efficient and accurate solutions, especially for large and diverse datasets.",
+            "tokens_count": 90,
+            "latency_s": 24.061,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-1a",
+                "rule_type": "number_words",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-002",
+            "prompt": "Explain the purpose of pipeline parallelism. Do NOT use the word 'latency' or the word 'network' in your response.",
+            "response": "\n\nPipeline parallelism is a technique used in computer systems to improve the efficiency of a sequence of dependent tasks by overlapping the execution of multiple stages of the same task. The goal is to hide the internal latency of each task by starting the processing of the next task as soon as possible, even if the previous task is not yet complete.\n\nIn a pipeline, each stage processes a part of the data and passes it to the next stage. For example, in a video processing pipeline, one stage might be responsible for decoding the video data, another for decompressing it, and another for rendering it. By the",
+            "tokens_count": 128,
+            "latency_s": 37.044,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-2a",
+                "rule_type": "forbidden_words",
+                "strict_pass": false,
+                "loose_pass": false
+              },
+              {
+                "instruction_id": "inst-2b",
+                "rule_type": "number_words",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-003",
+            "prompt": "Output a valid JSON object describing a GPU cluster with keys 'gpus', 'vram_per_gpu_gb', and 'interconnect'. Do not include extra text.",
+            "response": "\n\n{\n  \"gpus\": 100,\n  \"vram_per_gpu_gb\": 16,\n  \"interconnect\": \"NVLink\"\n}",
+            "tokens_count": 43,
+            "latency_s": 10.624,
+            "prompt_strict_pass": true,
+            "prompt_loose_pass": true,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-3a",
+                "rule_type": "json_format",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-004",
+            "prompt": "Write a 2-paragraph essay comparing NVLink to VPC Ethernet. Separate the paragraphs with a blank line.",
+            "response": "\n\nIn the realm of high-performance computing, two technologies have emerged as key players in interconnecting multiple GPUs: NVLink and VPC Ethernet. NVLink, a proprietary interconnect technology developed by NVIDIA, offers an unprecedented level of bandwidth and low latency, making it an ideal choice for data-intensive applications. With a maximum bandwidth of 300 GB/s and a latency as low as 30 ns, NVLink enables seamless communication between GPUs, accelerating the performance of complex computations. Furthermore, NVLink's ability",
+            "tokens_count": 128,
+            "latency_s": 37.129,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-4a",
+                "rule_type": "number_paragraphs",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-005",
+            "prompt": "Describe the concept of an activation vector in ALL UPPERCASE letters.",
+            "response": "\n\nACTIVATION VECTOR refers to a set of values that represent the activation level of a neuron or a node in a neural network. Each component of the vector corresponds to the strength of the input connection from a specific input feature. The activation level is calculated using an activation function, which transforms the weighted sum of the inputs into a single output value. This output value indicates the neuron's response to the input pattern. The activation vector is essential for the learning and decision-making process in neural networks.",
+            "tokens_count": 109,
+            "latency_s": 32.395,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-5a",
+                "rule_type": "casing",
+                "strict_pass": false,
+                "loose_pass": false
+              },
+              {
+                "instruction_id": "inst-5b",
+                "rule_type": "number_words",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-006",
+            "prompt": "Write a list of exactly 4 bullet points explaining why pipeline bubbles occur during single-stream inference.",
+            "response": "\n\n1. **Data Pacing**: In single-stream inference, the input data is fed into the model at a constant rate. However, the model's processing speed can vary, leading to periods where the model is not fully utilizing the input data. This results in a buffer of data waiting to be processed, causing a bubble in the pipeline.\n\n2. **Model Complexity**: More complex models require more computational resources and time to process each input. If the computational resources are not sufficient, the model may not be able to keep up with the input data, causing a pipeline bubble.\n\n3",
+            "tokens_count": 128,
+            "latency_s": 37.558,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-6a",
+                "rule_type": "bullet_points",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-007",
+            "prompt": "Write a short sentence about AI hardware without using the letter 'e'.",
+            "response": "\n\nAI hardware: Rapidly advancing silicon-based systems.",
+            "tokens_count": 17,
+            "latency_s": 4.096,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-7a",
+                "rule_type": "letter_frequency",
+                "strict_pass": false,
+                "loose_pass": false
+              },
+              {
+                "instruction_id": "inst-7b",
+                "rule_type": "number_words",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-008",
+            "prompt": "Explain continuous micro-batch interleaving. Your entire response must be written in lowercase letters only.",
+            "response": "\n\ncontinuous micro-batch interleaving is a technique used in machine learning to efficiently process large datasets. it involves dividing the data into small batches, processing each batch independently, and then updating the model parameters continuously.\n\nthe \"continuous\" part refers to the fact that the model updates are applied after each batch, rather than waiting until all batches have been processed. this allows the model to adapt to new data as it arrives, making it suitable for online learning scenarios.\n\nthe \"micro-batch\" part refers to the small size of the batches. this is in contrast to traditional batch",
+            "tokens_count": 128,
+            "latency_s": 31.966,
+            "prompt_strict_pass": true,
+            "prompt_loose_pass": true,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-8a",
+                "rule_type": "casing",
+                "strict_pass": true,
+                "loose_pass": true
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-009",
+            "prompt": "Summarize the benefits of FP8 quantization. End your response with the exact phrase: 'Efficiency unlocked.'",
+            "response": "\n\nFP8 quantization offers several significant benefits, primarily focused on improving the efficiency of deep learning models. Here's a brief summary:\n\n1. Reduced Memory Usage: FP8 quantization allows for a significant reduction in memory usage, as it uses fewer bits to represent the floating-point numbers. This makes it possible to train and deploy larger models on devices with limited memory.\n\n2. Faster Inference Speed: Due to the reduced memory footprint, FP8 quantization also leads to faster inference speeds. This is crucial for real-time applications where speed is of the essence.",
+            "tokens_count": 128,
+            "latency_s": 31.779,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-9a",
+                "rule_type": "start_end",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          },
+          {
+            "prompt_id": "ifeval-010",
+            "prompt": "Provide a JSON response with keys 'project' and 'target_model'.",
+            "response": "\n\nproject: \"Deep Learning Project\"\ntarget_model: \"Convolutional Neural Network (CNN)\"\n\n{\n  \"project\": \"Deep Learning Project\",\n  \"target_model\": \"Convolutional Neural Network (CNN)\"\n}",
+            "tokens_count": 59,
+            "latency_s": 16.449,
+            "prompt_strict_pass": false,
+            "prompt_loose_pass": false,
+            "instruction_breakdown": [
+              {
+                "instruction_id": "inst-10a",
+                "rule_type": "json_format",
+                "strict_pass": false,
+                "loose_pass": false
+              }
+            ],
+            "error": null
+          }
+        ]
+      },
+      "swebench": {
+        "benchmark": "SWE-bench Lite",
+        "model": "mistralai/Mistral-7B-Instruct-v0.3",
+        "concurrency": 4,
+        "total_instances": 5,
+        "valid_diff_count": 5,
+        "valid_diff_rate_pct": 100.0,
+        "target_files_matched_count": 5,
+        "target_files_matched_pct": 100.0,
+        "total_tokens": 960,
+        "elapsed_s": 236.708,
+        "throughput_tok_per_sec": 4.06,
+        "avg_latency_s": 146.442,
+        "bubble_fraction": 0.4286,
+        "bubble_elimination_pct": 57.1,
+        "results": [
+          {
+            "instance_id": "django__django-11099",
+            "repo": "django/django",
+            "total_tokens": 192,
+            "elapsed_s": 165.412,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.343
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 136.068
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/django/contrib/auth/validators.py\n+++ b/django/contrib/auth/validators.py\n@@ -10,7 +10,7 @@ from re import ASCII, UNICODE, U\n from django.utils.translation import gettext_lazy as _\n\n-ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$'\n+ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$[\\n\\r]?$'",
+            "is_valid_diff": true,
+            "affected_files": [
+              "django/contrib/auth/validators.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "psf__requests-2148",
+            "repo": "psf/requests",
+            "total_tokens": 192,
+            "elapsed_s": 164.812,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.096
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 135.717
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/requests/models.py\n+++ b/requests/models.py\n@@ -114,16 +114,16 @@ class Response(BaseHTTPResponse):\n         if not self.raw:\n             self.raw = Response(self.content, status=self.status_code,\n                                  headers=self._headers,\n                                  url=self.url, request=self.request)\n\n-    def raise_for_status(self):\n+    def raise_for_status(self):",
+            "is_valid_diff": true,
+            "affected_files": [
+              "requests/models.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "sympy__sympy-13480",
+            "repo": "sympy/sympy",
+            "total_tokens": 192,
+            "elapsed_s": 165.222,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.343
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 135.88
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/sympy/functions/elementary/hyperbolic.py\n+++ b/sympy/functions/elementary/hyperbolic.py\n@@ -104,16 +104,16 @@ class Coth(HyperbolicFunction):\n         if not is_number(x):\n             if not is_symbol(x):\n                 raise TypeError(\"x must be a number or symbol\")\n-            if x not in self.args:\n+            if x not in self.free_symbols:\n",
+            "is_valid_diff": true,
+            "affected_files": [
+              "sympy/functions/elementary/hyperbolic.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "pytest-dev__pytest-5221",
+            "repo": "pytest-dev/pytest",
+            "total_tokens": 192,
+            "elapsed_s": 164.88,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 29.093
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 135.788
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/src/_pytest/python.py\n+++ b/src/_pytest/python.py\n@@ -104,6 +104,10 @@ def main(argv=sys.argv[1:], options=None):\n         if options.fixtures:\n             print_fixtures(fixtures, options)\n             return\n\n+        # Add fixture scope information\n+        for fixture in fixtures:\n+            scope = fixture.scope\n+            print(f\"{fixture.name} ({scope})",
+            "is_valid_diff": true,
+            "affected_files": [
+              "src/_pytest/python.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 4,
+            "lines_removed": 0,
+            "matches_target_files": true,
+            "verification_error": null
+          },
+          {
+            "instance_id": "pallets__flask-4045",
+            "repo": "pallets/flask",
+            "total_tokens": 192,
+            "elapsed_s": 71.886,
+            "step_metrics": [
+              {
+                "step": "analysis",
+                "tokens": 64,
+                "latency_s": 12.356
+              },
+              {
+                "step": "patch_generation",
+                "tokens": 128,
+                "latency_s": 59.529
+              }
+            ],
+            "generated_patch": "\n\n```diff\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -114,7 +114,8 @@ def register_blueprint(app, blueprint):\n         if not isinstance(blueprint, Blueprint):\n             raise TypeError('Expected a Flask Blueprint but got %s' % type(blueprint).__name__)\n         if blueprint.name is None:\n-            blueprint.name = blueprint.__name__\n+            if '.' in blue",
+            "is_valid_diff": true,
+            "affected_files": [
+              "src/flask/blueprints.py"
+            ],
+            "hunk_count": 1,
+            "lines_added": 1,
+            "lines_removed": 1,
+            "matches_target_files": true,
+            "verification_error": null
+          }
+        ]
+      },
+      "cluster_telemetry_before": {
+        "active_streams": 0,
+        "total_stages": 2,
+        "total_submitted": 101,
+        "total_completed": 101,
+        "total_tokens_generated": 9549,
+        "throughput_tokens_per_sec": 3.89,
+        "avg_step_latency_ms": 404.7,
+        "theoretical_bubble_fraction": 0.5,
+        "bubble_elimination_pct": 50.0
+      },
+      "cluster_telemetry_after": {
+        "active_streams": 0,
+        "total_stages": 2,
+        "total_submitted": 121,
+        "total_completed": 121,
+        "total_tokens_generated": 11467,
+        "throughput_tokens_per_sec": 4.14,
+        "avg_step_latency_ms": 408.61,
+        "theoretical_bubble_fraction": 0.5,
+        "bubble_elimination_pct": 50.0
+      },
+      "run_index": 3
+    }
+  ],
+  "ifeval": {
+    "benchmark": "IFEval",
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "concurrency": 4,
+    "total_prompts": 10,
+    "total_instructions": 13,
+    "strict_prompt_accuracy": 20.0,
+    "loose_prompt_accuracy": 20.0,
+    "strict_instruction_accuracy": 38.46,
+    "loose_instruction_accuracy": 38.46,
+    "total_tokens": 958,
+    "elapsed_s": 72.928,
+    "throughput_tok_per_sec": 13.14,
+    "avg_latency_s": 26.31,
+    "bubble_fraction": 0.4286,
+    "bubble_elimination_pct": 57.1,
+    "results": [
+      {
+        "prompt_id": "ifeval-001",
+        "prompt": "Write a short summary of how Mixture-of-Experts routing works. Your response must be at least 30 words and at most 60 words.",
+        "response": "\n\nMixture-of-Experts routing is a method in machine learning where a set of \"experts\" (models) are combined to solve complex tasks. Each expert specializes in a specific sub-task, and a gating network determines which expert is best for a given input, routing it to the appropriate expert for processing. This approach allows for more efficient and accurate solutions, especially for large and diverse datasets.",
+        "tokens_count": 90,
+        "latency_s": 24.061,
+        "prompt_strict_pass": false,
+        "prompt_loose_pass": false,
+        "instruction_breakdown": [
+          {
+            "instruction_id": "inst-1a",
+            "rule_type": "number_words",
+            "strict_pass": false,
+            "loose_pass": false
+          }
+        ],
+        "error": null
+      },
+      {
+        "prompt_id": "ifeval-002",
+        "prompt": "Explain the purpose of pipeline parallelism. Do NOT use the word 'latency' or the word 'network' in your response.",
+        "response": "\n\nPipeline parallelism is a technique used in computer systems to improve the efficiency of a sequence of dependent tasks by overlapping the execution of multiple stages of the same task. The goal is to hide the internal latency of each task by starting the processing of the next task as soon as possible, even if the previous task is not yet complete.\n\nIn a pipeline, each stage processes a part of the data and passes it to the next stage. For example, in a video processing pipeline, one stage might be responsible for decoding the video data, another for decompressing it, and another for rendering it. By the",
+        "tokens_count": 128,
+        "latency_s": 37.044,
+        "prompt_strict_pass": false,
+        "prompt_loose_pass": false,
+        "instruction_breakdown": [
+          {
+            "instruction_id": "inst-2a",
+            "rule_type": "forbidden_words",
+            "strict_pass": false,
+            "loose_pass": false
+          },
+          {
+            "instruction_id": "inst-2b",
+            "rule_type": "number_words",
+            "strict_pass": true,
+            "loose_pass": true
+          }
+        ],
+        "error": null
+      },
+      {
+        "prompt_id": "ifeval-003",
+        "prompt": "Output a valid JSON object describing a GPU cluster with keys 'gpus', 'vram_per_gpu_gb', and 'interconnect'. Do not include extra text.",
+        "response": "\n\n{\n  \"gpus\": 100,\n  \"vram_per_gpu_gb\": 16,\n  \"interconnect\": \"NVLink\"\n}",
+        "tokens_count": 43,
+        "latency_s": 10.624,
+        "prompt_strict_pass": true,
+        "prompt_loose_pass": true,
+        "instruction_breakdown": [
+          {
+            "instruction_id": "inst-3a",
+            "rule_type": "json_format",
+            "strict_pass": true,
+            "loose_pass": true
+          }
+        ],
+        "error": null
+      },
+      {
+        "prompt_id": "ifeval-004",
+        "prompt": "Write a 2-paragraph essay comparing NVLink to VPC Ethernet. Separate the paragraphs with a blank line.",
+        "response": "\n\nIn the realm of high-performance computing, two technologies have emerged as key players in interconnecting multiple GPUs: NVLink and VPC Ethernet. NVLink, a proprietary interconnect technology developed by NVIDIA, offers an unprecedented level of bandwidth and low latency, making it an ideal choice for data-intensive applications. With a maximum bandwidth of 300 GB/s and a latency as low as 30 ns, NVLink enables seamless communication between GPUs, accelerating the performance of complex computations. Furthermore, NVLink's ability",
+        "tokens_count": 128,
+        "latency_s": 37.129,
+        "prompt_strict_pass": false,
+        "prompt_loose_pass": false,
+        "instruction_breakdown": [
+          {
+            "instruction_id": "inst-4a",
+            "rule_type": "number_paragraphs",
+            "strict_pass": false,
+            "loose_pass": false
+          }
+        ],
+        "error": null
+      },
+      {
+        "prompt_id": "ifeval-005",
+        "prompt": "Describe the concept of an activation vector in ALL UPPERCASE letters.",
+        "response": "\n\nACTIVATION VECTOR refers to a set of values that represent the activation level of a neuron or a node in a neural network. Each component of the vector corresponds to the strength of the input connection from a specific input feature. The activation level is calculated using an activation function, which transforms the weighted sum of the inputs into a single output value. This output value indicates the neuron's response to the input pattern. The activation vector is essential for the learning and decision-making process in neural networks.",
+        "tokens_count": 109,
+        "latency_s": 32.395,
+        "prompt_strict_pass": false,
+        "prompt_loose_pass": false,
+        "instruction_breakdown": [
+          {
+            "instruction_id": "inst-5a",
+            "rule_type": "casing",
+            "strict_pass": false,
+            "loose_pass": false
+          },
+          {
+            "instruction_id": "inst-5b",
+            "rule_type": "number_words",
+            "strict_pass": true,
+            "loose_pass": true
+          }
+        ],
+        "error": null
+      },
+      {
+        "prompt_id": "ifeval-006",
+        "prompt": "Write a list of exactly 4 bullet points explaining why pipeline bubbles occur during single-stream inference.",
+        "response": "\n\n1. **Data Pacing**: In single-stream inference, the input data is fed into the model at a constant rate. However, the model's processing speed can vary, leading to periods where the model is not fully utilizing the input data. This results in a buffer of data waiting to be processed, causing a bubble in the pipeline.\n\n2. **Model Complexity**: More complex models require more computational resources and time to process each input. If the computational resources are not sufficient, the model may not be able to keep up with the input data, causing a pipeline bubble.\n\n3",
+        "tokens_count": 128,
+        "latency_s": 37.558,
+        "prompt_strict_pass": false,
+        "prompt_loose_pass": false,
+        "instruction_breakdown": [
+          {
+            "instruction_id": "inst-6a",
+            "rule_type": "bullet_points",
+            "strict_pass": false,
+            "loose_pass": false
+          }
+        ],
+        "error": null
+      },
+      {
+        "prompt_id": "ifeval-007",
+        "prompt": "Write a short sentence about AI hardware without using the letter 'e'.",
+        "response": "\n\nAI hardware: Rapidly advancing silicon-based systems.",
+        "tokens_count": 17,
+        "latency_s": 4.096,
+        "prompt_strict_pass": false,
+        "prompt_loose_pass": false,
+        "instruction_breakdown": [
+          {
+            "instruction_id": "inst-7a",
+            "rule_type": "letter_frequency",
+            "strict_pass": false,
+            "loose_pass": false
+          },
+          {
+            "instruction_id": "inst-7b",
+            "rule_type": "number_words",
+            "strict_pass": true,
+            "loose_pass": true
+          }
+        ],
+        "error": null
+      },
+      {
+        "prompt_id": "ifeval-008",
+        "prompt": "Explain continuous micro-batch interleaving. Your entire response must be written in lowercase letters only.",
+        "response": "\n\ncontinuous micro-batch interleaving is a technique used in machine learning to efficiently process large datasets. it involves dividing the data into small batches, processing each batch independently, and then updating the model parameters continuously.\n\nthe \"continuous\" part refers to the fact that the model updates are applied after each batch, rather than waiting until all batches have been processed. this allows the model to adapt to new data as it arrives, making it suitable for online learning scenarios.\n\nthe \"micro-batch\" part refers to the small size of the batches. this is in contrast to traditional batch",
+        "tokens_count": 128,
+        "latency_s": 31.966,
+        "prompt_strict_pass": true,
+        "prompt_loose_pass": true,
+        "instruction_breakdown": [
+          {
+            "instruction_id": "inst-8a",
+            "rule_type": "casing",
+            "strict_pass": true,
+            "loose_pass": true
+          }
+        ],
+        "error": null
+      },
+      {
+        "prompt_id": "ifeval-009",
+        "prompt": "Summarize the benefits of FP8 quantization. End your response with the exact phrase: 'Efficiency unlocked.'",
+        "response": "\n\nFP8 quantization offers several significant benefits, primarily focused on improving the efficiency of deep learning models. Here's a brief summary:\n\n1. Reduced Memory Usage: FP8 quantization allows for a significant reduction in memory usage, as it uses fewer bits to represent the floating-point numbers. This makes it possible to train and deploy larger models on devices with limited memory.\n\n2. Faster Inference Speed: Due to the reduced memory footprint, FP8 quantization also leads to faster inference speeds. This is crucial for real-time applications where speed is of the essence.",
+        "tokens_count": 128,
+        "latency_s": 31.779,
+        "prompt_strict_pass": false,
+        "prompt_loose_pass": false,
+        "instruction_breakdown": [
+          {
+            "instruction_id": "inst-9a",
+            "rule_type": "start_end",
+            "strict_pass": false,
+            "loose_pass": false
+          }
+        ],
+        "error": null
+      },
+      {
+        "prompt_id": "ifeval-010",
+        "prompt": "Provide a JSON response with keys 'project' and 'target_model'.",
+        "response": "\n\nproject: \"Deep Learning Project\"\ntarget_model: \"Convolutional Neural Network (CNN)\"\n\n{\n  \"project\": \"Deep Learning Project\",\n  \"target_model\": \"Convolutional Neural Network (CNN)\"\n}",
+        "tokens_count": 59,
+        "latency_s": 16.449,
+        "prompt_strict_pass": false,
+        "prompt_loose_pass": false,
+        "instruction_breakdown": [
+          {
+            "instruction_id": "inst-10a",
+            "rule_type": "json_format",
+            "strict_pass": false,
+            "loose_pass": false
+          }
+        ],
+        "error": null
+      }
+    ]
+  },
+  "swebench": {
+    "benchmark": "SWE-bench Lite",
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "concurrency": 4,
+    "total_instances": 5,
+    "valid_diff_count": 5,
+    "valid_diff_rate_pct": 100.0,
+    "target_files_matched_count": 5,
+    "target_files_matched_pct": 100.0,
+    "total_tokens": 960,
+    "elapsed_s": 236.708,
+    "throughput_tok_per_sec": 4.06,
+    "avg_latency_s": 146.442,
+    "bubble_fraction": 0.4286,
+    "bubble_elimination_pct": 57.1,
+    "results": [
+      {
+        "instance_id": "django__django-11099",
+        "repo": "django/django",
+        "total_tokens": 192,
+        "elapsed_s": 165.412,
+        "step_metrics": [
+          {
+            "step": "analysis",
+            "tokens": 64,
+            "latency_s": 29.343
+          },
+          {
+            "step": "patch_generation",
+            "tokens": 128,
+            "latency_s": 136.068
+          }
+        ],
+        "generated_patch": "\n\n```diff\n--- a/django/contrib/auth/validators.py\n+++ b/django/contrib/auth/validators.py\n@@ -10,7 +10,7 @@ from re import ASCII, UNICODE, U\n from django.utils.translation import gettext_lazy as _\n\n-ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$'\n+ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$[\\n\\r]?$'",
+        "is_valid_diff": true,
+        "affected_files": [
+          "django/contrib/auth/validators.py"
+        ],
+        "hunk_count": 1,
+        "lines_added": 1,
+        "lines_removed": 1,
+        "matches_target_files": true,
+        "verification_error": null
+      },
+      {
+        "instance_id": "psf__requests-2148",
+        "repo": "psf/requests",
+        "total_tokens": 192,
+        "elapsed_s": 164.812,
+        "step_metrics": [
+          {
+            "step": "analysis",
+            "tokens": 64,
+            "latency_s": 29.096
+          },
+          {
+            "step": "patch_generation",
+            "tokens": 128,
+            "latency_s": 135.717
+          }
+        ],
+        "generated_patch": "\n\n```diff\n--- a/requests/models.py\n+++ b/requests/models.py\n@@ -114,16 +114,16 @@ class Response(BaseHTTPResponse):\n         if not self.raw:\n             self.raw = Response(self.content, status=self.status_code,\n                                  headers=self._headers,\n                                  url=self.url, request=self.request)\n\n-    def raise_for_status(self):\n+    def raise_for_status(self):",
+        "is_valid_diff": true,
+        "affected_files": [
+          "requests/models.py"
+        ],
+        "hunk_count": 1,
+        "lines_added": 1,
+        "lines_removed": 1,
+        "matches_target_files": true,
+        "verification_error": null
+      },
+      {
+        "instance_id": "sympy__sympy-13480",
+        "repo": "sympy/sympy",
+        "total_tokens": 192,
+        "elapsed_s": 165.222,
+        "step_metrics": [
+          {
+            "step": "analysis",
+            "tokens": 64,
+            "latency_s": 29.343
+          },
+          {
+            "step": "patch_generation",
+            "tokens": 128,
+            "latency_s": 135.88
+          }
+        ],
+        "generated_patch": "\n\n```diff\n--- a/sympy/functions/elementary/hyperbolic.py\n+++ b/sympy/functions/elementary/hyperbolic.py\n@@ -104,16 +104,16 @@ class Coth(HyperbolicFunction):\n         if not is_number(x):\n             if not is_symbol(x):\n                 raise TypeError(\"x must be a number or symbol\")\n-            if x not in self.args:\n+            if x not in self.free_symbols:\n",
+        "is_valid_diff": true,
+        "affected_files": [
+          "sympy/functions/elementary/hyperbolic.py"
+        ],
+        "hunk_count": 1,
+        "lines_added": 1,
+        "lines_removed": 1,
+        "matches_target_files": true,
+        "verification_error": null
+      },
+      {
+        "instance_id": "pytest-dev__pytest-5221",
+        "repo": "pytest-dev/pytest",
+        "total_tokens": 192,
+        "elapsed_s": 164.88,
+        "step_metrics": [
+          {
+            "step": "analysis",
+            "tokens": 64,
+            "latency_s": 29.093
+          },
+          {
+            "step": "patch_generation",
+            "tokens": 128,
+            "latency_s": 135.788
+          }
+        ],
+        "generated_patch": "\n\n```diff\n--- a/src/_pytest/python.py\n+++ b/src/_pytest/python.py\n@@ -104,6 +104,10 @@ def main(argv=sys.argv[1:], options=None):\n         if options.fixtures:\n             print_fixtures(fixtures, options)\n             return\n\n+        # Add fixture scope information\n+        for fixture in fixtures:\n+            scope = fixture.scope\n+            print(f\"{fixture.name} ({scope})",
+        "is_valid_diff": true,
+        "affected_files": [
+          "src/_pytest/python.py"
+        ],
+        "hunk_count": 1,
+        "lines_added": 4,
+        "lines_removed": 0,
+        "matches_target_files": true,
+        "verification_error": null
+      },
+      {
+        "instance_id": "pallets__flask-4045",
+        "repo": "pallets/flask",
+        "total_tokens": 192,
+        "elapsed_s": 71.886,
+        "step_metrics": [
+          {
+            "step": "analysis",
+            "tokens": 64,
+            "latency_s": 12.356
+          },
+          {
+            "step": "patch_generation",
+            "tokens": 128,
+            "latency_s": 59.529
+          }
+        ],
+        "generated_patch": "\n\n```diff\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -114,7 +114,8 @@ def register_blueprint(app, blueprint):\n         if not isinstance(blueprint, Blueprint):\n             raise TypeError('Expected a Flask Blueprint but got %s' % type(blueprint).__name__)\n         if blueprint.name is None:\n-            blueprint.name = blueprint.__name__\n+            if '.' in blue",
+        "is_valid_diff": true,
+        "affected_files": [
+          "src/flask/blueprints.py"
+        ],
+        "hunk_count": 1,
+        "lines_added": 1,
+        "lines_removed": 1,
+        "matches_target_files": true,
+        "verification_error": null
+      }
+    ]
+  },
+  "cluster_telemetry_before": {
+    "active_streams": 0,
+    "total_stages": 2,
+    "total_submitted": 61,
+    "total_completed": 61,
+    "total_tokens_generated": 5713,
+    "throughput_tokens_per_sec": 3.13,
+    "avg_step_latency_ms": 403.57,
+    "theoretical_bubble_fraction": 0.5,
+    "bubble_elimination_pct": 50.0
+  },
+  "cluster_telemetry_after": {
+    "active_streams": 0,
+    "total_stages": 2,
+    "total_submitted": 121,
+    "total_completed": 121,
+    "total_tokens_generated": 11467,
+    "throughput_tokens_per_sec": 4.14,
+    "avg_step_latency_ms": 408.61,
+    "theoretical_bubble_fraction": 0.5,
+    "bubble_elimination_pct": 50.0
+  }
+}

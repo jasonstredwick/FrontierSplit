@@ -52,7 +52,9 @@ data/
 
 # Logs & monitoring
 *.log
-logs/
+!experiments/**/logs/*.log
+/logs/
+!experiments/**/logs/
 wandb/
 .system_generated/
 eval_results/

@@ -1,0 +1,158 @@
+{
+  "benchmark": "SWE-bench Lite",
+  "model": "mistralai/Mistral-7B-Instruct-v0.3",
+  "concurrency": 4,
+  "total_instances": 5,
+  "valid_diff_count": 5,
+  "valid_diff_rate_pct": 100.0,
+  "target_files_matched_count": 5,
+  "target_files_matched_pct": 100.0,
+  "total_tokens": 960,
+  "elapsed_s": 236.708,
+  "throughput_tok_per_sec": 4.06,
+  "avg_latency_s": 146.442,
+  "bubble_fraction": 0.4286,
+  "bubble_elimination_pct": 57.1,
+  "results": [
+    {
+      "instance_id": "django__django-11099",
+      "repo": "django/django",
+      "total_tokens": 192,
+      "elapsed_s": 165.412,
+      "step_metrics": [
+        {
+          "step": "analysis",
+          "tokens": 64,
+          "latency_s": 29.343
+        },
+        {
+          "step": "patch_generation",
+          "tokens": 128,
+          "latency_s": 136.068
+        }
+      ],
+      "generated_patch": "\n\n```diff\n--- a/django/contrib/auth/validators.py\n+++ b/django/contrib/auth/validators.py\n@@ -10,7 +10,7 @@ from re import ASCII, UNICODE, U\n from django.utils.translation import gettext_lazy as _\n\n-ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$'\n+ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$[\\n\\r]?$'",
+      "is_valid_diff": true,
+      "affected_files": [
+        "django/contrib/auth/validators.py"
+      ],
+      "hunk_count": 1,
+      "lines_added": 1,
+      "lines_removed": 1,
+      "matches_target_files": true,
+      "verification_error": null
+    },
+    {
+      "instance_id": "psf__requests-2148",
+      "repo": "psf/requests",
+      "total_tokens": 192,
+      "elapsed_s": 164.812,
+      "step_metrics": [
+        {
+          "step": "analysis",
+          "tokens": 64,
+          "latency_s": 29.096
+        },
+        {
+          "step": "patch_generation",
+          "tokens": 128,
+          "latency_s": 135.717
+        }
+      ],
+      "generated_patch": "\n\n```diff\n--- a/requests/models.py\n+++ b/requests/models.py\n@@ -114,16 +114,16 @@ class Response(BaseHTTPResponse):\n         if not self.raw:\n             self.raw = Response(self.content, status=self.status_code,\n                                  headers=self._headers,\n                                  url=self.url, request=self.request)\n\n-    def raise_for_status(self):\n+    def raise_for_status(self):",
+      "is_valid_diff": true,
+      "affected_files": [
+        "requests/models.py"
+      ],
+      "hunk_count": 1,
+      "lines_added": 1,
+      "lines_removed": 1,
+      "matches_target_files": true,
+      "verification_error": null
+    },
+    {
+      "instance_id": "sympy__sympy-13480",
+      "repo": "sympy/sympy",
+      "total_tokens": 192,
+      "elapsed_s": 165.222,
+      "step_metrics": [
+        {
+          "step": "analysis",
+          "tokens": 64,
+          "latency_s": 29.343
+        },
+        {
+          "step": "patch_generation",
+          "tokens": 128,
+          "latency_s": 135.88
+        }
+      ],
+      "generated_patch": "\n\n```diff\n--- a/sympy/functions/elementary/hyperbolic.py\n+++ b/sympy/functions/elementary/hyperbolic.py\n@@ -104,16 +104,16 @@ class Coth(HyperbolicFunction):\n         if not is_number(x):\n             if not is_symbol(x):\n                 raise TypeError(\"x must be a number or symbol\")\n-            if x not in self.args:\n+            if x not in self.free_symbols:\n",
+      "is_valid_diff": true,
+      "affected_files": [
+        "sympy/functions/elementary/hyperbolic.py"
+      ],
+      "hunk_count": 1,
+      "lines_added": 1,
+      "lines_removed": 1,
+      "matches_target_files": true,
+      "verification_error": null
+    },
+    {
+      "instance_id": "pytest-dev__pytest-5221",
+      "repo": "pytest-dev/pytest",
+      "total_tokens": 192,
+      "elapsed_s": 164.88,
+      "step_metrics": [
+        {
+          "step": "analysis",
+          "tokens": 64,
+          "latency_s": 29.093
+        },
+        {
+          "step": "patch_generation",
+          "tokens": 128,
+          "latency_s": 135.788
+        }
+      ],
+      "generated_patch": "\n\n```diff\n--- a/src/_pytest/python.py\n+++ b/src/_pytest/python.py\n@@ -104,6 +104,10 @@ def main(argv=sys.argv[1:], options=None):\n         if options.fixtures:\n             print_fixtures(fixtures, options)\n             return\n\n+        # Add fixture scope information\n+        for fixture in fixtures:\n+            scope = fixture.scope\n+            print(f\"{fixture.name} ({scope})",
+      "is_valid_diff": true,
+      "affected_files": [
+        "src/_pytest/python.py"
+      ],
+      "hunk_count": 1,
+      "lines_added": 4,
+      "lines_removed": 0,
+      "matches_target_files": true,
+      "verification_error": null
+    },
+    {
+      "instance_id": "pallets__flask-4045",
+      "repo": "pallets/flask",
+      "total_tokens": 192,
+      "elapsed_s": 71.886,
+      "step_metrics": [
+        {
+          "step": "analysis",
+          "tokens": 64,
+          "latency_s": 12.356
+        },
+        {
+          "step": "patch_generation",
+          "tokens": 128,
+          "latency_s": 59.529
+        }
+      ],
+      "generated_patch": "\n\n```diff\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -114,7 +114,8 @@ def register_blueprint(app, blueprint):\n         if not isinstance(blueprint, Blueprint):\n             raise TypeError('Expected a Flask Blueprint but got %s' % type(blueprint).__name__)\n         if blueprint.name is None:\n-            blueprint.name = blueprint.__name__\n+            if '.' in blue",
+      "is_valid_diff": true,
+      "affected_files": [
+        "src/flask/blueprints.py"
+      ],
+      "hunk_count": 1,
+      "lines_added": 1,
+      "lines_removed": 1,
+      "matches_target_files": true,
+      "verification_error": null
+    }
+  ]
+}
