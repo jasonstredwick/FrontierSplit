@@ -184,7 +184,7 @@ if [ "${PULL_UPDATE}" = true ]; then
     HEALTH_KEY='"status":"healthy"'
     READY=false
     for attempt in $(seq 1 45); do
-      RES=$(curl -s --connect-timeout 2 "http://${NODE_IP}:${PORT}/health" 2>/dev/null || true)
+      RES=$(ssh_cmd "${NODE_IP}" "curl -s http://localhost:${PORT}/health" 2>/dev/null || true)
       if echo "${RES}" | grep -q "${HEALTH_KEY}"; then
         READY=true
         print_ok "Node ${node_idx} worker is ready!"
