@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 import numpy as np
 from pydantic import BaseModel, Field
 
@@ -20,6 +20,7 @@ class ActivationPacket(BaseModel):
     tensor_dtype: str = "float32"
     tensor_bytes_b64: str = ""
     timestamp_sent_ms: float = Field(default_factory=lambda: time.time() * 1000)
+    stage_timings: Dict[str, float] = Field(default_factory=dict)
 
     def set_tensor(self, arr: np.ndarray) -> None:
         """Serialize a numpy tensor into base64 raw bytes."""
@@ -43,3 +44,5 @@ class GenerationResponse(BaseModel):
     text: str
     is_finished: bool
     latency_ms: float
+    stage_timings: Dict[str, float] = Field(default_factory=dict)
+

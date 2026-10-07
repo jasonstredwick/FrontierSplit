@@ -1,23 +1,25 @@
 """FrontierSplit Ingress Gateway.
 
-Exposes an OpenAI-compatible API (/v1/chat/completions, /v1/models) to clients
+Exposes an OpenAI-compatible API (/v1/chat/completions, /v1/models, /v1/telemetry) to clients
 and multi-agent harnesses (DSPy, OpenHands, LangChain).
-Orchestrates autoregressive generation across the pipeline cluster.
+Orchestrates autoregressive generation across the pipeline cluster using an asynchronous
+interleaved request scheduler with streaming support.
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import asynccontextmanager
+import json
 import time
-import uuid
 from typing import Any, Dict, List, Optional
 import requests
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
-from frontiersplit.protocol import ActivationPacket, GenerationResponse
+from frontiersplit.scheduler import PipelineScheduler, ScheduledRequest
 
 
 class ChatMessage(BaseModel):
@@ -54,14 +56,39 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
 
 
-def create_gateway_app(stage0_url: str = "http://localhost:50051", model_name: str = "frontiersplit-mixtral-8x7b") -> FastAPI:
-    app = FastAPI(title="FrontierSplit OpenAI-Compatible Ingress Gateway")
+def create_gateway_app(
+    stage0_url: str = "http://localhost:50051",
+    model_name: str = "frontiersplit-mixtral-8x7b",
+    num_workers: int = 8,
+    total_stages: int = 4,
+    scheduler: Optional[PipelineScheduler] = None,
+) -> FastAPI:
+    """Create FastAPI application with interleaved pipeline scheduler."""
+    if scheduler is None:
+        scheduler = PipelineScheduler(
+            stage0_url=stage0_url,
+            num_workers=num_workers,
+            total_stages=total_stages,
+        )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await app.state.scheduler.start()
+        yield
+        await app.state.scheduler.stop()
+
+    app = FastAPI(title="FrontierSplit OpenAI-Compatible Ingress Gateway", lifespan=lifespan)
+    app.state.scheduler = scheduler
 
     @app.get("/health")
     def health():
         try:
             resp = requests.get(f"{stage0_url}/health", timeout=3)
-            return {"gateway": "healthy", "stage0_status": resp.json()}
+            return {
+                "gateway": "healthy",
+                "stage0_status": resp.json(),
+                "active_streams": len(scheduler.active_requests),
+            }
         except Exception as e:
             return {"gateway": "degraded", "stage0_error": str(e)}
 
@@ -79,72 +106,38 @@ def create_gateway_app(stage0_url: str = "http://localhost:50051", model_name: s
             ],
         }
 
-    @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-    def chat_completions(req: ChatCompletionRequest):
-        request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        created_time = int(time.time())
+    @app.get("/v1/telemetry")
+    @app.get("/metrics")
+    def get_telemetry():
+        return scheduler.get_telemetry()
 
-        # Concatenate message contents to simulate tokenization
-        prompt_text = "\n".join([f"{m.role}: {m.content}" for m in req.messages])
-        # Simple ASCII pseudo-tokenizer for demonstration / testing
-        tokens = [ord(c) % 32000 for c in prompt_text] if prompt_text else [1]
-        prompt_tokens_count = len(tokens)
-
-        generated_tokens = []
-        generated_text_chunks = []
-
-        # 1. Prefill step: Send initial prompt tokens to Stage 0
-        packet = ActivationPacket(
-            request_id=request_id,
-            sequence_step=0,
-            stage_id=0,
-            is_prefill=True,
-            tokens=tokens,
-        )
-
-        for step in range(req.max_tokens):
-            try:
-                resp = requests.post(f"{stage0_url}/forward", json=packet.model_dump(), timeout=30)
-                resp.raise_for_status()
-                gen_result = GenerationResponse.model_validate(resp.json())
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Pipeline forward error at step {step}: {e}")
-
-            generated_tokens.append(gen_result.token_id)
-            generated_text_chunks.append(gen_result.text)
-
-            if gen_result.is_finished:
-                break
-
-            # 2. Decode step: Send next token back into Stage 0 for autoregressive cycle
-            packet = ActivationPacket(
-                request_id=request_id,
-                sequence_step=step + 1,
-                stage_id=0,
-                is_prefill=False,
-                tokens=[gen_result.token_id],
-            )
-
-        completion_text = "".join(generated_text_chunks)
-        completion_tokens_count = len(generated_tokens)
-
-        return ChatCompletionResponse(
-            id=request_id,
-            created=created_time,
+    @app.post("/v1/chat/completions")
+    async def chat_completions(req: ChatCompletionRequest):
+        req_state = await scheduler.submit_request(
             model=req.model,
-            choices=[
-                CompletionChoice(
-                    index=0,
-                    message=ChatMessage(role="assistant", content=completion_text),
-                    finish_reason="stop",
-                )
-            ],
-            usage=UsageInfo(
-                prompt_tokens=prompt_tokens_count,
-                completion_tokens=completion_tokens_count,
-                total_tokens=prompt_tokens_count + completion_tokens_count,
-            ),
+            messages=req.messages,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            stream=req.stream,
         )
+
+        if req.stream:
+            async def event_generator():
+                while True:
+                    chunk = await req_state.stream_queue.get()
+                    if chunk is None:
+                        yield "data: [DONE]\n\n"
+                        break
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+            return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+        # Non-streaming mode: wait for generation to complete
+        await req_state.done_event.wait()
+        if req_state.error:
+            raise HTTPException(status_code=502, detail=f"Pipeline forward error: {req_state.error}")
+
+        return JSONResponse(content=req_state.to_chat_completion_response())
 
     return app
 
@@ -155,9 +148,16 @@ def main():
     parser.add_argument("--port", type=int, default=8000, help="Gateway port to listen on")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host interface")
     parser.add_argument("--model-name", type=str, default="frontiersplit-mixtral-8x7b", help="Model name to advertise")
+    parser.add_argument("--num-workers", type=int, default=8, help="Number of concurrent dispatch workers")
+    parser.add_argument("--total-stages", type=int, default=4, help="Total pipeline stages in cluster")
     args = parser.parse_args()
 
-    app = create_gateway_app(stage0_url=args.stage0_url, model_name=args.model_name)
+    app = create_gateway_app(
+        stage0_url=args.stage0_url,
+        model_name=args.model_name,
+        num_workers=args.num_workers,
+        total_stages=args.total_stages,
+    )
     print(f"Starting FrontierSplit Gateway on port {args.port}, connected to Stage 0 at {args.stage0_url}...")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

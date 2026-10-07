@@ -75,6 +75,9 @@ def create_worker_app(
         # Compute assigned transformer layers (layer projection + activation)
         # In real deployment, this invokes the assigned PyTorch/CUDA MoE blocks
         activation = np.matmul(activation, layer_proj)
+        stage_compute_ms = (time.time() - start_time) * 1000
+        timings = dict(packet.stage_timings)
+        timings[f"stage_{stage_id}_compute_ms"] = stage_compute_ms
 
         if not is_final_stage:
             # Forward activation downstream to next node in the pipeline
@@ -86,6 +89,7 @@ def create_worker_app(
                 sequence_step=packet.sequence_step,
                 stage_id=stage_id + 1,
                 is_prefill=packet.is_prefill,
+                stage_timings=timings,
             )
             next_packet.set_tensor(activation)
 
@@ -113,6 +117,7 @@ def create_worker_app(
                 text=mock_word,
                 is_finished=(packet.sequence_step >= 32),
                 latency_ms=elapsed_ms,
+                stage_timings=timings,
             )
 
     return app
