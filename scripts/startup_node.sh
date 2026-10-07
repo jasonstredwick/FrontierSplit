@@ -2,18 +2,30 @@
 # FrontierSplit: Node Startup Script (Runs on VM boot)
 set -euo pipefail
 
-echo "=== [FrontierSplit] Starting Node Provisioning ==="
+echo "=== [FrontierSplit] Node Initialization Starting ==="
 
-# 1. Update OS packages
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y build-essential git curl wget python3 python3-pip python3-venv
-
-# 2. Install NVIDIA Drivers if not present
-if ! command -v nvidia-smi &> /dev/null; then
-    echo "Installing NVIDIA GPU Drivers..."
-    curl -fsSL https://raw.githubusercontent.com/GoogleCloudPlatform/compute-gpu-installation/main/linux/install_gpu_driver.py --output /tmp/install_gpu_driver.py
-    python3 /tmp/install_gpu_driver.py
+# 1. Verify NVIDIA Driver & GPU presence
+if command -v nvidia-smi &> /dev/null; then
+    echo "NVIDIA GPU Detected:"
+    nvidia-smi
+else
+    echo "WARNING: nvidia-smi not yet found in PATH"
 fi
 
-echo "=== [FrontierSplit] Node Initialization Complete ==="
+# 2. Clone or update repository
+REPO_DIR="/opt/FrontierSplit"
+if [ ! -d "${REPO_DIR}" ]; then
+    echo "Cloning FrontierSplit repository..."
+    git clone https://github.com/jasonstredwick/FrontierSplit.git "${REPO_DIR}"
+else
+    echo "Updating FrontierSplit repository..."
+    cd "${REPO_DIR}" && git pull origin main || true
+fi
+
+# 3. Install requirements into system / DLVM python
+if [ -f "${REPO_DIR}/requirements.txt" ]; then
+    echo "Installing FrontierSplit dependencies..."
+    pip install -r "${REPO_DIR}/requirements.txt" || true
+fi
+
+echo "=== [FrontierSplit] Node Ready for Pipeline Service ==="
