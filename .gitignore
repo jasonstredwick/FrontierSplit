@@ -55,3 +55,4 @@ data/
 logs/
 wandb/
 .system_generated/
+eval_results/
