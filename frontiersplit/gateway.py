@@ -56,6 +56,13 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
 
 
+try:
+    from transformers import AutoTokenizer
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+
+
 def create_gateway_app(
     stage0_url: str = "http://localhost:50051",
     model_name: str = "frontiersplit-mixtral-8x7b",
@@ -65,10 +72,18 @@ def create_gateway_app(
 ) -> FastAPI:
     """Create FastAPI application with interleaved pipeline scheduler."""
     if scheduler is None:
+        tokenizer = None
+        if HAS_TRANSFORMERS and model_name and not model_name.startswith("frontiersplit-test"):
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+            except Exception:
+                tokenizer = None
+
         scheduler = PipelineScheduler(
             stage0_url=stage0_url,
             num_workers=num_workers,
             total_stages=total_stages,
+            tokenizer=tokenizer,
         )
 
     @asynccontextmanager

@@ -107,10 +107,12 @@ class PipelineScheduler:
         stage0_url: str = "http://localhost:50051",
         num_workers: int = 8,
         total_stages: int = 4,
+        tokenizer: Optional[Any] = None,
     ):
         self.stage0_url = stage0_url
         self.num_workers = num_workers
         self.total_stages = total_stages
+        self.tokenizer = tokenizer
 
         self.active_requests: Dict[str, ScheduledRequest] = {}
         self.ready_queue: asyncio.Queue[ScheduledRequest] = asyncio.Queue()
@@ -162,8 +164,24 @@ class PipelineScheduler:
         await self.ensure_started()
 
         request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        prompt_text = "\n".join([f"{m.role}: {m.content}" for m in messages])
-        prompt_tokens = [ord(c) % 32000 for c in prompt_text] if prompt_text else [1]
+        prompt_text = "\n".join([f"{getattr(m, 'role', 'user')}: {getattr(m, 'content', str(m))}" for m in messages])
+        
+        if self.tokenizer is not None:
+            if hasattr(self.tokenizer, "apply_chat_template") and messages:
+                try:
+                    formatted = [
+                        {"role": getattr(m, "role", "user"), "content": getattr(m, "content", str(m))}
+                        for m in messages
+                    ]
+                    prompt_tokens = self.tokenizer.apply_chat_template(
+                        formatted, add_generation_prompt=True, tokenize=True
+                    )
+                except Exception:
+                    prompt_tokens = self.tokenizer.encode(prompt_text, add_special_tokens=True)
+            else:
+                prompt_tokens = self.tokenizer.encode(prompt_text, add_special_tokens=True)
+        else:
+            prompt_tokens = [ord(c) % 32000 for c in prompt_text] if prompt_text else [1]
 
         req = ScheduledRequest(
             request_id=request_id,

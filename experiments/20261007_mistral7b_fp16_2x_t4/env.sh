@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FrontierSplit: Cluster Configuration & Environment Variables
+# FrontierSplit: Cluster Configuration Snapshot for Experiment 20261007_mistral7b_fp16_2x_t4
 
 PROJECT_ID="frontiersplit-proto"
 REGION="us-central1"

@@ -1,0 +1,53 @@
+{
+  "experiment_id": "20261007_mistral7b_fp16_2x_t4",
+  "created_at": "2026-10-07T07:30:00Z",
+  "model": {
+    "model_id": "mistralai/Mistral-7B-Instruct-v0.3",
+    "architecture": "MistralForCausalLM",
+    "precision": "fp16",
+    "bytes_per_param": 2.0,
+    "total_layers": 32,
+    "hidden_size": 4096,
+    "vocab_size": 32768,
+    "total_model_bytes": 15569256448,
+    "total_weights_gb": 14.50
+  },
+  "cluster": {
+    "num_nodes": 2,
+    "cloud_provider": "gcp",
+    "region": "us-central1",
+    "zone": "us-central1-a",
+    "machine_type": "n1-standard-4",
+    "accelerator": "type=nvidia-tesla-t4,count=1",
+    "vram_per_node_gb": 16.0,
+    "total_cluster_vram_gb": 32.0,
+    "boot_disk_size": "100GB",
+    "boot_disk_type": "pd-balanced",
+    "network_mesh": "frontiersplit-internal-mesh"
+  },
+  "partition_plan": [
+    {
+      "node_id": 0,
+      "stage_id": 0,
+      "layers": "0-15",
+      "layer_count": 16,
+      "roles": ["Embeddings", "TransformerLayers"],
+      "weights_gb": 7.25,
+      "vram_headroom_gb": 8.75
+    },
+    {
+      "node_id": 1,
+      "stage_id": 1,
+      "layers": "16-31",
+      "layer_count": 16,
+      "roles": ["TransformerLayers", "FinalNorm", "LMHead"],
+      "weights_gb": 7.25,
+      "vram_headroom_gb": 8.75
+    }
+  ],
+  "benchmarks": {
+    "ifeval": true,
+    "swebench_lite": true,
+    "concurrency_sweep": [1, 2, 4]
+  }
+}

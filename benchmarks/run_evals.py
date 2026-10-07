@@ -122,6 +122,7 @@ async def run_suite(
     benchmarks: str = "all",
     concurrency: int = 4,
     output_dir: str = "eval_results",
+    experiment_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute complete benchmark suite and write outputs."""
     os.makedirs(output_dir, exist_ok=True)
@@ -166,9 +167,34 @@ async def run_suite(
         output_path=report_path,
     )
 
+    # If an experiment directory is designated, mirror artifacts there
+    if experiment_dir:
+        report_exp_dir = os.path.join(experiment_dir, "report")
+        bench_exp_dir = os.path.join(experiment_dir, "benchmarks")
+        os.makedirs(report_exp_dir, exist_ok=True)
+        os.makedirs(bench_exp_dir, exist_ok=True)
+
+        with open(os.path.join(report_exp_dir, "eval_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(suite_summary, f, indent=2)
+        generate_markdown_report(
+            ifeval_summary=ifeval_results,
+            swebench_summary=swebench_results,
+            telemetry_before=telemetry_before,
+            telemetry_after=telemetry_after,
+            output_path=os.path.join(report_exp_dir, "eval_report.md"),
+        )
+        if ifeval_results:
+            with open(os.path.join(bench_exp_dir, "ifeval_traces.json"), "w", encoding="utf-8") as f:
+                json.dump(ifeval_results, f, indent=2)
+        if swebench_results:
+            with open(os.path.join(bench_exp_dir, "swebench_patches.json"), "w", encoding="utf-8") as f:
+                json.dump(swebench_results, f, indent=2)
+
     print(f"\n[Done] Evaluation artifacts generated:")
     print(f"  - Structured JSON: {json_path}")
     print(f"  - Markdown Report: {report_path}")
+    if experiment_dir:
+        print(f"  - Archived in experiment directory: {experiment_dir}")
 
     return suite_summary
 
@@ -181,6 +207,7 @@ def main():
     parser.add_argument("--benchmarks", type=str, choices=["ifeval", "swebench", "all"], default="all", help="Benchmarks to execute")
     parser.add_argument("--concurrency", type=int, default=4, help="Concurrent streams")
     parser.add_argument("--output-dir", type=str, default="eval_results", help="Directory for evaluation reports")
+    parser.add_argument("--experiment-dir", type=str, default=None, help="Path to siloed experiment directory")
     args = parser.parse_args()
 
     asyncio.run(
@@ -191,6 +218,7 @@ def main():
             benchmarks=args.benchmarks,
             concurrency=args.concurrency,
             output_dir=args.output_dir,
+            experiment_dir=args.experiment_dir,
         )
     )
 

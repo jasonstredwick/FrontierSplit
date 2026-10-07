@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# FrontierSplit: Spin up or start the 4-node L4 cluster
+# FrontierSplit: Spin up or start the pipeline cluster
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
 echo "=================================================================="
-echo " Launching FrontierSplit Cluster: ${NUM_NODES}x ${MACHINE_TYPE} (L4 GPU)"
+echo " Launching FrontierSplit Cluster: ${NUM_NODES}x ${MACHINE_TYPE} (${ACCELERATOR})"
 echo " Project: ${PROJECT_ID} | Zone: ${ZONE}"
 echo "=================================================================="
 
@@ -45,7 +45,7 @@ if [ -n "${EXISTING_INSTANCES}" ]; then
 else
     for i in $(seq 1 ${NUM_NODES}); do
         NODE_NAME="${NODE_PREFIX}-${i}"
-        echo "Creating new instance: ${NODE_NAME} with 1x NVIDIA L4..."
+        echo "Creating new instance: ${NODE_NAME} with ${ACCELERATOR}..."
         ${GCLOUD} compute instances create "${NODE_NAME}" \
             --project="${PROJECT_ID}" \
             --zone="${ZONE}" \
