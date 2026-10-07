@@ -52,6 +52,15 @@ echo " Model:           ${MODEL}"
 echo " Experiment Dir:  ${EXPERIMENT_DIR}"
 echo "=============================================================================="
 
+# Execute saturation benchmark runner if requested
+if [ "${BENCHMARK}" = "saturation" ]; then
+  exec "${VENV_PYTHON}" -m benchmarks.run_saturation \
+    --base-url "${BASE_URL}" \
+    --gateway-url "${GATEWAY_URL}" \
+    --model "${MODEL}" \
+    --experiment-dir "${EXPERIMENT_DIR}"
+fi
+
 # Execute unified runner
 exec "${VENV_PYTHON}" -m benchmarks.run_evals \
   --base-url "${BASE_URL}" \
