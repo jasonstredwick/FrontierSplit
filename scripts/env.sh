@@ -3,7 +3,7 @@
 
 PROJECT_ID="frontiersplit-proto"
 REGION="us-central1"
-ZONE="us-central1-c"
+ZONE="us-central1-a"
 NUM_NODES=4
 MACHINE_TYPE="g2-standard-4"
 ACCELERATOR="type=nvidia-l4,count=1"
