@@ -23,8 +23,10 @@ else
 fi
 
 # 3. Install requirements into system / DLVM python
+pip uninstall -y torchaudio || true
 if [ -f "${REPO_DIR}/requirements.txt" ]; then
     echo "Installing FrontierSplit dependencies..."
+    pip install --upgrade pip
     pip install -r "${REPO_DIR}/requirements.txt" || true
 fi
 
