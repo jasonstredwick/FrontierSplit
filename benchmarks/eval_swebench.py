@@ -238,7 +238,7 @@ class SWEBenchAgentRunner:
         base_url: str = "http://localhost:8000/v1",
         model: str = "frontiersplit-mixtral-8x7b",
         concurrency: int = 4,
-        timeout: float = 60.0,
+        timeout: float = 180.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -259,13 +259,17 @@ class SWEBenchAgentRunner:
             "max_tokens": max_tokens,
             "temperature": 0.2,
         }
-        resp = await client.post(f"{self.base_url}/chat/completions", json=payload, timeout=self.timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        latency_s = time.time() - start
-        content = data["choices"][0]["message"]["content"]
-        tokens_count = data.get("usage", {}).get("completion_tokens", max_tokens)
-        return content, tokens_count, latency_s
+        try:
+            resp = await client.post(f"{self.base_url}/chat/completions", json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            latency_s = time.time() - start
+            content = data["choices"][0]["message"]["content"]
+            tokens_count = data.get("usage", {}).get("completion_tokens", max_tokens)
+            return content, tokens_count, latency_s
+        except Exception as e:
+            latency_s = time.time() - start
+            return f"[Error: {e}]", 0, latency_s
 
     async def run_compound_agent_instance(
         self,

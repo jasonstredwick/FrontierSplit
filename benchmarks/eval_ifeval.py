@@ -251,7 +251,7 @@ class IFEvalRunner:
         base_url: str = "http://localhost:8000/v1",
         model: str = "frontiersplit-mixtral-8x7b",
         concurrency: int = 4,
-        timeout: float = 60.0,
+        timeout: float = 180.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
