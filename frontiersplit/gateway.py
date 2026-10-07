@@ -28,11 +28,12 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "frontiersplit-mixtral-8x7b"
+    model: str = "mistralai/Mistral-7B-Instruct-v0.3"
     messages: List[ChatMessage]
-    max_tokens: int = 512
+    max_tokens: Optional[int] = None
     temperature: float = 0.7
     stream: bool = False
+
 
 
 

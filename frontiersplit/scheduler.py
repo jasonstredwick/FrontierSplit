@@ -25,7 +25,7 @@ class ScheduledRequest:
         model: str,
         prompt_text: str,
         prompt_tokens: List[int],
-        max_tokens: int = 512,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         stream: bool = False,
         tokenizer: Optional[Any] = None,
@@ -34,10 +34,19 @@ class ScheduledRequest:
         self.model = model
         self.prompt_text = prompt_text
         self.prompt_tokens = prompt_tokens
-        self.max_tokens = max_tokens
+        self.tokenizer = tokenizer
+
+        # If max_tokens is unspecified, default to model capacity (up to 4096 output tokens)
+        if max_tokens is None:
+            max_model_len = getattr(self.tokenizer, "model_max_length", 32768) if self.tokenizer else 32768
+            if max_model_len > 131072:
+                max_model_len = 32768
+            self.max_tokens = max(1, min(4096, max_model_len - len(prompt_tokens)))
+        else:
+            self.max_tokens = max_tokens
+
         self.temperature = temperature
         self.stream = stream
-        self.tokenizer = tokenizer
 
         self.created_at = time.time()
         self.current_step = 0
@@ -161,7 +170,7 @@ class PipelineScheduler:
         self,
         model: str,
         messages: List[Any],
-        max_tokens: int = 512,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         stream: bool = False,
     ) -> ScheduledRequest:
@@ -238,7 +247,7 @@ class PipelineScheduler:
 
         # Offload blocking HTTP call to Stage 0 so async loop remains responsive
         def _post_forward() -> Dict[str, Any]:
-            resp = requests.post(f"{self.stage0_url}/forward", json=packet.model_dump(), timeout=180)
+            resp = requests.post(f"{self.stage0_url}/forward", json=packet.model_dump(), timeout=600)
             resp.raise_for_status()
             return resp.json()
 

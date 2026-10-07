@@ -56,6 +56,7 @@ def create_worker_app(
         print(f"[Worker Stage {stage_id}] Loading real model weights: {model_name_or_path} on device: {resolved_device}...")
         
         config = AutoConfig.from_pretrained(model_name_or_path)
+        model_context_length = getattr(config, "max_position_embeddings", 32768)
         total_layers = getattr(config, "num_hidden_layers", 32)
         layers_per_stage = total_layers // total_stages
         remainder = total_layers % total_stages
@@ -175,7 +176,7 @@ def create_worker_app(
                     next_packet.set_tensor(next_act)
 
                     try:
-                        resp = requests.post(f"{downstream_url}/forward", json=next_packet.model_dump(), timeout=180)
+                        resp = requests.post(f"{downstream_url}/forward", json=next_packet.model_dump(), timeout=600)
                         resp.raise_for_status()
                         return resp.json()
                     except Exception as e:
@@ -195,8 +196,8 @@ def create_worker_app(
                     if tokenizer is not None:
                         decoded_text = tokenizer.decode([next_token_id])
                         eos_id = getattr(tokenizer, "eos_token_id", None)
-                        # Natural termination on EOS token (scheduler enforces max_tokens)
-                        is_finished = (next_token_id == eos_id)
+                        # Natural termination on model EOS token or model architecture context ceiling
+                        is_finished = (next_token_id == eos_id) or (packet.sequence_step >= model_context_length)
                     else:
                         decoded_text = f"tok_{next_token_id % 100} "
                         is_finished = False
