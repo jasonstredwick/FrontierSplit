@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from pydantic import BaseModel, Field
 
+from frontiersplit.models import resolve_model_spec
 from frontiersplit.protocol import ActivationPacket, GenerationResponse
 
 
@@ -36,14 +37,13 @@ class ScheduledRequest:
         self.prompt_tokens = prompt_tokens
         self.tokenizer = tokenizer
 
-        # If max_tokens is unspecified, default to model capacity (up to 4096 output tokens)
+        # Align with model specification
+        model_spec = resolve_model_spec(model, tokenizer=self.tokenizer)
         if max_tokens is None:
-            max_model_len = getattr(self.tokenizer, "model_max_length", 32768) if self.tokenizer else 32768
-            if max_model_len > 131072:
-                max_model_len = 32768
-            self.max_tokens = max(1, min(4096, max_model_len - len(prompt_tokens)))
+            remaining_ctx = max(1, model_spec.context_window - len(prompt_tokens))
+            self.max_tokens = min(model_spec.max_generation_tokens, remaining_ctx)
         else:
-            self.max_tokens = max_tokens
+            self.max_tokens = min(max_tokens, model_spec.context_window)
 
         self.temperature = temperature
         self.stream = stream

@@ -17,6 +17,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 import uvicorn
 
+from frontiersplit.models import resolve_model_spec
 from frontiersplit.protocol import ActivationPacket, GenerationResponse
 
 # Optional PyTorch and Hugging Face imports
@@ -56,7 +57,6 @@ def create_worker_app(
         print(f"[Worker Stage {stage_id}] Loading real model weights: {model_name_or_path} on device: {resolved_device}...")
         
         config = AutoConfig.from_pretrained(model_name_or_path)
-        model_context_length = getattr(config, "max_position_embeddings", 32768)
         total_layers = getattr(config, "num_hidden_layers", 32)
         layers_per_stage = total_layers // total_stages
         remainder = total_layers % total_stages
@@ -72,6 +72,11 @@ def create_worker_app(
             tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         except Exception as e:
             print(f"[Worker Stage {stage_id}] Warning: Failed to load tokenizer: {e}")
+
+        # Resolve architecture specification and stop tokens dynamically for this model
+        model_spec = resolve_model_spec(model_name_or_path, tokenizer=tokenizer)
+        print(f"[Worker Stage {stage_id}] Model spec resolved: {model_spec.architecture}, context={model_spec.context_window}, stop_tokens={len(model_spec.stop_token_ids)}")
+
 
         # Load model weights in FP16
         full_model = AutoModelForCausalLM.from_pretrained(
@@ -195,9 +200,8 @@ def create_worker_app(
 
                     if tokenizer is not None:
                         decoded_text = tokenizer.decode([next_token_id])
-                        eos_id = getattr(tokenizer, "eos_token_id", None)
-                        # Natural termination on model EOS token or model architecture context ceiling
-                        is_finished = (next_token_id == eos_id) or (packet.sequence_step >= model_context_length)
+                        # Natural termination on model-specific stop tokens or context window limit
+                        is_finished = (next_token_id in model_spec.stop_token_ids) or (packet.sequence_step >= model_spec.context_window)
                     else:
                         decoded_text = f"tok_{next_token_id % 100} "
                         is_finished = False
