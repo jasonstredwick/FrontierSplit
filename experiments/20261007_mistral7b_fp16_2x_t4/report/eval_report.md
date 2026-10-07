@@ -1,6 +1,6 @@
 # FrontierSplit Evaluation Report: IFEval & SWE-bench Lite (3 Runs)
 
-**Generated**: 2026-10-07 16:00:13 UTC  
+**Generated**: 2026-10-07 17:25:20 UTC  
 **Cluster Architecture**: 2-Stage Distributed Pipeline Parallelism (PP) over VPC Ethernet  
 **Statistical Trials ($N$)**: `3` repeated iterations for statistical relevance  
 
@@ -16,11 +16,11 @@ Evaluated across **3 independent trials** with verifiable constraints:
 
 | Metric | Mean ± Std Dev | Min | Max | Median | Baseline / Reference |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Strict Prompt Accuracy** | `20.0% ± 0.0%` | `20.0%` | `20.0%` | `20.0%` | Strict raw prompt adherence |
-| **Loose Prompt Accuracy** | `20.0% ± 0.0%` | `20.0%` | `20.0%` | `20.0%` | Whitespace/markdown-tolerant |
-| **Strict Instruction Accuracy** | `38.46% ± 0.0%` | `38.46%` | `38.46%` | `38.46%` | Individual constraint verification |
-| **Loose Instruction Accuracy** | `38.46% ± 0.0%` | `38.46%` | `38.46%` | `38.46%` | Loose individual constraints |
-| **Throughput (tok/s)** | `13.0 ± 0.22` | `12.68` | `13.17` | `13.14` | Concurrent throughput |
+| **Strict Prompt Accuracy** | `40.0% ± 0.0%` | `40.0%` | `40.0%` | `40.0%` | Strict raw prompt adherence |
+| **Loose Prompt Accuracy** | `40.0% ± 0.0%` | `40.0%` | `40.0%` | `40.0%` | Whitespace/markdown-tolerant |
+| **Strict Instruction Accuracy** | `53.85% ± 0.0%` | `53.85%` | `53.85%` | `53.85%` | Individual constraint verification |
+| **Loose Instruction Accuracy** | `53.85% ± 0.0%` | `53.85%` | `53.85%` | `53.85%` | Loose individual constraints |
+| **Throughput (tok/s)** | `8.11 ± 0.13` | `7.94` | `8.27` | `8.12` | Concurrent throughput |
 | **Pipeline Saturation** | `57.1% ± 0.0%` | `57.1%` | `57.1%` | `57.1%` | Hardware utilization |
 
 ### 2. SWE-bench Lite Statistical Results (Autonomous Software Engineering)
@@ -31,16 +31,16 @@ Evaluated across **3 independent trials** with autonomous patch synthesis:
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **Valid Unified Diff Rate** | `100.0% ± 0.0%` | `100.0%` | `100.0%` | `100.0%` | Syntax-valid git diffs |
 | **Target File Hit Rate** | `100.0% ± 0.0%` | `100.0%` | `100.0%` | `100.0%` | Correct buggy file localization |
-| **Throughput (tok/s)** | `4.0 ± 0.04` | `3.97` | `4.06` | `3.98` | Multi-turn generation rate |
+| **Throughput (tok/s)** | `3.27 ± 0.03` | `3.23` | `3.31` | `3.27` | Multi-turn generation rate |
 | **Pipeline Saturation** | `57.1% ± 0.0%` | `57.1%` | `57.1%` | `57.1%` | Hardware utilization |
 
 ### 3. Per-Trial Iteration Breakdown
 
 | Trial | IFEval Strict % | IFEval Loose % | SWE-bench Diff % | Throughput (tok/s) | Saturation % | Duration (s) |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Run 1 | 20.0% | 20.0% | 100.0% | 13.17 | 57.1% | 315.04s |
-| Run 2 | 20.0% | 20.0% | 100.0% | 12.68 | 57.1% | 317.12s |
-| Run 3 | 20.0% | 20.0% | 100.0% | 13.14 | 57.1% | 309.85s |
+| Run 1 | 40.0% | 40.0% | 100.0% | 8.27 | 57.1% | 779.33s |
+| Run 2 | 40.0% | 40.0% | 100.0% | 8.12 | 57.1% | 790.5s |
+| Run 3 | 40.0% | 40.0% | 100.0% | 7.94 | 57.1% | 803.29s |
 
 ### 4. Pipeline Bubble Elimination Analysis ($K = 2$ Stages)
 

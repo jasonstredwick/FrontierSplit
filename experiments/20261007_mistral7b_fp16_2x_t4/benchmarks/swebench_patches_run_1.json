@@ -7,36 +7,36 @@
   "valid_diff_rate_pct": 100.0,
   "target_files_matched_count": 5,
   "target_files_matched_pct": 100.0,
-  "total_tokens": 960,
-  "elapsed_s": 242.089,
-  "throughput_tok_per_sec": 3.97,
-  "avg_latency_s": 149.915,
+  "total_tokens": 1894,
+  "elapsed_s": 571.965,
+  "throughput_tok_per_sec": 3.31,
+  "avg_latency_s": 364.512,
   "bubble_fraction": 0.4286,
   "bubble_elimination_pct": 57.1,
   "results": [
     {
       "instance_id": "django__django-11099",
       "repo": "django/django",
-      "total_tokens": 192,
-      "elapsed_s": 168.559,
+      "total_tokens": 384,
+      "elapsed_s": 416.146,
       "step_metrics": [
         {
           "step": "analysis",
-          "tokens": 64,
-          "latency_s": 29.03
+          "tokens": 128,
+          "latency_s": 66.017
         },
         {
           "step": "patch_generation",
-          "tokens": 128,
-          "latency_s": 139.53
+          "tokens": 256,
+          "latency_s": 350.129
         }
       ],
-      "generated_patch": "\n\n```diff\n--- a/django/contrib/auth/validators.py\n+++ b/django/contrib/auth/validators.py\n@@ -10,7 +10,7 @@ from re import ASCII, UNICODE, U\n from django.utils.translation import gettext_lazy as _\n\n-ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$'\n+ASCII_USERNAME_REGEX = r'^[\\w.@+-]+$[\\n\\r]?$'",
+      "generated_patch": "\n\ndiff --git a/django/contrib/auth/validators.py b/django/contrib/auth/validators.py\nindex 8e6888e..8888888 100644\n--- a/django/contrib/auth/validators.py\n+++ b/django/contrib/auth/validators.py\n@@ -10,7 +10,7 @@ from django.core.exceptions import ValidationError\n from django.utils.translation import gettext as _\n from django.utils.regex_helpers import (\n-    ASCII_LETTERS_OR_DIGITS,\n+    ASCII_LETTERS_OR_DIGITS_NO_NEWLINE,\n     DOT,\n     DOT_ATOM,\n     DOT_SEP,\n@@ -17,7 +17,7 @@ from django.utils.regex_helpers import (\n     DOT_SEP_OR_AT,\n     DOT_SEP_OR_AT_OR_PERIOD,\n     DOT_SEP_OR_AT",
       "is_valid_diff": true,
       "affected_files": [
         "django/contrib/auth/validators.py"
       ],
-      "hunk_count": 1,
+      "hunk_count": 2,
       "lines_added": 1,
       "lines_removed": 1,
       "matches_target_files": true,
@@ -45,77 +45,77 @@
     {
       "instance_id": "psf__requests-2148",
       "repo": "psf/requests",
-      "total_tokens": 192,
-      "elapsed_s": 168.441,
+      "total_tokens": 384,
+      "elapsed_s": 416.829,
       "step_metrics": [
         {
           "step": "analysis",
-          "tokens": 64,
-          "latency_s": 29.071
+          "tokens": 128,
+          "latency_s": 66.018
         },
         {
           "step": "patch_generation",
-          "tokens": 128,
-          "latency_s": 139.37
+          "tokens": 256,
+          "latency_s": 350.811
         }
       ],
-      "generated_patch": "\n\n```diff\n--- a/requests/models.py\n+++ b/requests/models.py\n@@ -114,16 +114,16 @@ class Response(BaseHTTPResponse):\n         if not self.raw:\n             self.raw = Response(self.content, status=self.status_code,\n                                  headers=self._headers,\n                                  url=self.url, request=self.request)\n\n-    def raise_for_status(self):\n+    def raise_for_status(self):",
+      "generated_patch": "\n\nassistant:\n\n```diff\n--- a/requests/models.py\n+++ b/requests/models.py\n@@ -184,16 +184,18 @@ class Response(BaseResponse):\n         if not self.raw:\n             self._content = self._content_or_none()\n\n         if self._content is None:\n             return\n\n-        try:\n-            if self.encoding:\n-                self._content = self._content.decode(self.encoding)\n-            self._content = self._content.strip()\n+        try:\n+            if self.encoding:\n+                self._content = self._content.decode(self.encoding)\n+            self._content = self._content.strip()\n+            if isinstance(self._content, bytes):\n+                self._content = io.BytesIO(self._content)\n+            elif isinstance(self._content, str):\n+                self._content = io.TextIOWrapper(io.BytesIO(self._content.encode()), encoding=self.encoding)\n         except Exception as e:",
       "is_valid_diff": true,
       "affected_files": [
         "requests/models.py"
       ],
       "hunk_count": 1,
-      "lines_added": 1,
-      "lines_removed": 1,
+      "lines_added": 8,
+      "lines_removed": 4,
       "matches_target_files": true,
       "verification_error": null
     },
     {
       "instance_id": "sympy__sympy-13480",
       "repo": "sympy/sympy",
-      "total_tokens": 192,
-      "elapsed_s": 169.482,
+      "total_tokens": 384,
+      "elapsed_s": 417.254,
       "step_metrics": [
         {
           "step": "analysis",
-          "tokens": 64,
-          "latency_s": 29.479
+          "tokens": 128,
+          "latency_s": 66.122
         },
         {
           "step": "patch_generation",
-          "tokens": 128,
-          "latency_s": 140.003
+          "tokens": 256,
+          "latency_s": 351.133
         }
       ],
-      "generated_patch": "\n\n```diff\n--- a/sympy/functions/elementary/hyperbolic.py\n+++ b/sympy/functions/elementary/hyperbolic.py\n@@ -104,16 +104,16 @@ class Coth(HyperbolicFunction):\n         if not is_number(x):\n             if not is_symbol(x):\n                 raise TypeError(\"x must be a number or symbol\")\n-            if x not in self.args:\n+            if x not in self.free_symbols:\n",
+      "generated_patch": "\n\n--- a/sympy/functions/elementary/hyperbolic.py\n+++ b/sympy/functions/elementary/hyperbolic.py\n@@ -104,16 +104,18 @@ class Coth(HyperbolicFunction):\n         if not is_number(arg):\n             arg = simplify(arg)\n\n-        if arg.has(x):\n-            arg = arg.subs(x, self.arg)\n+        if arg.has(x) and arg.free_symbols().issubset(self.arg.free_symbols()):\n+            arg = arg.subs(x, self.arg)\n\n         if arg.has(I):\n             arg = arg.subs(I, sqrt(-1))\n\n         if arg.has(pi):\n             arg = arg.subs(pi, sympify(math.pi))\n@@ -120,7 +122,7 @@ class Coth(HyperbolicFunction):\n         if arg.has(x):\n             arg = arg.subs",
       "is_valid_diff": true,
       "affected_files": [
         "sympy/functions/elementary/hyperbolic.py"
       ],
-      "hunk_count": 1,
-      "lines_added": 1,
-      "lines_removed": 1,
+      "hunk_count": 2,
+      "lines_added": 2,
+      "lines_removed": 2,
       "matches_target_files": true,
       "verification_error": null
     },
     {
       "instance_id": "pytest-dev__pytest-5221",
       "repo": "pytest-dev/pytest",
-      "total_tokens": 192,
-      "elapsed_s": 169.457,
+      "total_tokens": 384,
+      "elapsed_s": 416.519,
       "step_metrics": [
         {
           "step": "analysis",
-          "tokens": 64,
-          "latency_s": 29.48
+          "tokens": 128,
+          "latency_s": 66.173
         },
         {
           "step": "patch_generation",
-          "tokens": 128,
-          "latency_s": 139.977
+          "tokens": 256,
+          "latency_s": 350.347
         }
       ],
-      "generated_patch": "\n\n```diff\n--- a/src/_pytest/python.py\n+++ b/src/_pytest/python.py\n@@ -104,6 +104,10 @@ def main(argv=sys.argv[1:], options=None):\n         if options.fixtures:\n             print_fixtures(fixtures, options)\n             return\n\n+        # Add fixture scope information\n+        for fixture in fixtures:\n+            scope = fixture.scope\n+            print(f\"{fixture.name} ({scope})",
+      "generated_patch": "\n\nassistant:\n\n```diff\n--- a/src/_pytest/python.py\n+++ b/src/_pytest/python.py\n@@ -114,6 +114,10 @@ def runtest(item, session, options, args, monkeypatch):\n         if not item.fixtureinfo:\n             continue\n\n         # ... (existing code)\n+        scope = item.fixtureinfo.scope\n+        scope_str = scope.capitalize() if scope else 'Global'\n+        fixture_info = f\"Scope: {scope_str}\"\n+\n         if item.fixtureinfo.name in options.fixtures:\n             print(f\"{fixture_info} {item.fixtureinfo.name}: {item.fixtureinfo.doc}\")\n         # ... (existing code)\n```\n\nThis patch adds a new variable `scope` to store the fixture scope, converts it to a capitalized string, and sets the `fixture_info` variable to include the scope information. Then, it prints the updated `fixture_info` when the fixture name is",
       "is_valid_diff": true,
       "affected_files": [
         "src/_pytest/python.py"
@@ -129,27 +129,27 @@
     {
       "instance_id": "pallets__flask-4045",
       "repo": "pallets/flask",
-      "total_tokens": 192,
-      "elapsed_s": 73.637,
+      "total_tokens": 358,
+      "elapsed_s": 155.81,
       "step_metrics": [
         {
           "step": "analysis",
-          "tokens": 64,
-          "latency_s": 13.058
+          "tokens": 128,
+          "latency_s": 29.347
         },
         {
           "step": "patch_generation",
-          "tokens": 128,
-          "latency_s": 60.579
+          "tokens": 230,
+          "latency_s": 126.463
         }
       ],
-      "generated_patch": "\n\n```diff\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -114,7 +114,8 @@ def register_blueprint(app, blueprint):\n         if not isinstance(blueprint, Blueprint):\n             raise TypeError('Expected a Flask Blueprint but got %s' % type(blueprint).__name__)\n         if blueprint.name is None:\n-            blueprint.name = blueprint.__name__\n+            if '.' in blue",
+      "generated_patch": "\n\n```diff\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -114,7 +114,7 @@ def register_blueprint(app, blueprint):\n         if not isinstance(blueprint, Blueprint):\n             raise TypeError('Expected a Flask Blueprint but got %s'\n                              % type(blueprint).__name__)\n         if blueprint.name is None:\n-            blueprint.name = blueprint.__name__\n+            if '.' in blueprint.__name__:\n+                raise ValueError('Blueprint name cannot contain dots.')\n             blueprint.name = blueprint.name.lower()\n         if blueprint.url_prefix is None:\n             blueprint.url_prefix = ''\n```\n\nThis patch adds a check for the presence of dots in the blueprint name before setting it. If a dot is found, it raises a ValueError with an appropriate error message.",
       "is_valid_diff": true,
       "affected_files": [
         "src/flask/blueprints.py"
       ],
       "hunk_count": 1,
-      "lines_added": 1,
+      "lines_added": 2,
       "lines_removed": 1,
       "matches_target_files": true,
       "verification_error": null
