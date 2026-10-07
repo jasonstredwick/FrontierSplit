@@ -32,9 +32,8 @@ EXISTING_INSTANCES=$(${GCLOUD} compute instances list \
   --filter="name ~ '^${NODE_PREFIX}'" \
   --format="value(name)" || true)
 
-for i in $(seq 0 $((NUM_NODES - 1))); do
-    NODE_NAME="${NODE_PREFIX}-${i}"
-    if echo "${EXISTING_INSTANCES}" | grep -qw "${NODE_NAME}"; then
+if [ -n "${EXISTING_INSTANCES}" ]; then
+    for NODE_NAME in ${EXISTING_INSTANCES}; do
         STATUS=$(${GCLOUD} compute instances describe "${NODE_NAME}" --project="${PROJECT_ID}" --zone="${ZONE}" --format="value(status)")
         if [ "${STATUS}" == "TERMINATED" ]; then
             echo "Starting stopped instance: ${NODE_NAME}..."
@@ -42,7 +41,10 @@ for i in $(seq 0 $((NUM_NODES - 1))); do
         else
             echo "Instance ${NODE_NAME} is already ${STATUS}."
         fi
-    else
+    done
+else
+    for i in $(seq 1 ${NUM_NODES}); do
+        NODE_NAME="${NODE_PREFIX}-${i}"
         echo "Creating new instance: ${NODE_NAME} with 1x NVIDIA L4..."
         ${GCLOUD} compute instances create "${NODE_NAME}" \
             --project="${PROJECT_ID}" \
@@ -56,8 +58,8 @@ for i in $(seq 0 $((NUM_NODES - 1))); do
             --maintenance-policy="TERMINATE" \
             --tags="frontiersplit-node" \
             --metadata-from-file="startup-script=${SCRIPT_DIR}/startup_node.sh" &
-    fi
-done
+    done
+fi
 
 wait
 
