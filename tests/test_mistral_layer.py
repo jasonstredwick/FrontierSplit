@@ -22,18 +22,12 @@ class TestMistralLayerInterface(unittest.TestCase):
         x = torch.randn(1, 4, 128)
         
         # Test calling layer directly with just hidden_states
+        import traceback
         try:
             out = layer(x)
             print("Direct call succeeded:", type(out))
-        except Exception as e:
-            print("Direct call failed with:", type(e), e)
-            # Try with position_ids
-            position_ids = torch.arange(4).unsqueeze(0)
-            try:
-                out = layer(x, position_ids=position_ids)
-                print("Call with position_ids succeeded!")
-            except Exception as e2:
-                print("Call with position_ids failed:", type(e2), e2)
+        except Exception:
+            traceback.print_exc()
 
 if __name__ == "__main__":
     unittest.main()
