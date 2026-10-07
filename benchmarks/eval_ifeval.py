@@ -262,7 +262,7 @@ class IFEvalRunner:
         self,
         client: httpx.AsyncClient,
         prompt_item: IFEvalPrompt,
-        max_tokens: int = 128,
+        max_tokens: int = 512,
     ) -> Dict[str, Any]:
         """Send prompt to gateway, measure latency, and verify all constraints."""
         start_time = time.time()
@@ -333,7 +333,7 @@ class IFEvalRunner:
     async def run_evaluation(
         self,
         dataset: Optional[List[IFEvalPrompt]] = None,
-        max_tokens: int = 128,
+        max_tokens: int = 512,
     ) -> Dict[str, Any]:
         """Execute concurrent evaluation over the benchmark dataset."""
         items = dataset or DEFAULT_IFEVAL_DATASET
@@ -462,7 +462,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=4, help="Concurrent request streams")
     parser.add_argument("--dataset", type=str, default=None, help="Path to external JSONL dataset")
     parser.add_argument("--output", type=str, default=None, help="Path to write JSON results")
-    parser.add_argument("--max-tokens", type=int, default=128, help="Max tokens per prompt")
+    parser.add_argument("--max-tokens", type=int, default=512, help="Max tokens per prompt")
     args = parser.parse_args()
 
     dataset = load_dataset_from_jsonl(args.dataset) if args.dataset else None

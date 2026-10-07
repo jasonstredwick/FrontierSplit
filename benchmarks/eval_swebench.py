@@ -275,7 +275,7 @@ class SWEBenchAgentRunner:
         self,
         client: httpx.AsyncClient,
         instance: SWEBenchInstance,
-        tokens_per_step: int = 64,
+        tokens_per_step: int = 128,
     ) -> Dict[str, Any]:
         """Execute a full multi-turn compound agent cycle on an issue instance:
         Step 1: Root cause analysis & file localization
@@ -344,7 +344,7 @@ class SWEBenchAgentRunner:
     async def run_evaluation(
         self,
         dataset: Optional[List[SWEBenchInstance]] = None,
-        tokens_per_step: int = 64,
+        tokens_per_step: int = 128,
     ) -> Dict[str, Any]:
         """Run concurrent multi-agent evaluations over the SWE-bench dataset."""
         items = dataset or DEFAULT_SWEBENCH_DATASET
