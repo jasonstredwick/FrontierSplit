@@ -153,6 +153,14 @@ def create_worker_app(
             low_cpu_mem_usage=True,
         )
 
+        model_config = getattr(full_model, "config", None)
+        mask_function = None
+        try:
+            from transformers.models.mistral.modeling_mistral import create_causal_mask, create_sliding_window_causal_mask
+            mask_function = create_causal_mask if getattr(model_config, "sliding_window", None) is None else create_sliding_window_causal_mask
+        except Exception as e:
+            print(f"[Worker Stage {stage_id}] Warning: Could not import Mistral causal mask functions: {e}")
+
         base_model = getattr(full_model, "model", getattr(full_model, "transformer", full_model))
         all_layers = getattr(base_model, "layers", getattr(base_model, "h", []))
         raw_rotary = getattr(base_model, "rotary_emb", None)
@@ -163,7 +171,12 @@ def create_worker_app(
             embed_tokens = raw_embed.to(resolved_device) if raw_embed is not None else None
 
         for idx in range(start_layer, end_layer + 1):
-            assigned_layers.append(all_layers[idx].to(resolved_device))
+            layer = all_layers[idx].to(resolved_device)
+            # Re-index layer's internal self_attn.layer_idx to local index (0..len-1)
+            # so that each stage worker tracks KV cache cleanly without empty padding
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
+                layer.self_attn.layer_idx = idx - start_layer
+            assigned_layers.append(layer)
 
         if is_final_stage:
             raw_norm = getattr(base_model, "norm", getattr(base_model, "ln_f", None))
@@ -243,33 +256,85 @@ def create_worker_app(
                         prompt_len = hidden_states.shape[1]
                         cache = kv_store.get_or_create(packet.request_id, prompt_len=prompt_len, max_tokens=packet.max_tokens)
                         pos_ids = torch.arange(prompt_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
-                        pos_emb = rotary_emb(hidden_states, pos_ids) if rotary_emb is not None else None
+                        causal_mask = mask_function(
+                            config=model_config,
+                            inputs_embeds=hidden_states,
+                            attention_mask=None,
+                            past_key_values=cache,
+                            position_ids=pos_ids,
+                        ) if mask_function is not None else None
+                        pos_emb = rotary_emb(hidden_states, position_ids=pos_ids) if rotary_emb is not None else None
                         for layer in assigned_layers:
-                            layer_out = layer(hidden_states, position_embeddings=pos_emb, past_key_value=cache, use_cache=True)
+                            layer_out = layer(
+                                hidden_states,
+                                attention_mask=causal_mask,
+                                position_ids=pos_ids,
+                                past_key_values=cache,
+                                use_cache=True,
+                                position_embeddings=pos_emb,
+                            )
                             hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
                     else:
                         cache = kv_store.get(packet.request_id)
                         if cache is not None:
                             curr_len = cache.get_seq_length()
                             pos_ids = torch.tensor([[curr_len]], dtype=torch.long, device=resolved_device)
-                            pos_emb = rotary_emb(hidden_states, pos_ids) if rotary_emb is not None else None
+                            causal_mask = mask_function(
+                                config=model_config,
+                                inputs_embeds=hidden_states,
+                                attention_mask=None,
+                                past_key_values=cache,
+                                position_ids=pos_ids,
+                            ) if mask_function is not None else None
+                            pos_emb = rotary_emb(hidden_states, position_ids=pos_ids) if rotary_emb is not None else None
                             for layer in assigned_layers:
-                                layer_out = layer(hidden_states, position_embeddings=pos_emb, past_key_value=cache, use_cache=True)
+                                layer_out = layer(
+                                    hidden_states,
+                                    attention_mask=causal_mask,
+                                    position_ids=pos_ids,
+                                    past_key_values=cache,
+                                    use_cache=True,
+                                    position_embeddings=pos_emb,
+                                )
                                 hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
                             kv_store.update_seq_len(packet.request_id, 1)
                         else:
                             seq_len = hidden_states.shape[1]
                             pos_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
-                            pos_emb = rotary_emb(hidden_states, position_ids) if rotary_emb is not None else None
+                            causal_mask = mask_function(
+                                config=model_config,
+                                inputs_embeds=hidden_states,
+                                attention_mask=None,
+                                past_key_values=None,
+                                position_ids=pos_ids,
+                            ) if mask_function is not None else None
+                            pos_emb = rotary_emb(hidden_states, position_ids=pos_ids) if rotary_emb is not None else None
                             for layer in assigned_layers:
-                                layer_out = layer(hidden_states, position_embeddings=pos_emb)
+                                layer_out = layer(
+                                    hidden_states,
+                                    attention_mask=causal_mask,
+                                    position_ids=pos_ids,
+                                    position_embeddings=pos_emb,
+                                )
                                 hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
                 else:
                     seq_len = hidden_states.shape[1]
                     pos_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
-                    pos_emb = rotary_emb(hidden_states, position_ids) if rotary_emb is not None else None
+                    causal_mask = mask_function(
+                        config=model_config,
+                        inputs_embeds=hidden_states,
+                        attention_mask=None,
+                        past_key_values=None,
+                        position_ids=pos_ids,
+                    ) if mask_function is not None else None
+                    pos_emb = rotary_emb(hidden_states, position_ids=pos_ids) if rotary_emb is not None else None
                     for layer in assigned_layers:
-                        layer_out = layer(hidden_states, position_embeddings=pos_emb)
+                        layer_out = layer(
+                            hidden_states,
+                            attention_mask=causal_mask,
+                            position_ids=pos_ids,
+                            position_embeddings=pos_emb,
+                        )
                         hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
                 stage_compute_ms = (time.time() - start_time) * 1000
@@ -406,17 +471,43 @@ def create_worker_app(
                         if cache is not None:
                             curr_len = cache.get_seq_length()
                             pos_ids = torch.tensor([[curr_len]], dtype=torch.long, device=resolved_device)
-                            p_emb = rotary_emb(h_b, pos_ids) if rotary_emb is not None else None
+                            c_mask = mask_function(
+                                config=model_config,
+                                inputs_embeds=h_b,
+                                attention_mask=None,
+                                past_key_values=cache,
+                                position_ids=pos_ids,
+                            ) if mask_function is not None else None
+                            p_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
                             for layer in assigned_layers:
-                                l_out = layer(h_b, position_embeddings=p_emb, past_key_value=cache, use_cache=True)
+                                l_out = layer(
+                                    h_b,
+                                    attention_mask=c_mask,
+                                    position_ids=pos_ids,
+                                    past_key_values=cache,
+                                    use_cache=True,
+                                    position_embeddings=p_emb,
+                                )
                                 h_b = l_out[0] if isinstance(l_out, tuple) else l_out
                             kv_store.update_seq_len(req_id, 1)
                         else:
                             seq_len = h_b.shape[1]
                             pos_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
-                            p_emb = rotary_emb(h_b, pos_ids) if rotary_emb is not None else None
+                            c_mask = mask_function(
+                                config=model_config,
+                                inputs_embeds=h_b,
+                                attention_mask=None,
+                                past_key_values=None,
+                                position_ids=pos_ids,
+                            ) if mask_function is not None else None
+                            p_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
                             for layer in assigned_layers:
-                                l_out = layer(h_b, position_embeddings=p_emb)
+                                l_out = layer(
+                                    h_b,
+                                    attention_mask=c_mask,
+                                    position_ids=pos_ids,
+                                    position_embeddings=p_emb,
+                                )
                                 h_b = l_out[0] if isinstance(l_out, tuple) else l_out
                         batch_outs.append(h_b)
                     hidden_states = torch.cat(batch_outs, dim=0)
@@ -430,30 +521,53 @@ def create_worker_app(
                         max_tok = packet.max_tokens_list[b_idx] if packet.max_tokens_list else None
                         cache = kv_store.get_or_create(req_id, prompt_len=prompt_len, max_tokens=max_tok)
                         pos_ids = torch.arange(prompt_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
-                        p_emb = rotary_emb(h_b, pos_ids) if rotary_emb is not None else None
+                        c_mask = mask_function(
+                            config=model_config,
+                            inputs_embeds=h_b,
+                            attention_mask=None,
+                            past_key_values=cache,
+                            position_ids=pos_ids,
+                        ) if mask_function is not None else None
+                        p_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
                         for layer in assigned_layers:
-                            l_out = layer(h_b, position_embeddings=p_emb, past_key_value=cache, use_cache=True)
+                            l_out = layer(
+                                h_b,
+                                attention_mask=c_mask,
+                                position_ids=pos_ids,
+                                past_key_values=cache,
+                                use_cache=True,
+                                position_embeddings=p_emb,
+                            )
                             h_b = l_out[0] if isinstance(l_out, tuple) else l_out
                         batch_outs.append(h_b)
                     hidden_states = torch.cat(batch_outs, dim=0)
 
                 else:
                     seq_len = hidden_states.shape[1]
-                    pos_emb = None
-                    if rotary_emb is not None:
-                        if packet.attention_mask:
-                            mask_tensor = torch.tensor(packet.attention_mask, device=resolved_device, dtype=torch.long)
-                            position_ids = (mask_tensor.cumsum(dim=-1) - 1).clamp(min=0)
-                        else:
-                            position_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0).expand(batch_size, -1)
-                        pos_emb = rotary_emb(hidden_states, position_ids)
+                    mask_tensor = None
+                    if packet.attention_mask:
+                        mask_tensor = torch.tensor(packet.attention_mask, device=resolved_device, dtype=torch.long)
+                        position_ids = (mask_tensor.cumsum(dim=-1) - 1).clamp(min=0)
+                    else:
+                        position_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0).expand(batch_size, -1)
+
+                    c_mask = mask_function(
+                        config=model_config,
+                        inputs_embeds=hidden_states,
+                        attention_mask=mask_tensor,
+                        past_key_values=None,
+                        position_ids=position_ids,
+                    ) if mask_function is not None else None
+                    pos_emb = rotary_emb(hidden_states, position_ids=position_ids) if rotary_emb is not None else None
 
                     for layer in assigned_layers:
-                        if pos_emb is not None:
-                            layer_out = layer(hidden_states, position_embeddings=pos_emb)
-                        else:
-                            layer_out = layer(hidden_states)
-                        hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+                        l_out = layer(
+                            hidden_states,
+                            attention_mask=c_mask,
+                            position_ids=position_ids,
+                            position_embeddings=pos_emb,
+                        )
+                        hidden_states = l_out[0] if isinstance(l_out, tuple) else l_out
 
                 stage_compute_ms = (time.time() - start_time) * 1000
                 timings = dict(packet.stage_timings)
