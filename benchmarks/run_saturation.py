@@ -200,7 +200,7 @@ def generate_saturation_report(
 
 This benchmark measures the empirical **Throughput Saturation Curve** of FrontierSplit as concurrent request load scales from single-stream ($M = 1$) to high concurrency ($M = 16$). 
 
-By distributing weights across {k_stages} nodes, each node retains **$\sim {vram_per_node}\\text{{ GB}}$ of unallocated VRAM**, unlocking multi-stream concurrency that would cause an instant Out-Of-Memory (OOM) crash on a single 16 GB GPU.
+By distributing weights across {k_stages} nodes, each node retains **$\\sim {vram_per_node}\\text{{ GB}}$ of unallocated VRAM**, unlocking multi-stream concurrency that would cause an instant Out-Of-Memory (OOM) crash on a single 16 GB GPU.
 
 ### Key Highlights:
 * **Peak Aggregate Throughput:** **`{peak_tp} tok/s`** achieved at Concurrency $M = {peak_m}$.
