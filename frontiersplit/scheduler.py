@@ -198,9 +198,17 @@ class PipelineScheduler:
                         {"role": getattr(m, "role", "user"), "content": getattr(m, "content", str(m))}
                         for m in messages
                     ]
-                    prompt_tokens = self.tokenizer.apply_chat_template(
+                    encoded = self.tokenizer.apply_chat_template(
                         formatted, add_generation_prompt=True, tokenize=True
                     )
+                    if isinstance(encoded, dict) or hasattr(encoded, "get"):
+                        prompt_tokens = list(encoded.get("input_ids", encoded))
+                    elif isinstance(encoded, (list, tuple)):
+                        prompt_tokens = list(encoded)
+                    elif hasattr(encoded, "tolist"):
+                        prompt_tokens = encoded.tolist()
+                    else:
+                        prompt_tokens = list(encoded)
                 except Exception:
                     prompt_tokens = self.tokenizer.encode(prompt_text, add_special_tokens=True)
             else:
