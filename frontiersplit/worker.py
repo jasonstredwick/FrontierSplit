@@ -55,8 +55,17 @@ except ImportError:
 class WorkerKVCacheStore:
     """Manages session-keyed KV caches and VRAM budget guard for a pipeline worker stage."""
 
-    def __init__(self, max_tokens_budget: int = 100_000):
+    def __init__(
+        self,
+        max_tokens_budget: int = 100_000,
+        model_config: Optional[Any] = None,
+        device: Optional[str] = None,
+        use_static_cache: bool = False,
+    ):
         self.max_tokens_budget = max_tokens_budget
+        self.model_config = model_config
+        self.device = device
+        self.use_static_cache = use_static_cache
         self.allocated_tokens: int = 0
         self.sessions: Dict[str, Any] = {}
         self.session_caps: Dict[str, int] = {}
@@ -72,9 +81,26 @@ class WorkerKVCacheStore:
 
         if HAS_TORCH:
             try:
-                from transformers.cache_utils import DynamicCache
-                cache = DynamicCache()
-            except ImportError:
+                if self.use_static_cache and self.model_config is not None:
+                    from transformers.cache_utils import StaticCache
+                    max_len = 64
+                    for b in (64, 128, 256, 512, 1024, 2048):
+                        if b >= hard_cap:
+                            max_len = b
+                            break
+                    else:
+                        max_len = ((hard_cap + 63) // 64) * 64
+                    cache = StaticCache(
+                        config=self.model_config,
+                        max_cache_len=max_len,
+                        max_batch_size=1,
+                        device=self.device or "cpu",
+                        dtype=torch.float16,
+                    )
+                else:
+                    from transformers.cache_utils import DynamicCache
+                    cache = DynamicCache()
+            except (ImportError, Exception):
                 cache = None
         else:
             cache = []
@@ -124,6 +150,7 @@ def create_worker_app(
     tcp_port: Optional[int] = None,
     downstream_tcp: Optional[str] = None,
     quantize_activations: bool = False,
+    use_static_cache: Optional[bool] = None,
 ) -> FastAPI:
     """Creates a FastAPI app and optional persistent binary TCP server for a pipeline stage worker."""
     is_first_stage = (stage_id == 0)
@@ -372,7 +399,14 @@ def create_worker_app(
         embeddings = np.random.randn(vocab_size, hidden_size).astype(np.float32) * 0.02 if is_first_stage else None
         lm_head_synth = np.random.randn(hidden_size, vocab_size).astype(np.float32) * 0.02 if is_final_stage else None
 
-    kv_store = WorkerKVCacheStore()
+    if use_static_cache is None:
+        use_static_cache = bool(resolved_device and resolved_device.startswith("xla"))
+
+    kv_store = WorkerKVCacheStore(
+        model_config=config if use_real_model else None,
+        device=resolved_device,
+        use_static_cache=use_static_cache,
+    )
     compute_lock = asyncio.Lock()
     reply_clients: Dict[str, BinaryTransportClient] = {}
 
@@ -448,20 +482,24 @@ def create_worker_app(
                             position_ids=pos_ids,
                         ) if mask_function is not None else None
                         pos_emb = rotary_emb(hidden_states, position_ids=pos_ids) if rotary_emb is not None else None
+                        is_static = hasattr(cache, "get_max_cache_shape") or (cache is not None and cache.__class__.__name__ == "StaticCache")
+                        cache_pos = torch.arange(prompt_len, dtype=torch.long, device=resolved_device) if is_static else None
                         for layer in assigned_layers:
-                            layer_out = layer(
-                                hidden_states,
-                                attention_mask=causal_mask,
-                                position_ids=pos_ids,
-                                past_key_values=cache,
-                                use_cache=True,
-                                position_embeddings=pos_emb,
-                            )
+                            kwargs = {
+                                "attention_mask": causal_mask,
+                                "position_ids": pos_ids,
+                                "past_key_values": cache,
+                                "use_cache": True,
+                                "position_embeddings": pos_emb,
+                            }
+                            if cache_pos is not None:
+                                kwargs["cache_position"] = cache_pos
+                            layer_out = layer(hidden_states, **kwargs)
                             hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
                     else:
                         cache = kv_store.get(packet.request_id)
                         if cache is not None:
-                            curr_len = cache.get_seq_length()
+                            curr_len = kv_store.get_seq_len(packet.request_id)
                             pos_ids = torch.tensor([[curr_len]], dtype=torch.long, device=resolved_device)
                             causal_mask = mask_function(
                                 config=model_config,
@@ -471,15 +509,19 @@ def create_worker_app(
                                 position_ids=pos_ids,
                             ) if mask_function is not None else None
                             pos_emb = rotary_emb(hidden_states, position_ids=pos_ids) if rotary_emb is not None else None
+                            is_static = hasattr(cache, "get_max_cache_shape") or (cache is not None and cache.__class__.__name__ == "StaticCache")
+                            cache_pos = torch.tensor([curr_len], dtype=torch.long, device=resolved_device) if is_static else None
                             for layer in assigned_layers:
-                                layer_out = layer(
-                                    hidden_states,
-                                    attention_mask=causal_mask,
-                                    position_ids=pos_ids,
-                                    past_key_values=cache,
-                                    use_cache=True,
-                                    position_embeddings=pos_emb,
-                                )
+                                kwargs = {
+                                    "attention_mask": causal_mask,
+                                    "position_ids": pos_ids,
+                                    "past_key_values": cache,
+                                    "use_cache": True,
+                                    "position_embeddings": pos_emb,
+                                }
+                                if cache_pos is not None:
+                                    kwargs["cache_position"] = cache_pos
+                                layer_out = layer(hidden_states, **kwargs)
                                 hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
                             kv_store.update_seq_len(packet.request_id, 1)
                         else:
@@ -690,7 +732,7 @@ def create_worker_app(
                                 cos, sin = rotary_emb(hidden_norm, pos_ids)
                                 q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-                                # Per-stream attention using each session's contiguous DynamicCache
+                                # Per-stream attention using each session's contiguous DynamicCache or StaticCache
                                 attn_outs = []
                                 num_kv_groups = getattr(layer.self_attn, "num_key_value_groups", 1)
                                 for b_idx, req_id in enumerate(packet.request_ids):
@@ -698,14 +740,29 @@ def create_worker_app(
                                     q_b = q[b_idx:b_idx+1]
                                     k_b = k[b_idx:b_idx+1]
                                     v_b = v[b_idx:b_idx+1]
+                                    is_static = hasattr(cache, "get_max_cache_shape") or (cache is not None and cache.__class__.__name__ == "StaticCache")
                                     if cache is not None:
-                                        k_cached, v_cached = cache.update(k_b, v_b, layer.self_attn.layer_idx)
+                                        if is_static:
+                                            curr_pos = torch.tensor([kv_store.get_seq_len(req_id)], dtype=torch.long, device=resolved_device)
+                                            k_cached, v_cached = cache.update(k_b, v_b, layer.self_attn.layer_idx, cache_kwargs={"cache_position": curr_pos})
+                                        else:
+                                            k_cached, v_cached = cache.update(k_b, v_b, layer.self_attn.layer_idx)
                                     else:
                                         k_cached, v_cached = k_b, v_b
+
                                     if num_kv_groups > 1:
                                         k_cached = k_cached.repeat_interleave(num_kv_groups, dim=1)
                                         v_cached = v_cached.repeat_interleave(num_kv_groups, dim=1)
-                                    out_b = F.scaled_dot_product_attention(q_b, k_cached, v_cached)
+
+                                    if is_static:
+                                        curr_len = kv_store.get_seq_len(req_id)
+                                        max_k_len = k_cached.shape[2]
+                                        mask = torch.zeros((1, 1, 1, max_k_len), dtype=q_b.dtype, device=resolved_device)
+                                        if curr_len + 1 < max_k_len:
+                                            mask[:, :, :, curr_len + 1:] = -10000.0
+                                        out_b = F.scaled_dot_product_attention(q_b, k_cached, v_cached, attn_mask=mask)
+                                    else:
+                                        out_b = F.scaled_dot_product_attention(q_b, k_cached, v_cached)
                                     attn_outs.append(out_b)
 
                                 attn_out = torch.cat(attn_outs, dim=0).transpose(1, 2).reshape(B_cur, 1, -1)
@@ -746,15 +803,20 @@ def create_worker_app(
                                 ) if mask_function is not None else None
                                 pos_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
 
+                                is_static = hasattr(cache, "get_max_cache_shape") or (cache is not None and cache.__class__.__name__ == "StaticCache")
+                                cache_pos = torch.arange(prompt_len, dtype=torch.long, device=resolved_device) if is_static else None
+
                                 for layer in assigned_layers:
-                                    l_out = layer(
-                                        h_b,
-                                        attention_mask=c_mask,
-                                        position_ids=pos_ids,
-                                        past_key_values=cache,
-                                        use_cache=True,
-                                        position_embeddings=pos_emb,
-                                    )
+                                    kwargs = {
+                                        "attention_mask": c_mask,
+                                        "position_ids": pos_ids,
+                                        "past_key_values": cache,
+                                        "use_cache": True,
+                                        "position_embeddings": pos_emb,
+                                    }
+                                    if cache_pos is not None:
+                                        kwargs["cache_position"] = cache_pos
+                                    l_out = layer(h_b, **kwargs)
                                     h_b = l_out[0] if isinstance(l_out, tuple) else l_out
                                 batch_outs.append(h_b)
                             hidden_states = torch.cat(batch_outs, dim=0)
@@ -1060,6 +1122,8 @@ def main():
     parser.add_argument("--model-name", type=str, default=None, help="Hugging Face model ID to load")
     parser.add_argument("--device", type=str, default=None, help="PyTorch device (cuda, mps, cpu)")
     parser.add_argument("--quantize-activations", action="store_true", default=False, help="Enable dynamic INT8 activation quantization for inter-stage transport")
+    parser.add_argument("--use-static-cache", action="store_true", default=None, help="Enable fixed-size StaticCache for fast TPU/XLA compilation elimination")
+    parser.add_argument("--disable-static-cache", dest="use_static_cache", action="store_false", help="Disable StaticCache and force DynamicCache")
     args = parser.parse_args()
 
     app = create_worker_app(
@@ -1071,6 +1135,7 @@ def main():
         tcp_port=args.tcp_port,
         downstream_tcp=args.downstream_tcp,
         quantize_activations=args.quantize_activations,
+        use_static_cache=args.use_static_cache,
     )
     print(f"Starting FrontierSplit Worker Stage {args.stage_id}/{args.total_stages} on port {args.port}...")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

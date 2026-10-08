@@ -15,7 +15,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 from frontiersplit.worker import create_worker_app
 
 
-def _stage_worker_entry(index: int, total_stages: int, model_name: str, use_binary: bool, quantize_activations: bool):
+def _stage_worker_entry(index: int, total_stages: int, model_name: str, use_binary: bool, quantize_activations: bool, use_static_cache: bool = True):
     """Entry point for each spawned TPU core worker process."""
     stage_id = index
     is_final = (stage_id == total_stages - 1)
@@ -27,7 +27,7 @@ def _stage_worker_entry(index: int, total_stages: int, model_name: str, use_bina
     downstream_url = None if is_final else f"http://127.0.0.1:{downstream_port}"
     downstream_tcp = None if (is_final or not use_binary) else f"127.0.0.1:{downstream_tcp_port}"
 
-    print(f"[TPU Stage {stage_id}/{total_stages}] Initializing on TPU core (HTTP :{port}, TCP :{tcp_port})...")
+    print(f"[TPU Stage {stage_id}/{total_stages}] Initializing on TPU core (HTTP :{port}, TCP :{tcp_port}, StaticCache:{use_static_cache})...")
     app = create_worker_app(
         stage_id=stage_id,
         total_stages=total_stages,
@@ -37,6 +37,7 @@ def _stage_worker_entry(index: int, total_stages: int, model_name: str, use_bina
         device="xla",
         tcp_port=tcp_port,
         quantize_activations=quantize_activations,
+        use_static_cache=use_static_cache,
     )
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
 
@@ -48,19 +49,22 @@ def main():
     parser.add_argument("--use-binary", action="store_true", default=True, help="Enable persistent binary TCP transport")
     parser.add_argument("--disable-binary", dest="use_binary", action="store_false", help="Disable persistent binary TCP transport")
     parser.add_argument("--quantize-activations", action="store_true", default=False, help="Enable dynamic INT8 activation quantization")
+    parser.add_argument("--use-static-cache", action="store_true", default=True, help="Enable StaticCache for XLA compilation elimination")
+    parser.add_argument("--disable-static-cache", dest="use_static_cache", action="store_false", help="Disable StaticCache")
     args = parser.parse_args()
 
     print("==================================================================")
     print(" FrontierSplit Cloud TPU Multi-Core Runner")
-    print(f" Accelerator: v5litepod-8 (8 TPU Cores via xmp.spawn)")
-    print(f" Model:       {args.model_name}")
-    print(f" Binary TCP:  {'ENABLED' if args.use_binary else 'DISABLED'}")
-    print(f" Quantize:    {'ENABLED (INT8)' if args.quantize_activations else 'DISABLED (FP16)'}")
+    print(f" Accelerator:  v5litepod-8 (8 TPU Cores via xmp.spawn)")
+    print(f" Model:        {args.model_name}")
+    print(f" Binary TCP:   {'ENABLED' if args.use_binary else 'DISABLED'}")
+    print(f" Quantize:     {'ENABLED (INT8)' if args.quantize_activations else 'DISABLED (FP16)'}")
+    print(f" StaticCache:  {'ENABLED' if args.use_static_cache else 'DISABLED'}")
     print("==================================================================")
 
     xmp.spawn(
         _stage_worker_entry,
-        args=(args.total_stages, args.model_name, args.use_binary, args.quantize_activations),
+        args=(args.total_stages, args.model_name, args.use_binary, args.quantize_activations, args.use_static_cache),
     )
 
 
