@@ -357,6 +357,8 @@ def create_worker_app(
         lm_head_synth = np.random.randn(hidden_size, vocab_size).astype(np.float32) * 0.02 if is_final_stage else None
 
     kv_store = WorkerKVCacheStore()
+    compute_lock = asyncio.Lock()
+    reply_clients: Dict[str, BinaryTransportClient] = {}
 
     @app.get("/health")
     def health():
@@ -618,152 +620,163 @@ def create_worker_app(
         start_time = time.time()
         batch_size = len(packet.request_ids)
 
-        if use_real_model:
-            with torch.no_grad():
-                if is_first_stage and packet.tokens_batch:
-                    token_tensor = torch.tensor(packet.tokens_batch, device=resolved_device, dtype=torch.long)
-                    hidden_states = embed_tokens(token_tensor)
-                else:
-                    raw_bytes = packet.get_raw_bytes()
-                    if raw_bytes:
-                        dtype_obj = getattr(torch, packet.tensor_dtype, torch.float16)
-                        hidden_states = torch.frombuffer(
-                            bytearray(raw_bytes), dtype=dtype_obj
-                        ).reshape(packet.tensor_shape).to(resolved_device, non_blocking=True)
-                    else:
-                        arr = packet.get_tensor()
-                        hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
-
-                if packet.use_kv_cache and not packet.is_prefill:
-                    # True Batched GEMM Decode:
-                    # Linear projections and MLPs are executed across the full batch [B, 1, 4096] in ONE GEMM pass,
-                    # reading the 7.5 GB of layer weights exactly once rather than B times.
-                    B_cur = hidden_states.shape[0]
-                    pos_ids = torch.tensor(
-                        [[kv_store.get(req_id).get_seq_length() if kv_store.get(req_id) else 0] for req_id in packet.request_ids],
-                        dtype=torch.long,
-                        device=resolved_device,
-                    )
-
-                    for layer in assigned_layers:
-                        residual = hidden_states
-                        hidden_norm = layer.input_layernorm(hidden_states)
-
-                        input_shape = hidden_norm.shape[:-1]
-                        num_q_heads = layer.self_attn.config.num_attention_heads
-                        num_kv_heads = layer.self_attn.config.num_key_value_heads
-                        head_dim = layer.self_attn.head_dim
-
-                        # Batched Q, K, V projections [B, 1, 4096] in a single GEMM
-                        q = layer.self_attn.q_proj(hidden_norm).view(*input_shape, num_q_heads, head_dim).transpose(1, 2)
-                        k = layer.self_attn.k_proj(hidden_norm).view(*input_shape, num_kv_heads, head_dim).transpose(1, 2)
-                        v = layer.self_attn.v_proj(hidden_norm).view(*input_shape, num_kv_heads, head_dim).transpose(1, 2)
-
-                        cos, sin = rotary_emb(hidden_norm, pos_ids)
-                        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-                        # Per-stream attention using each session's contiguous DynamicCache
-                        attn_outs = []
-                        num_kv_groups = getattr(layer.self_attn, "num_key_value_groups", 1)
-                        for b_idx, req_id in enumerate(packet.request_ids):
-                            cache = kv_store.get(req_id)
-                            q_b = q[b_idx:b_idx+1]
-                            k_b = k[b_idx:b_idx+1]
-                            v_b = v[b_idx:b_idx+1]
-                            if cache is not None:
-                                k_cached, v_cached = cache.update(k_b, v_b, layer.self_attn.layer_idx)
-                            else:
-                                k_cached, v_cached = k_b, v_b
-                            if num_kv_groups > 1:
-                                k_cached = k_cached.repeat_interleave(num_kv_groups, dim=1)
-                                v_cached = v_cached.repeat_interleave(num_kv_groups, dim=1)
-                            out_b = F.scaled_dot_product_attention(q_b, k_cached, v_cached)
-                            attn_outs.append(out_b)
-
-                        attn_out = torch.cat(attn_outs, dim=0).transpose(1, 2).reshape(B_cur, 1, -1)
-                        hidden_states = residual + layer.self_attn.o_proj(attn_out)
-
-                        # Batched Feed-Forward / MoE: [B, 1, 4096] in ONE GEMM pass!
-                        normed = layer.post_attention_layernorm(hidden_states)
-                        if hasattr(layer, "block_sparse_moe"):
-                            moe_out = layer.block_sparse_moe(normed)
-                            moe_out = moe_out[0] if isinstance(moe_out, tuple) else moe_out
-                            hidden_states = hidden_states + moe_out
-                        elif hasattr(layer, "mlp"):
-                            moe_out = layer.mlp(normed)
-                            moe_out = moe_out[0] if isinstance(moe_out, tuple) else moe_out
-                            hidden_states = hidden_states + moe_out
+        try:
+            if use_real_model:
+                async with compute_lock:
+                    with torch.no_grad():
+                        if is_first_stage and packet.tokens_batch:
+                            token_tensor = torch.tensor(packet.tokens_batch, device=resolved_device, dtype=torch.long)
+                            hidden_states = embed_tokens(token_tensor)
                         else:
-                            raise RuntimeError(f"Unknown layer feed-forward block: {type(layer)}")
+                            raw_bytes = packet.get_raw_bytes()
+                            if raw_bytes:
+                                dtype_obj = getattr(torch, packet.tensor_dtype, torch.float16)
+                                hidden_states = torch.frombuffer(
+                                    bytearray(raw_bytes), dtype=dtype_obj
+                                ).reshape(packet.tensor_shape).to(resolved_device, non_blocking=True)
+                            else:
+                                arr = packet.get_tensor()
+                                hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
 
-                    for req_id in packet.request_ids:
-                        kv_store.update_seq_len(req_id, 1)
-
-                elif packet.use_kv_cache and packet.is_prefill:
-                    # Batched prefill with session KV caches
-                    batch_outs = []
-                    for b_idx, req_id in enumerate(packet.request_ids):
-                        h_b = hidden_states[b_idx:b_idx+1, :, :]
-                        prompt_len = h_b.shape[1]
-                        max_tok = packet.max_tokens_list[b_idx] if packet.max_tokens_list else None
-                        cache = kv_store.get_or_create(req_id, prompt_len=prompt_len, max_tokens=max_tok)
-
-                        pos_ids = torch.arange(prompt_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
-                        c_mask = mask_function(
-                            config=model_config,
-                            inputs_embeds=h_b,
-                            attention_mask=None,
-                            past_key_values=cache,
-                            position_ids=pos_ids,
-                        ) if mask_function is not None else None
-                        pos_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
-
-                        for layer in assigned_layers:
-                            l_out = layer(
-                                h_b,
-                                attention_mask=c_mask,
-                                position_ids=pos_ids,
-                                past_key_values=cache,
-                                use_cache=True,
-                                position_embeddings=pos_emb,
+                        if packet.use_kv_cache and not packet.is_prefill:
+                            # True Batched GEMM Decode:
+                            # Linear projections and MLPs are executed across the full batch [B, 1, 4096] in ONE GEMM pass,
+                            # reading the 7.5 GB of layer weights exactly once rather than B times.
+                            B_cur = hidden_states.shape[0]
+                            pos_ids = torch.tensor(
+                                [[kv_store.get(req_id).get_seq_length() if kv_store.get(req_id) else 0] for req_id in packet.request_ids],
+                                dtype=torch.long,
+                                device=resolved_device,
                             )
-                            h_b = l_out[0] if isinstance(l_out, tuple) else l_out
-                        batch_outs.append(h_b)
-                    hidden_states = torch.cat(batch_outs, dim=0)
 
-                else:
-                    seq_len = hidden_states.shape[1]
-                    mask_tensor = None
-                    if packet.attention_mask:
-                        mask_tensor = torch.tensor(packet.attention_mask, device=resolved_device, dtype=torch.long)
-                        position_ids = (mask_tensor.cumsum(dim=-1) - 1).clamp(min=0)
-                    else:
-                        position_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0).expand(batch_size, -1)
+                            for layer in assigned_layers:
+                                residual = hidden_states
+                                hidden_norm = layer.input_layernorm(hidden_states)
 
-                    c_mask = mask_function(
-                        config=model_config,
-                        inputs_embeds=hidden_states,
-                        attention_mask=mask_tensor,
-                        past_key_values=None,
-                        position_ids=position_ids,
-                    ) if mask_function is not None else None
-                    pos_emb = rotary_emb(hidden_states, position_ids=position_ids) if rotary_emb is not None else None
+                                input_shape = hidden_norm.shape[:-1]
+                                num_q_heads = layer.self_attn.config.num_attention_heads
+                                num_kv_heads = layer.self_attn.config.num_key_value_heads
+                                head_dim = layer.self_attn.head_dim
 
-                    for layer in assigned_layers:
-                        l_out = layer(
-                            hidden_states,
-                            attention_mask=c_mask,
-                            position_ids=position_ids,
-                            position_embeddings=pos_emb,
-                        )
-                        hidden_states = l_out[0] if isinstance(l_out, tuple) else l_out
+                                # Batched Q, K, V projections [B, 1, 4096] in a single GEMM
+                                q = layer.self_attn.q_proj(hidden_norm).view(*input_shape, num_q_heads, head_dim).transpose(1, 2)
+                                k = layer.self_attn.k_proj(hidden_norm).view(*input_shape, num_kv_heads, head_dim).transpose(1, 2)
+                                v = layer.self_attn.v_proj(hidden_norm).view(*input_shape, num_kv_heads, head_dim).transpose(1, 2)
 
-                if resolved_device.startswith("xla"):
-                    try:
-                        import torch_xla.core.xla_model as xm
-                        xm.mark_step()
-                    except ImportError:
-                        pass
+                                cos, sin = rotary_emb(hidden_norm, pos_ids)
+                                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+                                # Per-stream attention using each session's contiguous DynamicCache
+                                attn_outs = []
+                                num_kv_groups = getattr(layer.self_attn, "num_key_value_groups", 1)
+                                for b_idx, req_id in enumerate(packet.request_ids):
+                                    cache = kv_store.get(req_id)
+                                    q_b = q[b_idx:b_idx+1]
+                                    k_b = k[b_idx:b_idx+1]
+                                    v_b = v[b_idx:b_idx+1]
+                                    if cache is not None:
+                                        k_cached, v_cached = cache.update(k_b, v_b, layer.self_attn.layer_idx)
+                                    else:
+                                        k_cached, v_cached = k_b, v_b
+                                    if num_kv_groups > 1:
+                                        k_cached = k_cached.repeat_interleave(num_kv_groups, dim=1)
+                                        v_cached = v_cached.repeat_interleave(num_kv_groups, dim=1)
+                                    out_b = F.scaled_dot_product_attention(q_b, k_cached, v_cached)
+                                    attn_outs.append(out_b)
+
+                                attn_out = torch.cat(attn_outs, dim=0).transpose(1, 2).reshape(B_cur, 1, -1)
+                                hidden_states = residual + layer.self_attn.o_proj(attn_out)
+
+                                # Batched Feed-Forward / MoE: [B, 1, 4096] in ONE GEMM pass!
+                                normed = layer.post_attention_layernorm(hidden_states)
+                                if hasattr(layer, "block_sparse_moe"):
+                                    moe_out = layer.block_sparse_moe(normed)
+                                    moe_out = moe_out[0] if isinstance(moe_out, tuple) else moe_out
+                                    hidden_states = hidden_states + moe_out
+                                elif hasattr(layer, "mlp"):
+                                    moe_out = layer.mlp(normed)
+                                    moe_out = moe_out[0] if isinstance(moe_out, tuple) else moe_out
+                                    hidden_states = hidden_states + moe_out
+                                else:
+                                    raise RuntimeError(f"Unknown layer feed-forward block: {type(layer)}")
+
+                            for req_id in packet.request_ids:
+                                kv_store.update_seq_len(req_id, 1)
+
+                        elif packet.use_kv_cache and packet.is_prefill:
+                            # Batched prefill with session KV caches
+                            batch_outs = []
+                            for b_idx, req_id in enumerate(packet.request_ids):
+                                h_b = hidden_states[b_idx:b_idx+1, :, :]
+                                prompt_len = h_b.shape[1]
+                                max_tok = packet.max_tokens_list[b_idx] if packet.max_tokens_list else None
+                                cache = kv_store.get_or_create(req_id, prompt_len=prompt_len, max_tokens=max_tok)
+
+                                pos_ids = torch.arange(prompt_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
+                                c_mask = mask_function(
+                                    config=model_config,
+                                    inputs_embeds=h_b,
+                                    attention_mask=None,
+                                    past_key_values=cache,
+                                    position_ids=pos_ids,
+                                ) if mask_function is not None else None
+                                pos_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
+
+                                for layer in assigned_layers:
+                                    l_out = layer(
+                                        h_b,
+                                        attention_mask=c_mask,
+                                        position_ids=pos_ids,
+                                        past_key_values=cache,
+                                        use_cache=True,
+                                        position_embeddings=pos_emb,
+                                    )
+                                    h_b = l_out[0] if isinstance(l_out, tuple) else l_out
+                                batch_outs.append(h_b)
+                            hidden_states = torch.cat(batch_outs, dim=0)
+
+                        else:
+                            seq_len = hidden_states.shape[1]
+                            mask_tensor = None
+                            if packet.attention_mask:
+                                mask_tensor = torch.tensor(packet.attention_mask, device=resolved_device, dtype=torch.long)
+                                position_ids = (mask_tensor.cumsum(dim=-1) - 1).clamp(min=0)
+                            else:
+                                position_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0).expand(batch_size, -1)
+
+                            c_mask = mask_function(
+                                config=model_config,
+                                inputs_embeds=hidden_states,
+                                attention_mask=mask_tensor,
+                                past_key_values=None,
+                                position_ids=position_ids,
+                            ) if mask_function is not None else None
+                            pos_emb = rotary_emb(hidden_states, position_ids=position_ids) if rotary_emb is not None else None
+
+                            for layer in assigned_layers:
+                                l_out = layer(
+                                    hidden_states,
+                                    attention_mask=c_mask,
+                                    position_ids=position_ids,
+                                    position_embeddings=pos_emb,
+                                )
+                                hidden_states = l_out[0] if isinstance(l_out, tuple) else l_out
+
+                        if resolved_device.startswith("xla"):
+                            try:
+                                import torch_xla.core.xla_model as xm
+                                xm.mark_step()
+                            except ImportError:
+                                pass
+
+                        if is_final_stage:
+                            if final_norm is not None:
+                                hidden_states = final_norm(hidden_states)
+
+                            last_token_hidden = hidden_states[:, -1, :]  # shape: [B, hidden_size]
+                            logits = lm_head(last_token_hidden)  # shape: [B, vocab_size]
+
+                            next_token_ids = torch.argmax(logits, dim=-1).tolist()
 
                 stage_compute_ms = (time.time() - start_time) * 1000
                 timings = dict(packet.stage_timings)
@@ -779,6 +792,7 @@ def create_worker_app(
                         max_tokens_list=packet.max_tokens_list,
                         attention_mask=packet.attention_mask,
                         stage_timings=timings,
+                        reply_to=packet.reply_to,
                     )
                     cpu_t = hidden_states.contiguous().cpu()
                     dtype_str = str(hidden_states.dtype).replace("torch.", "")
@@ -789,7 +803,11 @@ def create_worker_app(
                     next_packet.set_raw_tensor(raw_bytes, list(hidden_states.shape), dtype_str)
 
                     if downstream_client is not None:
-                        return await downstream_client.send_batched_forward(next_packet)
+                        if packet.reply_to:
+                            await downstream_client.send_async_forward(next_packet, raw_tensor_bytes=raw_bytes)
+                            return BatchedGenerationResponse(responses=[], batch_size=0, stage_timings=timings)
+                        else:
+                            return await downstream_client.send_batched_forward(next_packet)
                     elif downstream_url:
                         next_packet.set_tensor(cpu_t.numpy())
                         def _post():
@@ -802,13 +820,6 @@ def create_worker_app(
                         raise HTTPException(status_code=500, detail="Missing downstream_url for intermediate stage")
 
                 else:
-                    if final_norm is not None:
-                        hidden_states = final_norm(hidden_states)
-
-                    last_token_hidden = hidden_states[:, -1, :]  # shape: [B, hidden_size]
-                    logits = lm_head(last_token_hidden)  # shape: [B, vocab_size]
-
-                    next_token_ids = torch.argmax(logits, dim=-1).tolist()
                     elapsed_ms = (time.time() - start_time) * 1000
 
                     responses = []
@@ -831,88 +842,135 @@ def create_worker_app(
                             )
                         )
 
-                    return BatchedGenerationResponse(
+                    batch_resp = BatchedGenerationResponse(
                         responses=responses,
                         batch_size=len(responses),
                         stage_timings=timings,
                     )
 
-        else:
-            # Synthetic batched matrix compute
-            if is_first_stage and packet.tokens_batch:
-                max_tok_len = max(len(t) for t in packet.tokens_batch)
-                padded_batch = [t + [0] * (max_tok_len - len(t)) for t in packet.tokens_batch]
-                tokens_arr = np.array(padded_batch)
-                activation = embeddings[tokens_arr]
-            else:
-                raw_bytes = packet.get_raw_bytes()
-                if raw_bytes:
-                    activation = np.frombuffer(raw_bytes, dtype=packet.tensor_dtype).reshape(packet.tensor_shape)
-                else:
-                    activation = packet.get_tensor()
+                    if packet.reply_to:
+                        if packet.reply_to not in reply_clients:
+                            reply_clients[packet.reply_to] = BinaryTransportClient(packet.reply_to)
+                        reply_client = reply_clients[packet.reply_to]
+                        await reply_client.send_response_frame(batch_resp)
 
-            if packet.use_kv_cache:
-                for b_idx, req_id in enumerate(packet.request_ids):
-                    if packet.is_prefill:
-                        max_tok = packet.max_tokens_list[b_idx] if packet.max_tokens_list else None
-                        prompt_len = len(packet.tokens_batch[b_idx]) if (packet.tokens_batch and b_idx < len(packet.tokens_batch)) else 1
-                        kv_store.get_or_create(req_id, prompt_len=prompt_len, max_tokens=max_tok)
+                    return batch_resp
+
+            else:
+                # Synthetic batched matrix compute
+                async with compute_lock:
+                    if is_first_stage and packet.tokens_batch:
+                        max_tok_len = max(len(t) for t in packet.tokens_batch)
+                        padded_batch = [t + [0] * (max_tok_len - len(t)) for t in packet.tokens_batch]
+                        tokens_arr = np.array(padded_batch)
+                        activation = embeddings[tokens_arr]
                     else:
-                        kv_store.update_seq_len(req_id, 1)
+                        raw_bytes = packet.get_raw_bytes()
+                        if raw_bytes:
+                            activation = np.frombuffer(raw_bytes, dtype=packet.tensor_dtype).reshape(packet.tensor_shape)
+                        else:
+                            activation = packet.get_tensor()
 
-            activation = np.matmul(activation, layer_proj)
-            stage_compute_ms = (time.time() - start_time) * 1000
-            timings = dict(packet.stage_timings)
-            timings[f"stage_{stage_id}_compute_ms"] = stage_compute_ms
+                    if packet.use_kv_cache:
+                        for b_idx, req_id in enumerate(packet.request_ids):
+                            if packet.is_prefill:
+                                max_tok = packet.max_tokens_list[b_idx] if packet.max_tokens_list else None
+                                prompt_len = len(packet.tokens_batch[b_idx]) if (packet.tokens_batch and b_idx < len(packet.tokens_batch)) else 1
+                                kv_store.get_or_create(req_id, prompt_len=prompt_len, max_tokens=max_tok)
+                            else:
+                                kv_store.update_seq_len(req_id, 1)
 
-            if not is_final_stage:
-                next_packet = BatchedActivationPacket(
-                    request_ids=packet.request_ids,
-                    sequence_steps=packet.sequence_steps,
-                    stage_id=stage_id + 1,
-                    is_prefill=packet.is_prefill,
-                    use_kv_cache=packet.use_kv_cache,
-                    max_tokens_list=packet.max_tokens_list,
-                    attention_mask=packet.attention_mask,
-                    stage_timings=timings,
-                )
-                next_packet.set_raw_tensor(activation.tobytes(), list(activation.shape), str(activation.dtype))
+                    activation = np.matmul(activation, layer_proj)
+                    stage_compute_ms = (time.time() - start_time) * 1000
+                    timings = dict(packet.stage_timings)
+                    timings[f"stage_{stage_id}_compute_ms"] = stage_compute_ms
 
-                if downstream_client is not None:
-                    return await downstream_client.send_batched_forward(next_packet)
-                elif downstream_url:
-                    next_packet.set_tensor(activation)
-                    def _post_synth():
-                        resp = requests.post(f"{downstream_url}/forward_batched", json=next_packet.model_dump(), timeout=30)
-                        resp.raise_for_status()
-                        return resp.json()
-                    res_json = await asyncio.to_thread(_post_synth)
-                    return BatchedGenerationResponse.model_validate(res_json)
+                    if is_final_stage:
+                        last_token_hidden = activation[:, -1, :]
+                        logits = np.matmul(last_token_hidden, lm_head_synth)
+                        next_token_ids = np.argmax(logits, axis=-1).tolist()
+
+                if not is_final_stage:
+                    next_packet = BatchedActivationPacket(
+                        request_ids=packet.request_ids,
+                        sequence_steps=packet.sequence_steps,
+                        stage_id=stage_id + 1,
+                        is_prefill=packet.is_prefill,
+                        use_kv_cache=packet.use_kv_cache,
+                        max_tokens_list=packet.max_tokens_list,
+                        attention_mask=packet.attention_mask,
+                        stage_timings=timings,
+                        reply_to=packet.reply_to,
+                    )
+                    next_packet.set_raw_tensor(activation.tobytes(), list(activation.shape), str(activation.dtype))
+
+                    if downstream_client is not None:
+                        if packet.reply_to:
+                            await downstream_client.send_async_forward(next_packet, raw_tensor_bytes=activation.tobytes())
+                            return BatchedGenerationResponse(responses=[], batch_size=0, stage_timings=timings)
+                        else:
+                            return await downstream_client.send_batched_forward(next_packet)
+                    elif downstream_url:
+                        next_packet.set_tensor(activation)
+                        def _post_synth():
+                            resp = requests.post(f"{downstream_url}/forward_batched", json=next_packet.model_dump(), timeout=30)
+                            resp.raise_for_status()
+                            return resp.json()
+                        res_json = await asyncio.to_thread(_post_synth)
+                        return BatchedGenerationResponse.model_validate(res_json)
+                    else:
+                        raise HTTPException(status_code=500, detail="Missing downstream_url for intermediate stage")
+
                 else:
-                    raise HTTPException(status_code=500, detail="Missing downstream_url for intermediate stage")
+                    elapsed_ms = (time.time() - start_time) * 1000
 
-            else:
-                last_token_hidden = activation[:, -1, :]
-                logits = np.matmul(last_token_hidden, lm_head_synth)
-                next_token_ids = np.argmax(logits, axis=-1).tolist()
-                elapsed_ms = (time.time() - start_time) * 1000
-
-                responses = [
-                    GenerationResponse(
-                        request_id=req_id,
-                        token_id=tok,
-                        text=f"tok_{tok % 100} ",
-                        is_finished=(seq_step >= 32),
-                        latency_ms=elapsed_ms,
+                    responses = [
+                        GenerationResponse(
+                            request_id=req_id,
+                            token_id=tok,
+                            text=f"tok_{tok % 100} ",
+                            is_finished=(seq_step >= 32),
+                            latency_ms=elapsed_ms,
+                            stage_timings=timings,
+                        )
+                        for req_id, seq_step, tok in zip(packet.request_ids, packet.sequence_steps, next_token_ids)
+                    ]
+                    batch_resp = BatchedGenerationResponse(
+                        responses=responses,
+                        batch_size=len(responses),
                         stage_timings=timings,
                     )
-                    for req_id, seq_step, tok in zip(packet.request_ids, packet.sequence_steps, next_token_ids)
-                ]
-                return BatchedGenerationResponse(
-                    responses=responses,
-                    batch_size=len(responses),
-                    stage_timings=timings,
+
+                    if packet.reply_to:
+                        if packet.reply_to not in reply_clients:
+                            reply_clients[packet.reply_to] = BinaryTransportClient(packet.reply_to)
+                        reply_client = reply_clients[packet.reply_to]
+                        await reply_client.send_response_frame(batch_resp)
+
+                    return batch_resp
+
+        except Exception as e:
+            if packet.reply_to:
+                err_resp = BatchedGenerationResponse(
+                    responses=[
+                        GenerationResponse(
+                            request_id=r_id,
+                            token_id=0,
+                            text=f"[Error in Stage {stage_id}: {e}]",
+                            is_finished=True,
+                            latency_ms=0.0,
+                        )
+                        for r_id in packet.request_ids
+                    ],
+                    batch_size=len(packet.request_ids),
                 )
+                try:
+                    if packet.reply_to not in reply_clients:
+                        reply_clients[packet.reply_to] = BinaryTransportClient(packet.reply_to)
+                    await reply_clients[packet.reply_to].send_response_frame(err_resp)
+                except Exception:
+                    pass
+            raise
 
     @app.post("/forward_batched", response_model=BatchedGenerationResponse)
     async def forward_batched(packet: BatchedActivationPacket):
@@ -936,6 +994,9 @@ def create_worker_app(
             await binary_server.stop()
         if downstream_client is not None:
             await downstream_client.close()
+        for client in reply_clients.values():
+            await client.close()
+        reply_clients.clear()
 
     app.router.lifespan_context = lifespan
     app.state.binary_server = binary_server

@@ -22,7 +22,7 @@ from frontiersplit.protocol import (
     ReleaseSessionPacket,
     ReleaseSessionResponse,
 )
-from frontiersplit.transport import BinaryTransportClient
+from frontiersplit.transport import BinaryTransportClient, BinaryTransportServer
 
 
 class ScheduledRequest:
@@ -133,6 +133,10 @@ class PipelineScheduler:
         max_batch_size: int = 16,
         use_kv_cache: bool = True,
         stage0_tcp: Optional[str] = None,
+        enable_1f1b: bool = True,
+        gateway_host: Optional[str] = None,
+        reply_port: int = 50060,
+        max_in_flight: Optional[int] = None,
     ):
         self.stage0_url = stage0_url
         self.num_workers = num_workers
@@ -145,6 +149,15 @@ class PipelineScheduler:
             stage0_url.replace("tcp://", "") if stage0_url and stage0_url.startswith("tcp://") else None
         )
         self.stage0_client = BinaryTransportClient(target_peer) if target_peer else None
+
+        self.enable_1f1b = enable_1f1b and (self.stage0_client is not None)
+        self.gateway_host = gateway_host or "127.0.0.1"
+        self.reply_port = reply_port
+        self.reply_server: Optional[BinaryTransportServer] = None
+        self._in_flight_times: Dict[str, float] = {}
+
+        flight_limit = max_in_flight or max(self.total_stages * 4, 32)
+        self._in_flight_sem: Optional[asyncio.Semaphore] = asyncio.Semaphore(flight_limit) if self.enable_1f1b else None
 
         self.active_requests: Dict[str, ScheduledRequest] = {}
         self.ready_queue: asyncio.Queue[ScheduledRequest] = asyncio.Queue()
@@ -159,18 +172,36 @@ class PipelineScheduler:
         self.step_latencies: List[float] = []
 
     async def start(self) -> None:
-        """Start scheduler worker loop tasks."""
+        """Start scheduler worker loop tasks and optional 1F1B reply server."""
         if self.is_running:
             return
         self.is_running = True
         self.start_time = time.time()
+
+        if self.enable_1f1b:
+            try:
+                self.reply_server = BinaryTransportServer(
+                    host="0.0.0.0",
+                    port=self.reply_port,
+                    response_handler=self._handle_pipeline_reply,
+                )
+                await self.reply_server.start()
+            except OSError:
+                self.reply_server = BinaryTransportServer(
+                    host="0.0.0.0",
+                    port=0,
+                    response_handler=self._handle_pipeline_reply,
+                )
+                await self.reply_server.start()
+            self.reply_port = self.reply_server.port
+
         self._worker_tasks = [
             asyncio.create_task(self._worker_loop(i))
             for i in range(self.num_workers)
         ]
 
     async def stop(self) -> None:
-        """Gracefully stop scheduler worker tasks and close binary transport client."""
+        """Gracefully stop scheduler worker tasks, 1F1B reply server, and close binary transport client."""
         if not self.is_running:
             return
         self.is_running = False
@@ -178,6 +209,11 @@ class PipelineScheduler:
             task.cancel()
         await asyncio.gather(*self._worker_tasks, return_exceptions=True)
         self._worker_tasks.clear()
+
+        if self.reply_server is not None:
+            await self.reply_server.stop()
+            self.reply_server = None
+
         if self.stage0_client is not None:
             await self.stage0_client.close()
 
@@ -318,6 +354,21 @@ class PipelineScheduler:
             attention_mask=attention_masks,
         )
 
+        if self.enable_1f1b and self.stage0_client is not None:
+            packet.reply_to = f"{self.gateway_host}:{self.reply_port}"
+            now = time.time()
+            for r in batch:
+                self._in_flight_times[r.request_id] = now
+            if self._in_flight_sem is not None:
+                await self._in_flight_sem.acquire()
+            try:
+                await self.stage0_client.send_async_forward(packet)
+            except Exception as e:
+                if self._in_flight_sem is not None:
+                    self._in_flight_sem.release()
+                raise e
+            return
+
         step_start = time.time()
         if self.stage0_client is not None:
             batched_result = await self.stage0_client.send_batched_forward(packet)
@@ -355,6 +406,53 @@ class PipelineScheduler:
             req.step_latencies.append(step_latency)
             req.stage_timings.append(gen_result.stage_timings)
 
+            if req.stream:
+                chunk = req.to_chunk_dict(gen_result.text, finish_reason=None)
+                await req.stream_queue.put(chunk)
+
+            # Check termination condition
+            reached_max = (req.max_tokens is not None and req.current_step >= req.max_tokens - 1)
+            if gen_result.is_finished or reached_max:
+                req.is_finished = True
+                req.finish_reason = "stop" if gen_result.is_finished else "length"
+                if req.stream:
+                    finish_chunk = req.to_chunk_dict("", finish_reason=req.finish_reason)
+                    await req.stream_queue.put(finish_chunk)
+                    await req.stream_queue.put(None)
+                req.done_event.set()
+                self._finalize_request(req)
+            else:
+                req.current_step += 1
+                req.is_prefill = False
+                req.input_tokens = req.prompt_tokens + req.generated_tokens
+                await self.ready_queue.put(req)
+
+    async def _handle_pipeline_reply(self, resp: BatchedGenerationResponse) -> None:
+        """Processes responses received directly from the final stage over persistent TCP in 1F1B mode."""
+        if self._in_flight_sem is not None:
+            self._in_flight_sem.release()
+
+        now = time.time()
+        for gen_result in resp.responses:
+            req = self.active_requests.get(gen_result.request_id)
+            if not req:
+                continue
+
+            dispatch_time = self._in_flight_times.pop(req.request_id, None)
+            step_latency = (now - dispatch_time) * 1000 if dispatch_time else gen_result.latency_ms
+
+            req.generated_tokens.append(gen_result.token_id)
+            req.generated_chunks.append(gen_result.text)
+            req.step_latencies.append(step_latency)
+            req.stage_timings.append(gen_result.stage_timings)
+
+            # Update telemetry
+            self.total_tokens_generated += 1
+            self.step_latencies.append(step_latency)
+            if len(self.step_latencies) > 200:
+                self.step_latencies.pop(0)
+
+            # If streaming, emit the chunk
             if req.stream:
                 chunk = req.to_chunk_dict(gen_result.text, finish_reason=None)
                 await req.stream_queue.put(chunk)

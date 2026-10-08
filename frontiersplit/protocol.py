@@ -23,6 +23,8 @@ MSG_RELEASE_SESSION_REQ = 3
 MSG_RELEASE_SESSION_RESP = 4
 MSG_PING = 5
 MSG_PONG = 6
+MSG_FORWARD_ASYNC_REQ = 7
+MSG_FORWARD_ACK = 8
 
 FLAG_IS_PREFILL = 0x01
 FLAG_USE_KV_CACHE = 0x02
@@ -179,6 +181,7 @@ class BatchedActivationPacket(BaseModel):
     tensor_bytes_b64: str = ""
     timestamp_sent_ms: float = Field(default_factory=lambda: time.time() * 1000)
     stage_timings: Dict[str, float] = Field(default_factory=dict)
+    reply_to: Optional[str] = None
 
     # Internal cached raw bytes to bypass Base64 encoding/decoding during binary transport
     _raw_tensor_bytes: Optional[bytes] = None
@@ -226,7 +229,7 @@ class BatchedActivationPacket(BaseModel):
             return np.zeros(self.tensor_shape, dtype=self.tensor_dtype)
         return np.frombuffer(raw_bytes, dtype=self.tensor_dtype).reshape(self.tensor_shape)
 
-    def encode_binary(self, raw_tensor_bytes: Optional[bytes] = None) -> bytes:
+    def encode_binary(self, raw_tensor_bytes: Optional[bytes] = None, msg_type: Optional[int] = None) -> bytes:
         """Encodes this packet into a 32-byte framed binary packet with raw FP16/FP32 payload."""
         payload = raw_tensor_bytes if raw_tensor_bytes is not None else self.get_raw_bytes()
         meta = {
@@ -242,6 +245,7 @@ class BatchedActivationPacket(BaseModel):
             "tensor_dtype": self.tensor_dtype,
             "timestamp_sent_ms": self.timestamp_sent_ms,
             "stage_timings": self.stage_timings,
+            "reply_to": self.reply_to,
         }
         meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
         flags = 0
@@ -251,8 +255,9 @@ class BatchedActivationPacket(BaseModel):
             flags |= FLAG_USE_KV_CACHE
 
         dtype_code = DTYPE_TO_CODE.get(self.tensor_dtype, 0)
+        resolved_msg_type = msg_type or (MSG_FORWARD_ASYNC_REQ if self.reply_to else MSG_FORWARD_BATCHED_REQ)
         header = pack_header(
-            msg_type=MSG_FORWARD_BATCHED_REQ,
+            msg_type=resolved_msg_type,
             flags=flags,
             meta_len=len(meta_bytes),
             payload_len=len(payload),
@@ -285,6 +290,7 @@ class BatchedActivationPacket(BaseModel):
             tensor_dtype=meta.get("tensor_dtype", dtype_str),
             timestamp_sent_ms=meta.get("timestamp_sent_ms", time.time() * 1000),
             stage_timings=meta.get("stage_timings", {}),
+            reply_to=meta.get("reply_to"),
         )
         packet.set_raw_tensor(payload_bytes, packet.tensor_shape, packet.tensor_dtype)
         return packet

@@ -21,6 +21,8 @@ from frontiersplit.protocol import (
     MSG_FORWARD_BATCHED_RESP,
     MSG_PING,
     MSG_PONG,
+    MSG_FORWARD_ASYNC_REQ,
+    MSG_FORWARD_ACK,
     MSG_RELEASE_SESSION_REQ,
     MSG_RELEASE_SESSION_RESP,
     BatchedActivationPacket,
@@ -162,6 +164,69 @@ class BinaryTransportClient:
 
         raise RuntimeError("Unreachable send_batched_forward completion")
 
+    async def send_async_forward(
+        self,
+        packet: BatchedActivationPacket,
+        raw_tensor_bytes: Optional[bytes] = None,
+    ) -> None:
+        """Transmits a batched forward packet asynchronously, awaits immediate ACK, and unblocks instantly without waiting for downstream pipeline unwinding."""
+        frame = packet.encode_binary(raw_tensor_bytes=raw_tensor_bytes, msg_type=MSG_FORWARD_ASYNC_REQ)
+
+        async with self._lock:
+            for attempt in range(self.max_retries):
+                try:
+                    await self.connect()
+                    assert self.writer is not None and self.reader is not None
+
+                    # Write frame and flush directly to socket
+                    self.writer.write(frame)
+                    await self.writer.drain()
+
+                    # Await immediate 32-byte ACK frame (<0.1 ms)
+                    msg_type, flags, meta, payload, dtype_str, shape = await asyncio.wait_for(
+                        read_binary_frame_async(self.reader),
+                        timeout=min(self.timeout, 10.0),
+                    )
+
+                    if msg_type == MSG_FORWARD_ACK:
+                        return
+                    else:
+                        raise RuntimeError(f"Expected MSG_FORWARD_ACK (8), got {msg_type}")
+
+                except (ConnectionError, asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError) as e:
+                    logger.warning(
+                        f"[BinaryClient] Socket error on send_async_forward attempt {attempt + 1}/{self.max_retries} to {self.current_peer}: {e}"
+                    )
+                    await self.close()
+                    if len(self.peers) > 1:
+                        self.current_peer_idx = (self.current_peer_idx + 1) % len(self.peers)
+
+                    if attempt < self.max_retries - 1:
+                        backoff = (self.retry_backoff_ms / 1000.0) * (2 ** attempt)
+                        await asyncio.sleep(backoff)
+                    else:
+                        raise ConnectionError(f"Persistent binary async transmission failed after {self.max_retries} attempts: {e}")
+
+        raise RuntimeError("Unreachable send_async_forward completion")
+
+    async def send_response_frame(self, response: BatchedGenerationResponse) -> None:
+        """Transmits a completed batch generation response frame directly to the gateway / reply listener."""
+        frame = response.encode_binary()
+        async with self._lock:
+            for attempt in range(self.max_retries):
+                try:
+                    await self.connect()
+                    assert self.writer is not None
+                    self.writer.write(frame)
+                    await self.writer.drain()
+                    return
+                except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+                    await self.close()
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep((self.retry_backoff_ms / 1000.0) * (2 ** attempt))
+                    else:
+                        raise ConnectionError(f"Failed to transmit generation response to reply peer {self.current_peer}: {e}")
+
     async def send_release_sessions(self, request_ids: List[str]) -> ReleaseSessionResponse:
         """Sends session KV cache release command down the pipeline over persistent TCP."""
         packet = ReleaseSessionPacket(request_ids=request_ids)
@@ -204,13 +269,15 @@ class BinaryTransportServer:
         self,
         host: str,
         port: int,
-        forward_handler: Callable[[BatchedActivationPacket], Awaitable[BatchedGenerationResponse]],
+        forward_handler: Optional[Callable[[BatchedActivationPacket], Awaitable[Any]]] = None,
         release_handler: Optional[Callable[[ReleaseSessionPacket], Awaitable[ReleaseSessionResponse]]] = None,
+        response_handler: Optional[Callable[[BatchedGenerationResponse], Awaitable[None]]] = None,
     ):
         self.host = host
         self.port = port
         self.forward_handler = forward_handler
         self.release_handler = release_handler
+        self.response_handler = response_handler
         self.server: Optional[asyncio.Server] = None
         self.is_running: bool = False
         self._active_writers: set[asyncio.StreamWriter] = set()
@@ -224,6 +291,8 @@ class BinaryTransportServer:
             reuse_address=True,
         )
         self.is_running = True
+        if self.server.sockets:
+            self.port = self.server.sockets[0].getsockname()[1]
         logger.info(f"[BinaryServer] Persistent TCP server listening on {self.host}:{self.port}")
 
     async def stop(self) -> None:
@@ -277,10 +346,41 @@ class BinaryTransportServer:
                     )
 
                     # Execute pipeline stage processing
-                    response = await self.forward_handler(packet)
-                    resp_frame = response.encode_binary()
-                    writer.write(resp_frame)
+                    if self.forward_handler is not None:
+                        response = await self.forward_handler(packet)
+                        if isinstance(response, BatchedGenerationResponse):
+                            resp_frame = response.encode_binary()
+                            writer.write(resp_frame)
+                            await writer.drain()
+
+                elif msg_type == MSG_FORWARD_ASYNC_REQ:
+                    meta_bytes = json.dumps(meta).encode("utf-8")
+                    packet = BatchedActivationPacket.decode_binary(
+                        meta_bytes=meta_bytes,
+                        payload_bytes=payload,
+                        dtype_str=dtype_str,
+                        shape=shape,
+                        flags=flags,
+                    )
+                    # Immediate acknowledgment back to sender so sender unblocks in <0.1 ms!
+                    ack_header = pack_header(
+                        msg_type=MSG_FORWARD_ACK,
+                        flags=0,
+                        meta_len=0,
+                        payload_len=0,
+                    )
+                    writer.write(ack_header)
                     await writer.drain()
+
+                    # Execute forward pass asynchronously in the background
+                    if self.forward_handler is not None:
+                        asyncio.create_task(self.forward_handler(packet))
+
+                elif msg_type == MSG_FORWARD_BATCHED_RESP:
+                    meta_bytes = json.dumps(meta).encode("utf-8")
+                    resp = BatchedGenerationResponse.decode_binary(meta_bytes)
+                    if self.response_handler is not None:
+                        asyncio.create_task(self.response_handler(resp))
 
                 elif msg_type == MSG_RELEASE_SESSION_REQ:
                     meta_bytes = json.dumps(meta).encode("utf-8")

@@ -68,11 +68,17 @@ echo "Waiting for Stage 0 on ${NODE_PREFIX}-1 to become healthy..."
 ${GCLOUD} compute ssh "${NODE_PREFIX}-1" --zone="${ZONE}" --project="${PROJECT_ID}" --tunnel-through-iap \
   --command="for i in \$(seq 1 300); do curl -s http://localhost:50051/health | grep -q '\"status\":\"healthy\"' && echo 'Stage 0 is healthy!' && exit 0; echo 'Waiting for worker / weights download...'; sleep 3; done; echo 'Timeout waiting for worker'; journalctl --user-unit=fs-worker -n 50 --no-pager; exit 1"
 
+ENABLE_1F1B="${ENABLE_1F1B:-1}"
 GATEWAY_TCP_FLAG=""
 if [ "${USE_BINARY_TRANSPORT}" = "1" ]; then
   GATEWAY_TCP_FLAG="--stage0-tcp=localhost:${TCP_PORT}"
+  if [ "${ENABLE_1F1B}" = "1" ]; then
+    GATEWAY_TCP_FLAG="${GATEWAY_TCP_FLAG} --gateway-host=${NODE_IPS[1]} --reply-port=50060"
+  else
+    GATEWAY_TCP_FLAG="${GATEWAY_TCP_FLAG} --disable-1f1b"
+  fi
 fi
-echo "Ensuring Ingress Gateway is running on ${NODE_PREFIX}-1..."
+echo "Ensuring Ingress Gateway is running on ${NODE_PREFIX}-1 (1F1B: $([ "${ENABLE_1F1B}" = "1" ] && echo "ENABLED" || echo "DISABLED"))..."
 ${GCLOUD} compute ssh "${NODE_PREFIX}-1" --zone="${ZONE}" --project="${PROJECT_ID}" --tunnel-through-iap \
   --command="(curl -s http://localhost:8000/health | grep -q '\"gateway\":\"healthy\"' && echo 'Gateway is already healthy!') || (systemctl --user stop fs-gateway 2>/dev/null || true && systemctl --user reset-failed 2>/dev/null || true && systemd-run --user --working-directory=/opt/FrontierSplit --setenv=PYTHONPATH=/opt/FrontierSplit --unit=fs-gateway python3 -m frontiersplit.gateway --stage0-url=http://localhost:50051 ${GATEWAY_TCP_FLAG} --port=8000 --total-stages=${NUM_NODES} --model-name=${MODEL_ID})"
 

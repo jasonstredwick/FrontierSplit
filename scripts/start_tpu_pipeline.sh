@@ -21,7 +21,9 @@ if [ "${NODE_STATE}" != "READY" ]; then
 fi
 
 USE_BINARY_TRANSPORT="${USE_BINARY_TRANSPORT:-1}"
+ENABLE_1F1B="${ENABLE_1F1B:-1}"
 echo "Binary TCP Transport: $([ "${USE_BINARY_TRANSPORT}" = "1" ] && echo "ENABLED" || echo "DISABLED (HTTP Baseline)")"
+echo "Asynchronous 1F1B:    $([ "${ENABLE_1F1B}" = "1" ] && echo "ENABLED" || echo "DISABLED")"
 
 TPU_SSH() {
   ${GCLOUD} compute tpus tpu-vm ssh "${TPU_NAME}" \
@@ -81,6 +83,7 @@ echo "Starting Ingress Gateway on port ${GATEWAY_PORT}..."
 TPU_SSH "nohup python3 -m frontiersplit.gateway \
   --stage0-url=http://127.0.0.1:50051 \
   $([ \"${USE_BINARY_TRANSPORT}\" = \"1\" ] && echo \"--stage0-tcp=127.0.0.1:50151\") \
+  $([ \"${ENABLE_1F1B}\" = \"0\" ] && echo \"--disable-1f1b\") \
   --port=${GATEWAY_PORT} \
   --total-stages=8 \
   --model-name=${MODEL_ID} > /tmp/fs_gateway.log 2>&1 &"

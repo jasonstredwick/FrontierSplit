@@ -74,6 +74,10 @@ def create_gateway_app(
     max_batch_size: int = 16,
     use_kv_cache: bool = True,
     stage0_tcp: Optional[str] = None,
+    enable_1f1b: bool = True,
+    gateway_host: Optional[str] = None,
+    reply_port: int = 50060,
+    max_in_flight: Optional[int] = None,
 ) -> FastAPI:
     """Create FastAPI application with interleaved pipeline scheduler."""
     if scheduler is None:
@@ -92,6 +96,10 @@ def create_gateway_app(
             max_batch_size=max_batch_size,
             use_kv_cache=use_kv_cache,
             stage0_tcp=stage0_tcp,
+            enable_1f1b=enable_1f1b,
+            gateway_host=gateway_host,
+            reply_port=reply_port,
+            max_in_flight=max_in_flight,
         )
 
     @asynccontextmanager
@@ -176,6 +184,10 @@ def main():
     parser.add_argument("--total-stages", type=int, default=4, help="Total pipeline stages in cluster")
     parser.add_argument("--max-batch-size", type=int, default=16, help="Maximum batch size for dynamic queue draining")
     parser.add_argument("--disable-kv-cache", action="store_true", help="Disable stateful KV cache and use stateless recomputation")
+    parser.add_argument("--disable-1f1b", action="store_true", help="Disable 1F1B async pipelining and use synchronous round-trip dispatch")
+    parser.add_argument("--gateway-host", type=str, default=None, help="Host address for downstream stages to stream replies back to")
+    parser.add_argument("--reply-port", type=int, default=50060, help="Persistent binary TCP reply port for 1F1B direct response streaming")
+    parser.add_argument("--max-in-flight", type=int, default=None, help="Maximum concurrent in-flight micro-batches across pipeline")
     args = parser.parse_args()
 
     app = create_gateway_app(
@@ -186,6 +198,10 @@ def main():
         total_stages=args.total_stages,
         max_batch_size=args.max_batch_size,
         use_kv_cache=not args.disable_kv_cache,
+        enable_1f1b=not args.disable_1f1b,
+        gateway_host=args.gateway_host,
+        reply_port=args.reply_port,
+        max_in_flight=args.max_in_flight,
     )
     print(f"Starting FrontierSplit Gateway on port {args.port}, connected to Stage 0 at {args.stage0_url}...")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
