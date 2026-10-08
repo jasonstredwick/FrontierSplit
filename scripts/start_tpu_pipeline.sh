@@ -22,8 +22,10 @@ fi
 
 USE_BINARY_TRANSPORT="${USE_BINARY_TRANSPORT:-1}"
 ENABLE_1F1B="${ENABLE_1F1B:-1}"
-echo "Binary TCP Transport: $([ "${USE_BINARY_TRANSPORT}" = "1" ] && echo "ENABLED" || echo "DISABLED (HTTP Baseline)")"
-echo "Asynchronous 1F1B:    $([ "${ENABLE_1F1B}" = "1" ] && echo "ENABLED" || echo "DISABLED")"
+QUANTIZE_ACTIVATIONS="${QUANTIZE_ACTIVATIONS:-0}"
+echo "Binary TCP Transport:    $([ "${USE_BINARY_TRANSPORT}" = "1" ] && echo "ENABLED" || echo "DISABLED (HTTP Baseline)")"
+echo "Asynchronous 1F1B:       $([ "${ENABLE_1F1B}" = "1" ] && echo "ENABLED" || echo "DISABLED")"
+echo "Activation Quantization: $([ "${QUANTIZE_ACTIVATIONS}" = "1" ] && echo "ENABLED (INT8)" || echo "DISABLED (FP16)")"
 
 TPU_SSH() {
   ${GCLOUD} compute tpus tpu-vm ssh "${TPU_NAME}" \
@@ -32,61 +34,74 @@ TPU_SSH() {
     --command="$1"
 }
 
-echo "Setting up repository and Python environment on TPU VM..."
+echo "Setting up repository and Python dependencies on TPU VM..."
 TPU_SSH "sudo mkdir -p /opt/FrontierSplit && sudo chown -R \$USER:\$USER /opt/FrontierSplit && \
   (git clone https://github.com/jasonstredwick/FrontierSplit.git /opt/FrontierSplit 2>/dev/null || (cd /opt/FrontierSplit && git pull origin main)) && \
-  pip install -r /opt/FrontierSplit/requirements.txt"
+  pip install -q fastapi uvicorn pydantic requests httpx transformers accelerate safetensors"
 
-# Kill any existing pipeline services
-echo "Cleaning up any existing worker or gateway processes..."
-TPU_SSH "pkill -f 'frontiersplit.worker' 2>/dev/null || true && pkill -f 'frontiersplit.gateway' 2>/dev/null || true && sleep 1"
+echo "Creating launcher script on TPU VM..."
+TPU_SSH "cat <<'EOF' > /tmp/fs_tpu_launcher.sh
+#!/usr/bin/env bash
+set -e
+export PYTHONPATH=/opt/FrontierSplit
+pkill -f 'frontiersplit.worker' 2>/dev/null || true
+pkill -f 'frontiersplit.gateway' 2>/dev/null || true
+sleep 1
 
-echo "Starting 8 distributed stage workers on TPU cores xla:0..xla:7..."
+MODEL=\"${MODEL_ID}\"
+USE_BIN=\"${USE_BINARY_TRANSPORT}\"
+QUANT_FLAG=\"$([ "${QUANTIZE_ACTIVATIONS}" = "1" ] && echo "--quantize-activations")\"
+
 # Stage 7 (Final Stage: LM Head, layers 28..31)
-TPU_SSH "nohup python3 -m frontiersplit.worker \
+nohup python3 -m frontiersplit.worker \
   --stage-id=7 \
   --total-stages=8 \
   --port=50058 \
-  $([ \"${USE_BINARY_TRANSPORT}\" = \"1\" ] && echo \"--tcp-port=50158\") \
+  \$([ \"\$USE_BIN\" = \"1\" ] && echo \"--tcp-port=50158\") \
   --device=xla:7 \
-  --model-name=${MODEL_ID} > /tmp/fs_stage7.log 2>&1 &"
+  \$QUANT_FLAG \
+  --model-name=\$MODEL > /tmp/fs_stage7.log 2>&1 &
 
-# Stages 6 down to 1 (Intermediate Stages)
-for s in $(seq 6 -1 1); do
-  PORT=$((50051 + s))
-  TCP_PORT=$((50151 + s))
-  NEXT_PORT=$((PORT + 1))
-  NEXT_TCP_PORT=$((TCP_PORT + 1))
+# Stages 6 down to 1
+for s in 6 5 4 3 2 1; do
+  PORT=\$((50051 + s))
+  TCP_PORT=\$((50151 + s))
+  NEXT_PORT=\$((PORT + 1))
+  NEXT_TCP_PORT=\$((TCP_PORT + 1))
 
-  TPU_SSH "nohup python3 -m frontiersplit.worker \
-    --stage-id=${s} \
+  nohup python3 -m frontiersplit.worker \
+    --stage-id=\$s \
     --total-stages=8 \
-    --port=${PORT} \
-    $([ \"${USE_BINARY_TRANSPORT}\" = \"1\" ] && echo \"--tcp-port=${TCP_PORT} --downstream-tcp=127.0.0.1:${NEXT_TCP_PORT}\") \
-    --downstream-url=http://127.0.0.1:${NEXT_PORT} \
-    --device=xla:${s} \
-    --model-name=${MODEL_ID} > /tmp/fs_stage${s}.log 2>&1 &"
+    --port=\$PORT \
+    \$([ \"\$USE_BIN\" = \"1\" ] && echo \"--tcp-port=\$TCP_PORT --downstream-tcp=127.0.0.1:\$NEXT_TCP_PORT\") \
+    --downstream-url=http://127.0.0.1:\$NEXT_PORT \
+    --device=xla:\$s \
+    \$QUANT_FLAG \
+    --model-name=\$MODEL > /tmp/fs_stage\${s}.log 2>&1 &
 done
 
-# Stage 0 (First Stage: Embeddings + layers 0..3)
-TPU_SSH "nohup python3 -m frontiersplit.worker \
+# Stage 0
+nohup python3 -m frontiersplit.worker \
   --stage-id=0 \
   --total-stages=8 \
   --port=50051 \
-  $([ \"${USE_BINARY_TRANSPORT}\" = \"1\" ] && echo \"--tcp-port=50151 --downstream-tcp=127.0.0.1:50152\") \
+  \$([ \"\$USE_BIN\" = \"1\" ] && echo \"--tcp-port=50151 --downstream-tcp=127.0.0.1:50152\") \
   --downstream-url=http://127.0.0.1:50052 \
   --device=xla:0 \
-  --model-name=${MODEL_ID} > /tmp/fs_stage0.log 2>&1 &"
+  \$QUANT_FLAG \
+  --model-name=\$MODEL > /tmp/fs_stage0.log 2>&1 &
 
 # Ingress Gateway
-echo "Starting Ingress Gateway on port ${GATEWAY_PORT}..."
-TPU_SSH "nohup python3 -m frontiersplit.gateway \
+ENABLE_1F1B_FLAG=\"$([ "${ENABLE_1F1B}" = "0" ] && echo "--disable-1f1b")\"
+nohup python3 -m frontiersplit.gateway \
   --stage0-url=http://127.0.0.1:50051 \
-  $([ \"${USE_BINARY_TRANSPORT}\" = \"1\" ] && echo \"--stage0-tcp=127.0.0.1:50151\") \
-  $([ \"${ENABLE_1F1B}\" = \"0\" ] && echo \"--disable-1f1b\") \
+  \$([ \"\$USE_BIN\" = \"1\" ] && echo \"--stage0-tcp=127.0.0.1:50151\") \
+  \$ENABLE_1F1B_FLAG \
   --port=${GATEWAY_PORT} \
   --total-stages=8 \
-  --model-name=${MODEL_ID} > /tmp/fs_gateway.log 2>&1 &"
+  --model-name=\$MODEL > /tmp/fs_gateway.log 2>&1 &
+EOF
+chmod +x /tmp/fs_tpu_launcher.sh && /tmp/fs_tpu_launcher.sh"
 
 echo "Waiting for TPU pipeline to initialize..."
 for i in $(seq 1 60); do
