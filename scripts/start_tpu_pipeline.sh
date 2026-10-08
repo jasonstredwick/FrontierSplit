@@ -45,8 +45,10 @@ set -e
 export PATH=/home/pixel/.local/bin:\$PATH
 export PYTHONPATH=/opt/FrontierSplit
 export HF_HOME=/dev/shm/huggingface
-pkill -f 'frontiersplit' 2>/dev/null || true
-sleep 1
+sudo fuser -k 50051/tcp 50052/tcp 50053/tcp 50054/tcp 50055/tcp 50056/tcp 50057/tcp 50058/tcp 50151/tcp 50152/tcp 50153/tcp 50154/tcp 50155/tcp 50156/tcp 50157/tcp 50158/tcp 8000/tcp 2>/dev/null || true
+pkill -9 -f 'frontiersplit' 2>/dev/null || true
+pkill -9 -f 'multiprocessing.spawn' 2>/dev/null || true
+sleep 2
 
 MODEL=\"${MODEL_ID}\"
 USE_BIN=\"${USE_BINARY_TRANSPORT}\"
@@ -61,13 +63,21 @@ nohup python3 -m frontiersplit.tpu_runner \
   \$BIN_FLAG \
   \$QUANT_FLAG > /tmp/fs_tpu_workers.log 2>&1 &
 
-# Wait briefly for Stage 0 port to open before starting Gateway
-for k in \$(seq 1 30); do
-  if curl -s http://127.0.0.1:50051/health 2>/dev/null | grep -q '\"status\":\"healthy\"'; then
-    echo \"Stage 0 is ready! Starting Ingress Gateway...\"
+# Wait for all 8 stages to become healthy
+echo \"Waiting for all 8 TPU worker stages to become healthy...\"
+for k in \$(seq 1 60); do
+  all_ok=1
+  for p in \$(seq 50051 50058); do
+    if ! curl -s http://127.0.0.1:\$p/health 2>/dev/null | grep -q '\"status\":\"healthy\"'; then
+      all_ok=0
+      break
+    fi
+  done
+  if [ \$all_ok -eq 1 ]; then
+    echo \"All 8 TPU stages are healthy! Starting Ingress Gateway...\"
     break
   fi
-  sleep 2
+  sleep 3
 done
 
 # Ingress Gateway
