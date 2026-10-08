@@ -158,14 +158,130 @@ def create_worker_app(
         print(f"[Worker Stage {stage_id}] Model spec resolved: {model_spec.architecture}, context={model_spec.context_window}, stop_tokens={len(model_spec.stop_token_ids)}")
 
 
-        # Load model weights in FP16
-        full_model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-        )
+        # Check if sharded safetensors index exists for fast selective stage loading
+        use_selective_sharded_loading = False
+        weight_map = {}
+        try:
+            from huggingface_hub import hf_hub_download
+            from safetensors.torch import load_file
+            import json
+            index_path = hf_hub_download(model_name_or_path, "model.safetensors.index.json")
+            with open(index_path, "r", encoding="utf-8") as f:
+                weight_map = json.load(f).get("weight_map", {})
+            use_selective_sharded_loading = bool(weight_map)
+        except Exception as e:
+            print(f"[Worker Stage {stage_id}] Note: Selective sharded loader unavailable ({e}), using standard from_pretrained")
+            use_selective_sharded_loading = False
 
-        model_config = getattr(full_model, "config", None)
+        if use_selective_sharded_loading:
+            print(f"[Worker Stage {stage_id}] Fast selective sharded loader active. Materializing layers {start_layer}..{end_layer}...")
+            import torch.nn as nn
+            if "mixtral" in getattr(config, "model_type", "").lower():
+                from transformers.models.mixtral.modeling_mixtral import (
+                    MixtralDecoderLayer as DecoderLayer,
+                    MixtralRMSNorm as RMSNorm,
+                    MixtralRotaryEmbedding as RotaryEmbedding,
+                )
+            else:
+                from transformers.models.mistral.modeling_mistral import (
+                    MistralDecoderLayer as DecoderLayer,
+                    MistralRMSNorm as RMSNorm,
+                    MistralRotaryEmbedding as RotaryEmbedding,
+                )
+
+            rotary_emb = RotaryEmbedding(config).to(resolved_device)
+            if is_first_stage:
+                embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=torch.float16)
+
+            stage_layers = []
+            for idx in range(start_layer, end_layer + 1):
+                layer = DecoderLayer(config, layer_idx=idx).to(dtype=torch.float16)
+                layer.self_attn.layer_idx = idx - start_layer
+                stage_layers.append(layer)
+
+            if is_final_stage:
+                final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps).to(dtype=torch.float16)
+                lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float16)
+
+            # Determine strictly needed shards for this stage
+            needed_shards = set()
+            for k, shard in weight_map.items():
+                if any(k.startswith(f"model.layers.{l}.") for l in range(start_layer, end_layer + 1)):
+                    needed_shards.add(shard)
+                if is_first_stage and k.startswith("model.embed_tokens."):
+                    needed_shards.add(shard)
+                if is_final_stage and (k.startswith("model.norm.") or k.startswith("lm_head.")):
+                    needed_shards.add(shard)
+
+            print(f"[Worker Stage {stage_id}] Downloading & injecting {len(needed_shards)} shards: {sorted(needed_shards)}")
+            for shard in sorted(needed_shards):
+                t_sh = time.time()
+                s_path = hf_hub_download(model_name_or_path, shard)
+                sd = load_file(s_path, device="cpu")
+                for l_idx in range(start_layer, end_layer + 1):
+                    pfx = f"model.layers.{l_idx}."
+                    sub = {k[len(pfx):]: v for k, v in sd.items() if k.startswith(pfx)}
+                    if sub:
+                        stage_layers[l_idx - start_layer].load_state_dict(sub, strict=False)
+                if is_first_stage and "model.embed_tokens.weight" in sd:
+                    embed_tokens.weight.data.copy_(sd["model.embed_tokens.weight"])
+                if is_final_stage:
+                    if "model.norm.weight" in sd:
+                        final_norm.weight.data.copy_(sd["model.norm.weight"])
+                    if "lm_head.weight" in sd:
+                        lm_head.weight.data.copy_(sd["lm_head.weight"])
+                del sd
+                print(f"[Worker Stage {stage_id}] Loaded shard {shard} in {time.time()-t_sh:.1f}s")
+
+            gc.collect()
+            # Move loaded modules to target GPU device
+            if is_first_stage and embed_tokens is not None:
+                embed_tokens = embed_tokens.to(resolved_device)
+            for l in stage_layers:
+                assigned_layers.append(l.to(resolved_device))
+            if is_final_stage:
+                if final_norm is not None:
+                    final_norm = final_norm.to(resolved_device)
+                if lm_head is not None:
+                    lm_head = lm_head.to(resolved_device)
+
+            model_config = config
+
+        else:
+            # Standard from_pretrained fallback
+            full_model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+            )
+
+            model_config = getattr(full_model, "config", None)
+            base_model = getattr(full_model, "model", getattr(full_model, "transformer", full_model))
+            all_layers = getattr(base_model, "layers", getattr(base_model, "h", []))
+            raw_rotary = getattr(base_model, "rotary_emb", None)
+            rotary_emb = raw_rotary.to(resolved_device) if raw_rotary is not None else None
+
+            if is_first_stage:
+                raw_embed = getattr(base_model, "embed_tokens", getattr(base_model, "wte", None))
+                embed_tokens = raw_embed.to(resolved_device) if raw_embed is not None else None
+
+            for idx in range(start_layer, end_layer + 1):
+                layer = all_layers[idx].to(resolved_device)
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
+                    layer.self_attn.layer_idx = idx - start_layer
+                assigned_layers.append(layer)
+
+            if is_final_stage:
+                raw_norm = getattr(base_model, "norm", getattr(base_model, "ln_f", None))
+                final_norm = raw_norm.to(resolved_device) if raw_norm is not None else None
+                raw_lm_head = getattr(full_model, "lm_head", None)
+                lm_head = raw_lm_head.to(resolved_device) if raw_lm_head is not None else None
+
+            del full_model
+            del base_model
+            del all_layers
+            gc.collect()
+
         mask_function = None
         try:
             from transformers.models.mistral.modeling_mistral import create_causal_mask, create_sliding_window_causal_mask
@@ -173,34 +289,6 @@ def create_worker_app(
         except Exception as e:
             print(f"[Worker Stage {stage_id}] Warning: Could not import Mistral causal mask functions: {e}")
 
-        base_model = getattr(full_model, "model", getattr(full_model, "transformer", full_model))
-        all_layers = getattr(base_model, "layers", getattr(base_model, "h", []))
-        raw_rotary = getattr(base_model, "rotary_emb", None)
-        rotary_emb = raw_rotary.to(resolved_device) if raw_rotary is not None else None
-
-        if is_first_stage:
-            raw_embed = getattr(base_model, "embed_tokens", getattr(base_model, "wte", None))
-            embed_tokens = raw_embed.to(resolved_device) if raw_embed is not None else None
-
-        for idx in range(start_layer, end_layer + 1):
-            layer = all_layers[idx].to(resolved_device)
-            # Re-index layer's internal self_attn.layer_idx to local index (0..len-1)
-            # so that each stage worker tracks KV cache cleanly without empty padding
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
-                layer.self_attn.layer_idx = idx - start_layer
-            assigned_layers.append(layer)
-
-        if is_final_stage:
-            raw_norm = getattr(base_model, "norm", getattr(base_model, "ln_f", None))
-            final_norm = raw_norm.to(resolved_device) if raw_norm is not None else None
-            raw_lm_head = getattr(full_model, "lm_head", None)
-            lm_head = raw_lm_head.to(resolved_device) if raw_lm_head is not None else None
-
-        # Free unassigned layers and garbage collect
-        del full_model
-        del base_model
-        del all_layers
-        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

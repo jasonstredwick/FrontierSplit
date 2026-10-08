@@ -25,10 +25,10 @@ else
 fi
 
 # Configuration defaults (sourced dynamically from cluster_config.json via env.sh)
-NODE_1_IP="${NODE_1_IP}"
-NODE_2_IP="${NODE_2_IP}"
-SSH_KEY="${SSH_KEY}"
-SSH_USER="${SSH_USER}"
+NODE_1_IP="${NODE_1_IP:-}"
+NODE_2_IP="${NODE_2_IP:-}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/google_compute_engine}"
+SSH_USER="${SSH_USER:-pixel}"
 GATEWAY_PORT="${GATEWAY_PORT:-8000}"
 WORKER_PORT="${WORKER_PORT:-50051}"
 
@@ -116,7 +116,11 @@ print_info() {
 get_node_ip() {
   local num="$1"
   local var_name="NODE_${num}_IP"
-  echo "${!var_name:-}"
+  local val="${!var_name:-}"
+  if [ -z "${val}" ] && [ -f "${CLUSTER_CONFIG_FILE:-}" ] && command -v jq >/dev/null 2>&1; then
+    val=$(jq -r "(.nodes[] | select(.node_id == ${num}) | .external_ip) // empty" "${CLUSTER_CONFIG_FILE}")
+  fi
+  echo "${val:-}"
 }
 
 # SSH execution helper

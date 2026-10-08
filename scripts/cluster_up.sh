@@ -101,6 +101,19 @@ try:
 except Exception:
     cfg = {}
 
+res = subprocess.check_output([
+    gcloud, 'compute', 'instances', 'list',
+    f'--project={project}', f'--filter=name ~ ^{prefix}', '--format=json'
+], text=True)
+instances = json.loads(res)
+inst_map = {}
+for inst in instances:
+    name = inst.get('name', '')
+    net = inst.get('networkInterfaces', [{}])[0]
+    int_ip = net.get('networkIP', '')
+    ext_ip = net.get('accessConfigs', [{}])[0].get('natIP', '')
+    inst_map[name] = {'internal': int_ip, 'external': ext_ip}
+
 cfg['cluster_name'] = f'frontiersplit-{num_nodes}x-t4'
 cfg['model_id'] = '${MODEL_ID}'
 cfg['machine_type'] = '${MACHINE_TYPE}'
@@ -113,14 +126,9 @@ nodes_list = []
 
 for i in range(1, num_nodes + 1):
     name = f'{prefix}-{i}'
-    try:
-        cmd = [gcloud, 'compute', 'instances', 'describe', name, f'--project={project}', f'--zone={zone}', '--format=json(networkInterfaces)']
-        res = subprocess.check_output(cmd, text=True)
-        net_info = json.loads(res)[0]
-        ext_ip = net_info.get('accessConfigs', [{}])[0].get('natIP', '')
-        int_ip = net_info.get('networkIP', '')
-    except Exception as e:
-        ext_ip, int_ip = '', ''
+    info = inst_map.get(name, {'internal': '', 'external': ''})
+    ext_ip = info['external']
+    int_ip = info['internal']
 
     start_l = (i - 1) * layers_per_node
     end_l = (i * layers_per_node) - 1

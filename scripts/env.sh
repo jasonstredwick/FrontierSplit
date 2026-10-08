@@ -21,6 +21,9 @@ if [ -f "${CLUSTER_CONFIG_FILE}" ] && command -v jq >/dev/null 2>&1; then
   SSH_KEY_RAW="$(jq -r '.ssh.key_path // ""' "${CLUSTER_CONFIG_FILE}")"
   SSH_KEY="${SSH_KEY:-${SSH_KEY_RAW/#\~/$HOME}}"
   SSH_USER="${SSH_USER:-$(jq -r '.ssh.user // "pixel"' "${CLUSTER_CONFIG_FILE}")}"
+  for i in $(seq 1 "${NUM_NODES}"); do
+    eval "NODE_${i}_IP=\"\${NODE_${i}_IP:-\$(jq -r '(.nodes[] | select(.node_id == '${i}') | .external_ip) // empty' \"\${CLUSTER_CONFIG_FILE}\")}\""
+  done
 else
   PROJECT_ID="${PROJECT_ID:-frontiersplit-proto}"
   REGION="${REGION:-us-central1}"
