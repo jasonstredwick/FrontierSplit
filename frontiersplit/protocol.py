@@ -15,6 +15,8 @@ class ActivationPacket(BaseModel):
     sequence_step: int
     stage_id: int
     is_prefill: bool = False
+    use_kv_cache: bool = True
+    max_tokens: Optional[int] = None
     tokens: Optional[List[int]] = None
     tensor_shape: List[int] = Field(default_factory=list)
     tensor_dtype: str = "float32"
@@ -53,6 +55,8 @@ class BatchedActivationPacket(BaseModel):
     sequence_steps: List[int]
     stage_id: int
     is_prefill: bool = False
+    use_kv_cache: bool = True
+    max_tokens_list: Optional[List[int]] = None
     tokens_batch: Optional[List[List[int]]] = None  # Padded tokens per request [B, max_len]
     attention_mask: Optional[List[List[int]]] = None # Attention mask per request [B, max_len]
     tensor_shape: List[int] = Field(default_factory=list) # [B, max_len, hidden_size]
@@ -81,5 +85,18 @@ class BatchedGenerationResponse(BaseModel):
     responses: List[GenerationResponse]
     batch_size: int
     stage_timings: Dict[str, float] = Field(default_factory=dict)
+
+
+class ReleaseSessionPacket(BaseModel):
+    """Inter-node command packet sent to workers to immediately reclaim session KV caches."""
+    request_ids: List[str]
+
+
+class ReleaseSessionResponse(BaseModel):
+    """Response acknowledging session KV cache reclamation across pipeline stages."""
+    status: str = "ok"
+    released_count: int
+    active_sessions: int
+
 
 

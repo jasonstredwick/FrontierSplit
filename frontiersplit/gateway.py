@@ -72,6 +72,7 @@ def create_gateway_app(
     total_stages: int = 4,
     scheduler: Optional[PipelineScheduler] = None,
     max_batch_size: int = 16,
+    use_kv_cache: bool = True,
 ) -> FastAPI:
     """Create FastAPI application with interleaved pipeline scheduler."""
     if scheduler is None:
@@ -88,6 +89,7 @@ def create_gateway_app(
             total_stages=total_stages,
             tokenizer=tokenizer,
             max_batch_size=max_batch_size,
+            use_kv_cache=use_kv_cache,
         )
 
     @asynccontextmanager
@@ -170,6 +172,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=8, help="Number of concurrent dispatch workers")
     parser.add_argument("--total-stages", type=int, default=4, help="Total pipeline stages in cluster")
     parser.add_argument("--max-batch-size", type=int, default=16, help="Maximum batch size for dynamic queue draining")
+    parser.add_argument("--disable-kv-cache", action="store_true", help="Disable stateful KV cache and use stateless recomputation")
     args = parser.parse_args()
 
     app = create_gateway_app(
@@ -178,6 +181,7 @@ def main():
         num_workers=args.num_workers,
         total_stages=args.total_stages,
         max_batch_size=args.max_batch_size,
+        use_kv_cache=not args.disable_kv_cache,
     )
     print(f"Starting FrontierSplit Gateway on port {args.port}, connected to Stage 0 at {args.stage0_url}...")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

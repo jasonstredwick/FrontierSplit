@@ -19,6 +19,8 @@ from frontiersplit.protocol import (
     BatchedActivationPacket,
     BatchedGenerationResponse,
     GenerationResponse,
+    ReleaseSessionPacket,
+    ReleaseSessionResponse,
 )
 
 
@@ -128,12 +130,14 @@ class PipelineScheduler:
         total_stages: int = 4,
         tokenizer: Optional[Any] = None,
         max_batch_size: int = 16,
+        use_kv_cache: bool = True,
     ):
         self.stage0_url = stage0_url
         self.num_workers = num_workers
         self.total_stages = total_stages
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
+        self.use_kv_cache = use_kv_cache
 
         self.active_requests: Dict[str, ScheduledRequest] = {}
         self.ready_queue: asyncio.Queue[ScheduledRequest] = asyncio.Queue()
@@ -258,23 +262,32 @@ class PipelineScheduler:
 
     async def _execute_batched_step(self, batch: List[ScheduledRequest]) -> None:
         """Execute a batched forward pass across all requests in the batch."""
-        max_len = max(len(r.input_tokens) for r in batch)
-        pad_id = getattr(self.tokenizer, "pad_token_id", None)
-        if pad_id is None:
-            pad_id = getattr(self.tokenizer, "eos_token_id", None) or 0
+        is_prefill = any(r.is_prefill for r in batch)
+        if self.use_kv_cache and not is_prefill:
+            # Decode step: pass only the single newest token for each request
+            padded_tokens = [[r.generated_tokens[-1]] for r in batch]
+            attention_masks = [[1] for _ in batch]
+        else:
+            # Prefill step (or stateless): pass full sequence with padding
+            max_len = max(len(r.input_tokens) for r in batch)
+            pad_id = getattr(self.tokenizer, "pad_token_id", None)
+            if pad_id is None:
+                pad_id = getattr(self.tokenizer, "eos_token_id", None) or 0
 
-        padded_tokens = []
-        attention_masks = []
-        for r in batch:
-            pad_len = max_len - len(r.input_tokens)
-            padded_tokens.append([pad_id] * pad_len + r.input_tokens)
-            attention_masks.append([0] * pad_len + [1] * len(r.input_tokens))
+            padded_tokens = []
+            attention_masks = []
+            for r in batch:
+                pad_len = max_len - len(r.input_tokens)
+                padded_tokens.append([pad_id] * pad_len + r.input_tokens)
+                attention_masks.append([0] * pad_len + [1] * len(r.input_tokens))
 
         packet = BatchedActivationPacket(
             request_ids=[r.request_id for r in batch],
             sequence_steps=[r.current_step for r in batch],
             stage_id=0,
-            is_prefill=any(r.is_prefill for r in batch),
+            is_prefill=is_prefill,
+            use_kv_cache=self.use_kv_cache,
+            max_tokens_list=[r.max_tokens for r in batch],
             tokens_batch=padded_tokens,
             attention_mask=attention_masks,
         )
@@ -336,12 +349,19 @@ class PipelineScheduler:
 
     async def _execute_step(self, req: ScheduledRequest) -> None:
         """Execute a single pipeline forward pass for a request."""
+        if self.use_kv_cache and not req.is_prefill:
+            step_tokens = [req.generated_tokens[-1]]
+        else:
+            step_tokens = req.input_tokens
+
         packet = ActivationPacket(
             request_id=req.request_id,
             sequence_step=req.current_step,
             stage_id=0,
             is_prefill=req.is_prefill,
-            tokens=req.input_tokens,
+            use_kv_cache=self.use_kv_cache,
+            max_tokens=req.max_tokens,
+            tokens=step_tokens,
         )
 
         # Offload blocking HTTP call to Stage 0 so async loop remains responsive
@@ -391,9 +411,25 @@ class PipelineScheduler:
             await self.ready_queue.put(req)
 
     def _finalize_request(self, req: ScheduledRequest) -> None:
-        """Retire a finished request and update metrics."""
+        """Retire a finished request, reclaim worker KV cache, and update metrics."""
         self.active_requests.pop(req.request_id, None)
         self.total_completed += 1
+        if self.use_kv_cache:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._async_release_session(req.request_id))
+            except RuntimeError:
+                pass
+
+    async def _async_release_session(self, request_id: str) -> None:
+        """Asynchronously notify stage 0 to release worker session KV cache."""
+        def _post_release():
+            try:
+                packet = ReleaseSessionPacket(request_ids=[request_id])
+                requests.post(f"{self.stage0_url}/release_sessions", json=packet.model_dump(), timeout=10)
+            except Exception:
+                pass
+        await asyncio.to_thread(_post_release)
 
     def get_telemetry(self) -> Dict[str, Any]:
         """Compute real-time pipeline performance and bubble metrics."""

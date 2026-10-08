@@ -23,6 +23,8 @@ from frontiersplit.protocol import (
     BatchedActivationPacket,
     BatchedGenerationResponse,
     GenerationResponse,
+    ReleaseSessionPacket,
+    ReleaseSessionResponse,
 )
 
 # Optional PyTorch and Hugging Face imports
@@ -32,6 +34,67 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
+
+
+class WorkerKVCacheStore:
+    """Manages session-keyed KV caches and VRAM budget guard for a pipeline worker stage."""
+
+    def __init__(self, max_tokens_budget: int = 100_000):
+        self.max_tokens_budget = max_tokens_budget
+        self.allocated_tokens: int = 0
+        self.sessions: Dict[str, Any] = {}
+        self.session_caps: Dict[str, int] = {}
+        self.session_seq_lens: Dict[str, int] = {}
+
+    def get_or_create(self, request_id: str, prompt_len: int, max_tokens: Optional[int] = None) -> Any:
+        """Retrieve existing session cache or allocate a new tile-aligned capacity."""
+        if request_id in self.sessions:
+            return self.sessions[request_id]
+
+        hard_cap = prompt_len + (max_tokens if max_tokens is not None else 512)
+        aligned_cap = ((hard_cap + 15) // 16) * 16
+
+        if HAS_TORCH:
+            try:
+                from transformers.cache_utils import DynamicCache
+                cache = DynamicCache()
+            except ImportError:
+                cache = None
+        else:
+            cache = []
+
+        self.sessions[request_id] = cache
+        self.session_caps[request_id] = aligned_cap
+        self.session_seq_lens[request_id] = prompt_len
+        self.allocated_tokens += aligned_cap
+        return cache
+
+    def get(self, request_id: str) -> Optional[Any]:
+        return self.sessions.get(request_id)
+
+    def update_seq_len(self, request_id: str, delta: int = 1) -> int:
+        curr = self.session_seq_lens.get(request_id, 0) + delta
+        self.session_seq_lens[request_id] = curr
+        return curr
+
+    def get_seq_len(self, request_id: str) -> int:
+        return self.session_seq_lens.get(request_id, 0)
+
+    def release(self, request_id: str) -> bool:
+        if request_id in self.sessions:
+            self.sessions.pop(request_id, None)
+            cap = self.session_caps.pop(request_id, 0)
+            self.session_seq_lens.pop(request_id, None)
+            self.allocated_tokens = max(0, self.allocated_tokens - cap)
+            return True
+        return False
+
+    def clear(self) -> None:
+        self.sessions.clear()
+        self.session_caps.clear()
+        self.session_seq_lens.clear()
+        self.allocated_tokens = 0
+
 
 
 def create_worker_app(
@@ -125,6 +188,8 @@ def create_worker_app(
         embeddings = np.random.randn(vocab_size, hidden_size).astype(np.float32) * 0.02 if is_first_stage else None
         lm_head_synth = np.random.randn(hidden_size, vocab_size).astype(np.float32) * 0.02 if is_final_stage else None
 
+    kv_store = WorkerKVCacheStore()
+
     @app.get("/health")
     def health():
         return {
@@ -137,7 +202,28 @@ def create_worker_app(
             "use_real_model": use_real_model,
             "device": resolved_device,
             "layer_range": layer_range,
+            "active_sessions": len(kv_store.sessions),
+            "allocated_kv_tokens": kv_store.allocated_tokens,
         }
+
+    @app.post("/release_sessions", response_model=ReleaseSessionResponse)
+    def release_sessions(packet: ReleaseSessionPacket):
+        released = 0
+        for req_id in packet.request_ids:
+            if kv_store.release(req_id):
+                released += 1
+
+        if not is_final_stage and downstream_url:
+            try:
+                requests.post(f"{downstream_url}/release_sessions", json=packet.model_dump(), timeout=10)
+            except Exception as e:
+                print(f"[Worker Stage {stage_id}] Warning: Propagating release_sessions to {downstream_url} failed: {e}")
+
+        return ReleaseSessionResponse(
+            status="ok",
+            released_count=released,
+            active_sessions=len(kv_store.sessions),
+        )
 
     @app.post("/forward", response_model=GenerationResponse)
     def forward(packet: ActivationPacket):
@@ -152,20 +238,39 @@ def create_worker_app(
                     arr = packet.get_tensor()
                     hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
 
-                # Compute position embeddings if rotary embedding is used
-                seq_len = hidden_states.shape[1]
-                pos_emb = None
-                if rotary_emb is not None:
-                    position_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
-                    pos_emb = rotary_emb(hidden_states, position_ids)
-
-                # Forward through assigned transformer layers
-                for layer in assigned_layers:
-                    if pos_emb is not None:
-                        layer_out = layer(hidden_states, position_embeddings=pos_emb)
+                if packet.use_kv_cache:
+                    if packet.is_prefill:
+                        prompt_len = hidden_states.shape[1]
+                        cache = kv_store.get_or_create(packet.request_id, prompt_len=prompt_len, max_tokens=packet.max_tokens)
+                        pos_ids = torch.arange(prompt_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
+                        pos_emb = rotary_emb(hidden_states, pos_ids) if rotary_emb is not None else None
+                        for layer in assigned_layers:
+                            layer_out = layer(hidden_states, position_embeddings=pos_emb, past_key_value=cache, use_cache=True)
+                            hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
                     else:
-                        layer_out = layer(hidden_states)
-                    hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+                        cache = kv_store.get(packet.request_id)
+                        if cache is not None:
+                            curr_len = cache.get_seq_length()
+                            pos_ids = torch.tensor([[curr_len]], dtype=torch.long, device=resolved_device)
+                            pos_emb = rotary_emb(hidden_states, pos_ids) if rotary_emb is not None else None
+                            for layer in assigned_layers:
+                                layer_out = layer(hidden_states, position_embeddings=pos_emb, past_key_value=cache, use_cache=True)
+                                hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+                            kv_store.update_seq_len(packet.request_id, 1)
+                        else:
+                            seq_len = hidden_states.shape[1]
+                            pos_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
+                            pos_emb = rotary_emb(hidden_states, position_ids) if rotary_emb is not None else None
+                            for layer in assigned_layers:
+                                layer_out = layer(hidden_states, position_embeddings=pos_emb)
+                                hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+                else:
+                    seq_len = hidden_states.shape[1]
+                    pos_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
+                    pos_emb = rotary_emb(hidden_states, position_ids) if rotary_emb is not None else None
+                    for layer in assigned_layers:
+                        layer_out = layer(hidden_states, position_embeddings=pos_emb)
+                        hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
                 stage_compute_ms = (time.time() - start_time) * 1000
                 timings = dict(packet.stage_timings)
@@ -181,6 +286,8 @@ def create_worker_app(
                         sequence_step=packet.sequence_step,
                         stage_id=stage_id + 1,
                         is_prefill=packet.is_prefill,
+                        use_kv_cache=packet.use_kv_cache,
+                        max_tokens=packet.max_tokens,
                         stage_timings=timings,
                     )
                     next_packet.set_tensor(next_act)
@@ -193,7 +300,6 @@ def create_worker_app(
                         raise HTTPException(status_code=502, detail=f"Downstream handoff to {downstream_url} failed: {e}")
 
                 else:
-                    # Final Stage: Compute LM head logits and select next token
                     if final_norm is not None:
                         hidden_states = final_norm(hidden_states)
 
@@ -205,7 +311,6 @@ def create_worker_app(
 
                     if tokenizer is not None:
                         decoded_text = tokenizer.decode([next_token_id])
-                        # Natural termination on model-specific stop tokens or context window limit
                         is_finished = (next_token_id in model_spec.stop_token_ids) or (packet.sequence_step >= model_spec.context_window)
                     else:
                         decoded_text = f"tok_{next_token_id % 100} "
@@ -230,6 +335,12 @@ def create_worker_app(
             else:
                 activation = packet.get_tensor()
 
+            if packet.use_kv_cache:
+                if packet.is_prefill:
+                    kv_store.get_or_create(packet.request_id, prompt_len=len(packet.tokens or [1]), max_tokens=packet.max_tokens)
+                else:
+                    kv_store.update_seq_len(packet.request_id, 1)
+
             activation = np.matmul(activation, layer_proj)
             stage_compute_ms = (time.time() - start_time) * 1000
             timings = dict(packet.stage_timings)
@@ -244,6 +355,8 @@ def create_worker_app(
                     sequence_step=packet.sequence_step,
                     stage_id=stage_id + 1,
                     is_prefill=packet.is_prefill,
+                    use_kv_cache=packet.use_kv_cache,
+                    max_tokens=packet.max_tokens,
                     stage_timings=timings,
                 )
                 next_packet.set_tensor(activation)
@@ -284,22 +397,63 @@ def create_worker_app(
                     arr = packet.get_tensor()
                     hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
 
-                seq_len = hidden_states.shape[1]
-                pos_emb = None
-                if rotary_emb is not None:
-                    if packet.attention_mask:
-                        mask_tensor = torch.tensor(packet.attention_mask, device=resolved_device, dtype=torch.long)
-                        position_ids = (mask_tensor.cumsum(dim=-1) - 1).clamp(min=0)
-                    else:
-                        position_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0).expand(batch_size, -1)
-                    pos_emb = rotary_emb(hidden_states, position_ids)
+                if packet.use_kv_cache and not packet.is_prefill:
+                    # Batched decode with session KV caches
+                    batch_outs = []
+                    for b_idx, req_id in enumerate(packet.request_ids):
+                        h_b = hidden_states[b_idx:b_idx+1, :, :]
+                        cache = kv_store.get(req_id)
+                        if cache is not None:
+                            curr_len = cache.get_seq_length()
+                            pos_ids = torch.tensor([[curr_len]], dtype=torch.long, device=resolved_device)
+                            p_emb = rotary_emb(h_b, pos_ids) if rotary_emb is not None else None
+                            for layer in assigned_layers:
+                                l_out = layer(h_b, position_embeddings=p_emb, past_key_value=cache, use_cache=True)
+                                h_b = l_out[0] if isinstance(l_out, tuple) else l_out
+                            kv_store.update_seq_len(req_id, 1)
+                        else:
+                            seq_len = h_b.shape[1]
+                            pos_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
+                            p_emb = rotary_emb(h_b, pos_ids) if rotary_emb is not None else None
+                            for layer in assigned_layers:
+                                l_out = layer(h_b, position_embeddings=p_emb)
+                                h_b = l_out[0] if isinstance(l_out, tuple) else l_out
+                        batch_outs.append(h_b)
+                    hidden_states = torch.cat(batch_outs, dim=0)
 
-                for layer in assigned_layers:
-                    if pos_emb is not None:
-                        layer_out = layer(hidden_states, position_embeddings=pos_emb)
-                    else:
-                        layer_out = layer(hidden_states)
-                    hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+                elif packet.use_kv_cache and packet.is_prefill:
+                    # Batched prefill with session KV caches
+                    batch_outs = []
+                    for b_idx, req_id in enumerate(packet.request_ids):
+                        h_b = hidden_states[b_idx:b_idx+1, :, :]
+                        prompt_len = h_b.shape[1]
+                        max_tok = packet.max_tokens_list[b_idx] if packet.max_tokens_list else None
+                        cache = kv_store.get_or_create(req_id, prompt_len=prompt_len, max_tokens=max_tok)
+                        pos_ids = torch.arange(prompt_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
+                        p_emb = rotary_emb(h_b, pos_ids) if rotary_emb is not None else None
+                        for layer in assigned_layers:
+                            l_out = layer(h_b, position_embeddings=p_emb, past_key_value=cache, use_cache=True)
+                            h_b = l_out[0] if isinstance(l_out, tuple) else l_out
+                        batch_outs.append(h_b)
+                    hidden_states = torch.cat(batch_outs, dim=0)
+
+                else:
+                    seq_len = hidden_states.shape[1]
+                    pos_emb = None
+                    if rotary_emb is not None:
+                        if packet.attention_mask:
+                            mask_tensor = torch.tensor(packet.attention_mask, device=resolved_device, dtype=torch.long)
+                            position_ids = (mask_tensor.cumsum(dim=-1) - 1).clamp(min=0)
+                        else:
+                            position_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0).expand(batch_size, -1)
+                        pos_emb = rotary_emb(hidden_states, position_ids)
+
+                    for layer in assigned_layers:
+                        if pos_emb is not None:
+                            layer_out = layer(hidden_states, position_embeddings=pos_emb)
+                        else:
+                            layer_out = layer(hidden_states)
+                        hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
                 stage_compute_ms = (time.time() - start_time) * 1000
                 timings = dict(packet.stage_timings)
@@ -315,6 +469,8 @@ def create_worker_app(
                         sequence_steps=packet.sequence_steps,
                         stage_id=stage_id + 1,
                         is_prefill=packet.is_prefill,
+                        use_kv_cache=packet.use_kv_cache,
+                        max_tokens_list=packet.max_tokens_list,
                         attention_mask=packet.attention_mask,
                         stage_timings=timings,
                     )
@@ -371,6 +527,15 @@ def create_worker_app(
             else:
                 activation = packet.get_tensor()
 
+            if packet.use_kv_cache:
+                for b_idx, req_id in enumerate(packet.request_ids):
+                    if packet.is_prefill:
+                        max_tok = packet.max_tokens_list[b_idx] if packet.max_tokens_list else None
+                        prompt_len = len(packet.tokens_batch[b_idx]) if (packet.tokens_batch and b_idx < len(packet.tokens_batch)) else 1
+                        kv_store.get_or_create(req_id, prompt_len=prompt_len, max_tokens=max_tok)
+                    else:
+                        kv_store.update_seq_len(req_id, 1)
+
             activation = np.matmul(activation, layer_proj)
             stage_compute_ms = (time.time() - start_time) * 1000
             timings = dict(packet.stage_timings)
@@ -385,6 +550,8 @@ def create_worker_app(
                     sequence_steps=packet.sequence_steps,
                     stage_id=stage_id + 1,
                     is_prefill=packet.is_prefill,
+                    use_kv_cache=packet.use_kv_cache,
+                    max_tokens_list=packet.max_tokens_list,
                     attention_mask=packet.attention_mask,
                     stage_timings=timings,
                 )
