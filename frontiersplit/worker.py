@@ -30,7 +30,19 @@ from frontiersplit.protocol import (
 # Optional PyTorch and Hugging Face imports
 try:
     import torch
+    import torch.nn.functional as F
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+    try:
+        from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb
+    except ImportError:
+        def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+            def rotate_half(x):
+                x1 = x[..., : x.shape[-1] // 2]
+                x2 = x[..., x.shape[-1] // 2 :]
+                return torch.cat((-x2, x1), dim=-1)
+            q_embed = (q * cos) + (rotate_half(q) * sin)
+            k_embed = (k * cos) + (rotate_half(k) * sin)
+            return q_embed, k_embed
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
@@ -463,54 +475,59 @@ def create_worker_app(
                     hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
 
                 if packet.use_kv_cache and not packet.is_prefill:
-                    # Batched decode with session KV caches
-                    batch_outs = []
-                    for b_idx, req_id in enumerate(packet.request_ids):
-                        h_b = hidden_states[b_idx:b_idx+1, :, :]
-                        cache = kv_store.get(req_id)
-                        if cache is not None:
-                            curr_len = cache.get_seq_length()
-                            pos_ids = torch.tensor([[curr_len]], dtype=torch.long, device=resolved_device)
-                            c_mask = mask_function(
-                                config=model_config,
-                                inputs_embeds=h_b,
-                                attention_mask=None,
-                                past_key_values=cache,
-                                position_ids=pos_ids,
-                            ) if mask_function is not None else None
-                            p_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
-                            for layer in assigned_layers:
-                                l_out = layer(
-                                    h_b,
-                                    attention_mask=c_mask,
-                                    position_ids=pos_ids,
-                                    past_key_values=cache,
-                                    use_cache=True,
-                                    position_embeddings=p_emb,
-                                )
-                                h_b = l_out[0] if isinstance(l_out, tuple) else l_out
-                            kv_store.update_seq_len(req_id, 1)
-                        else:
-                            seq_len = h_b.shape[1]
-                            pos_ids = torch.arange(seq_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
-                            c_mask = mask_function(
-                                config=model_config,
-                                inputs_embeds=h_b,
-                                attention_mask=None,
-                                past_key_values=None,
-                                position_ids=pos_ids,
-                            ) if mask_function is not None else None
-                            p_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
-                            for layer in assigned_layers:
-                                l_out = layer(
-                                    h_b,
-                                    attention_mask=c_mask,
-                                    position_ids=pos_ids,
-                                    position_embeddings=p_emb,
-                                )
-                                h_b = l_out[0] if isinstance(l_out, tuple) else l_out
-                        batch_outs.append(h_b)
-                    hidden_states = torch.cat(batch_outs, dim=0)
+                    # True Batched GEMM Decode:
+                    # Linear projections and MLPs are executed across the full batch [B, 1, 4096] in ONE GEMM pass,
+                    # reading the 7.5 GB of layer weights exactly once rather than B times.
+                    B_cur = hidden_states.shape[0]
+                    pos_ids = torch.tensor(
+                        [[kv_store.get(req_id).get_seq_length() if kv_store.get(req_id) else 0] for req_id in packet.request_ids],
+                        dtype=torch.long,
+                        device=resolved_device,
+                    )
+
+                    for layer in assigned_layers:
+                        residual = hidden_states
+                        hidden_norm = layer.input_layernorm(hidden_states)
+
+                        input_shape = hidden_norm.shape[:-1]
+                        num_q_heads = layer.self_attn.config.num_attention_heads
+                        num_kv_heads = layer.self_attn.config.num_key_value_heads
+                        head_dim = layer.self_attn.head_dim
+
+                        # Batched Q, K, V projections [B, 1, 4096] in a single GEMM
+                        q = layer.self_attn.q_proj(hidden_norm).view(*input_shape, num_q_heads, head_dim).transpose(1, 2)
+                        k = layer.self_attn.k_proj(hidden_norm).view(*input_shape, num_kv_heads, head_dim).transpose(1, 2)
+                        v = layer.self_attn.v_proj(hidden_norm).view(*input_shape, num_kv_heads, head_dim).transpose(1, 2)
+
+                        cos, sin = rotary_emb(hidden_norm, pos_ids)
+                        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+                        # Per-stream attention using each session's contiguous DynamicCache
+                        attn_outs = []
+                        num_kv_groups = getattr(layer.self_attn, "num_key_value_groups", 1)
+                        for b_idx, req_id in enumerate(packet.request_ids):
+                            cache = kv_store.get(req_id)
+                            q_b = q[b_idx:b_idx+1]
+                            k_b = k[b_idx:b_idx+1]
+                            v_b = v[b_idx:b_idx+1]
+                            if cache is not None:
+                                k_cached, v_cached = cache.update(k_b, v_b, layer.self_attn.layer_idx)
+                            else:
+                                k_cached, v_cached = k_b, v_b
+                            if num_kv_groups > 1:
+                                k_cached = k_cached.repeat_interleave(num_kv_groups, dim=1)
+                                v_cached = v_cached.repeat_interleave(num_kv_groups, dim=1)
+                            out_b = F.scaled_dot_product_attention(q_b, k_cached, v_cached)
+                            attn_outs.append(out_b)
+
+                        attn_out = torch.cat(attn_outs, dim=0).transpose(1, 2).reshape(B_cur, 1, -1)
+                        hidden_states = residual + layer.self_attn.o_proj(attn_out)
+
+                        # Batched MLP: [B, 1, 4096] in ONE GEMM pass!
+                        hidden_states = hidden_states + layer.mlp(layer.post_attention_layernorm(hidden_states))
+
+                    for req_id in packet.request_ids:
+                        kv_store.update_seq_len(req_id, 1)
 
                 elif packet.use_kv_cache and packet.is_prefill:
                     # Batched prefill with session KV caches
@@ -636,7 +653,9 @@ def create_worker_app(
         else:
             # Synthetic batched matrix compute
             if is_first_stage and packet.tokens_batch:
-                tokens_arr = np.array(packet.tokens_batch)
+                max_tok_len = max(len(t) for t in packet.tokens_batch)
+                padded_batch = [t + [0] * (max_tok_len - len(t)) for t in packet.tokens_batch]
+                tokens_arr = np.array(padded_batch)
                 activation = embeddings[tokens_arr]
             else:
                 activation = packet.get_tensor()

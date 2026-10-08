@@ -113,6 +113,46 @@ class TestWorkerKVCacheEndpoints(unittest.TestCase):
         self.assertEqual(health_after["active_sessions"], 0)
         self.assertEqual(health_after["allocated_kv_tokens"], 0)
 
+    def test_batched_gemm_decode_lifecycle(self):
+        """Verify batched prefill followed by batched GEMM decode across multiple streams."""
+        # 1. Batched prefill for 2 streams
+        prefill_pkt = BatchedActivationPacket(
+            request_ids=["bat_req_1", "bat_req_2"],
+            sequence_steps=[0, 0],
+            stage_id=0,
+            is_prefill=True,
+            use_kv_cache=True,
+            tokens_batch=[[1, 2, 3], [4, 5, 6, 7]],
+        )
+        resp1 = self.client.post("/forward_batched", json=prefill_pkt.model_dump())
+        self.assertEqual(resp1.status_code, 200)
+
+        health = self.client.get("/health").json()
+        self.assertEqual(health["active_sessions"], 2)
+
+        # 2. Batched decode step (single token per stream)
+        decode_pkt = BatchedActivationPacket(
+            request_ids=["bat_req_1", "bat_req_2"],
+            sequence_steps=[1, 1],
+            stage_id=0,
+            is_prefill=False,
+            use_kv_cache=True,
+            tokens_batch=[[10], [20]],
+        )
+        resp2 = self.client.post("/forward_batched", json=decode_pkt.model_dump())
+        self.assertEqual(resp2.status_code, 200)
+        data2 = resp2.json()
+        self.assertEqual(len(data2["responses"]), 2)
+
+        # 3. Clean release
+        rel_pkt = ReleaseSessionPacket(request_ids=["bat_req_1", "bat_req_2"])
+        rel_resp = self.client.post("/release_sessions", json=rel_pkt.model_dump())
+        self.assertEqual(rel_resp.status_code, 200)
+        self.assertEqual(rel_resp.json()["released_count"], 2)
+
+        health_after = self.client.get("/health").json()
+        self.assertEqual(health_after["active_sessions"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

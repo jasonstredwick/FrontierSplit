@@ -126,7 +126,7 @@ class PipelineScheduler:
     def __init__(
         self,
         stage0_url: str = "http://localhost:50051",
-        num_workers: int = 8,
+        num_workers: int = 1,
         total_stages: int = 4,
         tokenizer: Optional[Any] = None,
         max_batch_size: int = 16,
@@ -252,10 +252,19 @@ class PipelineScheduler:
                     break
 
             try:
-                if len(batch) == 1:
-                    await self._execute_step(batch[0])
-                else:
-                    await self._execute_batched_step(batch)
+                prefills = [r for r in batch if r.is_prefill]
+                decodes = [r for r in batch if not r.is_prefill]
+
+                if prefills:
+                    if len(prefills) == 1:
+                        await self._execute_step(prefills[0])
+                    else:
+                        await self._execute_batched_step(prefills)
+                if decodes:
+                    if len(decodes) == 1:
+                        await self._execute_step(decodes[0])
+                    else:
+                        await self._execute_batched_step(decodes)
             except Exception as e:
                 for req in batch:
                     req.error = str(e)

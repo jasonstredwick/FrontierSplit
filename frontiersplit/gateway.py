@@ -68,7 +68,7 @@ except ImportError:
 def create_gateway_app(
     stage0_url: str = "http://localhost:50051",
     model_name: str = "frontiersplit-mixtral-8x7b",
-    num_workers: int = 8,
+    num_workers: int = 1,
     total_stages: int = 4,
     scheduler: Optional[PipelineScheduler] = None,
     max_batch_size: int = 16,
