@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import gc
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 import numpy as np
 import requests
 from fastapi import FastAPI, HTTPException
@@ -214,24 +214,68 @@ def create_worker_app(
                     needed_shards.add(shard)
 
             print(f"[Worker Stage {stage_id}] Downloading & injecting {len(needed_shards)} shards: {sorted(needed_shards)}")
+            raw_layer_tensors: Dict[int, Dict[str, Any]] = {l: {} for l in range(start_layer, end_layer + 1)}
             for shard in sorted(needed_shards):
                 t_sh = time.time()
                 s_path = hf_hub_download(model_name_or_path, shard)
                 sd = load_file(s_path, device="cpu")
                 for l_idx in range(start_layer, end_layer + 1):
                     pfx = f"model.layers.{l_idx}."
-                    sub = {k[len(pfx):]: v for k, v in sd.items() if k.startswith(pfx)}
-                    if sub:
-                        stage_layers[l_idx - start_layer].load_state_dict(sub, strict=False)
+                    for k, v in sd.items():
+                        if k.startswith(pfx):
+                            raw_layer_tensors[l_idx][k[len(pfx):]] = v
                 if is_first_stage and "model.embed_tokens.weight" in sd:
-                    embed_tokens.weight.data.copy_(sd["model.embed_tokens.weight"])
+                    embed_tokens.weight.data.copy_(sd["model.embed_tokens.weight"].to(torch.float16))
                 if is_final_stage:
                     if "model.norm.weight" in sd:
-                        final_norm.weight.data.copy_(sd["model.norm.weight"])
+                        final_norm.weight.data.copy_(sd["model.norm.weight"].to(torch.float16))
                     if "lm_head.weight" in sd:
-                        lm_head.weight.data.copy_(sd["lm_head.weight"])
+                        lm_head.weight.data.copy_(sd["lm_head.weight"].to(torch.float16))
                 del sd
                 print(f"[Worker Stage {stage_id}] Loaded shard {shard} in {time.time()-t_sh:.1f}s")
+
+            # Convert and inject weights into stage layers with strict validation
+            for l_idx in range(start_layer, end_layer + 1):
+                raw_sub = raw_layer_tensors[l_idx]
+                layer = stage_layers[l_idx - start_layer]
+                target_sd = {}
+
+                has_stacked_experts = hasattr(layer, "mlp") and hasattr(layer.mlp, "experts") and hasattr(layer.mlp.experts, "gate_up_proj")
+                if has_stacked_experts and any(k.startswith("block_sparse_moe.") for k in raw_sub):
+                    # Convert raw checkpoint format (block_sparse_moe.*) to unified stacked MoE (transformers >= 4.49 / 5.x)
+                    for k in [
+                        "input_layernorm.weight",
+                        "post_attention_layernorm.weight",
+                        "self_attn.q_proj.weight",
+                        "self_attn.k_proj.weight",
+                        "self_attn.v_proj.weight",
+                        "self_attn.o_proj.weight",
+                    ]:
+                        if k in raw_sub:
+                            target_sd[k] = raw_sub[k].to(torch.float16)
+
+                    if "block_sparse_moe.gate.weight" in raw_sub:
+                        target_sd["mlp.gate.weight"] = raw_sub["block_sparse_moe.gate.weight"].to(torch.float16)
+
+                    num_exp = getattr(config, "num_local_experts", 8)
+                    gate_up_list = []
+                    down_list = []
+                    for e in range(num_exp):
+                        w1 = raw_sub[f"block_sparse_moe.experts.{e}.w1.weight"].to(torch.float16)
+                        w3 = raw_sub[f"block_sparse_moe.experts.{e}.w3.weight"].to(torch.float16)
+                        w2 = raw_sub[f"block_sparse_moe.experts.{e}.w2.weight"].to(torch.float16)
+                        gate_up_list.append(torch.cat([w1, w3], dim=0))
+                        down_list.append(w2)
+
+                    target_sd["mlp.experts.gate_up_proj"] = torch.stack(gate_up_list, dim=0)
+                    target_sd["mlp.experts.down_proj"] = torch.stack(down_list, dim=0)
+                else:
+                    target_sd = {k: v.to(torch.float16) for k, v in raw_sub.items()}
+
+                layer.load_state_dict(target_sd, strict=True)
+                raw_layer_tensors[l_idx].clear()
+
+            raw_layer_tensors.clear()
 
             gc.collect()
             # Move loaded modules to target GPU device
@@ -618,7 +662,9 @@ def create_worker_app(
                             moe_out = moe_out[0] if isinstance(moe_out, tuple) else moe_out
                             hidden_states = hidden_states + moe_out
                         elif hasattr(layer, "mlp"):
-                            hidden_states = hidden_states + layer.mlp(normed)
+                            moe_out = layer.mlp(normed)
+                            moe_out = moe_out[0] if isinstance(moe_out, tuple) else moe_out
+                            hidden_states = hidden_states + moe_out
                         else:
                             raise RuntimeError(f"Unknown layer feed-forward block: {type(layer)}")
 
