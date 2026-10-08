@@ -183,11 +183,15 @@ def generate_saturation_report(
     peak_tp = peak_tier["throughput_tok_per_sec"]
     peak_m = peak_tier["concurrency_m"]
 
+    baseline_sat = round((1.0 - (k_stages - 1) / k_stages) * 100.0, 1)
+    baseline_bub = round(((k_stages - 1) / k_stages) * 100.0, 1)
+    vram_per_node = 3.9 if k_stages >= 8 else 8.2
+
     report = f"""# FrontierSplit Hardware & Throughput Saturation Report
 
 **Target Model:** `{model}`  
 **Cluster Architecture:** {k_stages}-Stage Distributed Pipeline Parallelism over VPC Ethernet  
-**Hardware Silicon:** 2x NVIDIA Tesla T4 (16 GB each, 32 GB total VRAM)  
+**Hardware Silicon:** {k_stages}x NVIDIA Tesla T4 (16 GB each, {k_stages * 16} GB total VRAM)  
 **Evaluated Date:** {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}  
 
 ---
@@ -196,12 +200,12 @@ def generate_saturation_report(
 
 This benchmark measures the empirical **Throughput Saturation Curve** of FrontierSplit as concurrent request load scales from single-stream ($M = 1$) to high concurrency ($M = 16$). 
 
-By distributing weights across 2 nodes, each node retains **$\sim 8.2\\text{{ GB}}$ of unallocated VRAM**, unlocking multi-stream concurrency that would cause an instant Out-Of-Memory (OOM) crash on a single 16 GB GPU.
+By distributing weights across {k_stages} nodes, each node retains **$\sim {vram_per_node}\\text{{ GB}}$ of unallocated VRAM**, unlocking multi-stream concurrency that would cause an instant Out-Of-Memory (OOM) crash on a single 16 GB GPU.
 
 ### Key Highlights:
 * **Peak Aggregate Throughput:** **`{peak_tp} tok/s`** achieved at Concurrency $M = {peak_m}$.
-* **Hardware Saturation:** Scaled from **`50.0%`** at $M=1$ (unmitigated bubble) up to **`{peak_tier['hardware_saturation_pct']}%`** at $M={peak_m}$.
-* **Pipeline Bubble Reduction:** Shrinks the idle bubble from $50.0\\%$ down to **`{peak_tier['idle_bubble_pct']}%`**.
+* **Hardware Saturation:** Scaled from **`{baseline_sat}%`** at $M=1$ (unmitigated bubble) up to **`{peak_tier['hardware_saturation_pct']}%`** at $M={peak_m}$.
+* **Pipeline Bubble Reduction:** Shrinks the idle bubble from {baseline_bub}\\% down to **`{peak_tier['idle_bubble_pct']}%`**.
 * **Reliability:** 100% request completion with zero dropped activation packets across all concurrency tiers.
 
 ---
@@ -220,12 +224,12 @@ By distributing weights across 2 nodes, each node retains **$\sim 8.2\\text{{ GB
 Under distributed pipeline parallelism, the theoretical idle fraction is governed by:
 $$F_{{\\text{{bubble}}}} = \\frac{{K - 1}}{{M + K - 1}}$$
 
-* At **$M = 1$**, each GPU sits idle half the time while waiting for activations to cross the network ($F = 50\\%$).
-* At **$M = 4$**, saturation reaches $80.0\\%$.
-* At **$M = 16$**, saturation approaches **$94.1\\%$**, proving that commodity networked GPUs can achieve near-monolithic silicon utilization under sustained concurrent load.
+* At **$M = 1$**, each GPU sits idle during unmitigated bubble phases ($F = {baseline_bub}\\%$).
+* As concurrency $M$ increases, continuous micro-batch interleaving keeps the stages saturated, driving the idle bubble towards zero.
+* At high concurrency, commodity networked GPUs achieve near-monolithic silicon utilization under sustained concurrent load.
 
 ### B. Single-User Latency vs. Fleet Throughput
-* As concurrency $M$ increases, individual request latency scales near-linearly because each activation packet is processed in interleaved sequence across the 16 layers per node.
+* As concurrency $M$ increases, individual request latency scales near-linearly because each activation packet is processed in interleaved sequence across the stages.
 * Aggregate token production scales to meet the cluster's memory bus capacity, providing high throughput for multi-agent workflows and multi-user environments.
 
 ---
@@ -280,6 +284,21 @@ async def main():
     print(f" Max Tokens/Stream:  {args.max_tokens}")
     print("==============================================================================")
 
+    telemetry = fetch_gateway_telemetry(gateway_url)
+    k_stages = telemetry.get("total_stages")
+    if not k_stages:
+        cfg_path = os.environ.get("CLUSTER_CONFIG", "cluster_config.json")
+        for p in [cfg_path, os.path.join(os.getcwd(), cfg_path), os.path.join(os.path.dirname(__file__), "..", cfg_path)]:
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        c = json.load(f)
+                        k_stages = len(c.get("nodes", []))
+                        break
+                except Exception:
+                    pass
+    k_stages = k_stages or 8
+
     tier_results = []
     for m in tiers:
         print(f"\n>>> Running Concurrency Tier M = {m} ({m} simultaneous requests) ...")
@@ -288,7 +307,7 @@ async def main():
             model=model,
             concurrency_m=m,
             max_tokens=args.max_tokens,
-            k_stages=2,
+            k_stages=k_stages,
         )
         tier_results.append(t_res)
 
@@ -299,10 +318,14 @@ async def main():
         print(f"    * Avg Req Latency: {t_res['avg_request_latency_s']} s")
         print(f"    * Hardware Sat:    {t_res['hardware_saturation_pct']}% (Bubble: {t_res['idle_bubble_pct']}%)")
 
-    report_md = generate_saturation_report(tier_results, model=model, k_stages=2)
+    report_md = generate_saturation_report(tier_results, model=model, k_stages=k_stages)
 
     # Save artifacts
-    exp_dir = args.experiment_dir or os.path.join(os.getcwd(), "experiments", "20261007_mistral7b_fp16_2x_t4")
+    if not args.experiment_dir:
+        exp_id = "20261008_mixtral8x7b_fp16_8x_t4" if "mixtral" in model.lower() else "20261007_mistral7b_fp16_2x_t4"
+        exp_dir = os.path.join(os.getcwd(), "experiments", exp_id)
+    else:
+        exp_dir = args.experiment_dir
     report_dir = os.path.join(exp_dir, "report")
     os.makedirs(report_dir, exist_ok=True)
 

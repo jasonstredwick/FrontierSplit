@@ -430,10 +430,15 @@ def main():
             except Exception:
                 pass
 
-    # Defaults if still unset
     base_url = base_url or "http://localhost:8000/v1"
     gateway_url = gateway_url or "http://localhost:8000"
     model = model or "frontiersplit-mixtral-8x7b"
+
+    # Default experiment directory based on model
+    exp_dir = args.experiment_dir
+    if not exp_dir:
+        exp_id = "20261008_mixtral8x7b_fp16_8x_t4" if "mixtral" in model.lower() else "20261007_mistral7b_fp16_2x_t4"
+        exp_dir = os.path.join(os.getcwd(), "experiments", exp_id)
 
     asyncio.run(
         run_suite(
@@ -445,7 +450,7 @@ def main():
             num_runs=args.num_runs,
             max_tokens=args.max_tokens,
             output_dir=args.output_dir,
-            experiment_dir=args.experiment_dir,
+            experiment_dir=exp_dir,
         )
     )
 
