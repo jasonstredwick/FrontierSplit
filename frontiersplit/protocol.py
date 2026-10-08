@@ -28,6 +28,7 @@ MSG_FORWARD_ACK = 8
 
 FLAG_IS_PREFILL = 0x01
 FLAG_USE_KV_CACHE = 0x02
+FLAG_QUANTIZED = 0x04
 
 DTYPE_TO_CODE = {
     "float16": 1,
@@ -35,6 +36,8 @@ DTYPE_TO_CODE = {
     "bfloat16": 3,
     "int64": 4,
     "int32": 5,
+    "int8": 6,
+    "float8_e4m3fn": 7,
 }
 CODE_TO_DTYPE = {v: k for k, v in DTYPE_TO_CODE.items()}
 
@@ -182,6 +185,7 @@ class BatchedActivationPacket(BaseModel):
     timestamp_sent_ms: float = Field(default_factory=lambda: time.time() * 1000)
     stage_timings: Dict[str, float] = Field(default_factory=dict)
     reply_to: Optional[str] = None
+    tensor_scale: Optional[float] = None
 
     # Internal cached raw bytes to bypass Base64 encoding/decoding during binary transport
     _raw_tensor_bytes: Optional[bytes] = None
@@ -223,14 +227,17 @@ class BatchedActivationPacket(BaseModel):
         self.tensor_bytes_b64 = base64.b64encode(raw_bytes).decode("ascii")
 
     def get_tensor(self) -> np.ndarray:
-        """Deserialize raw tensor bytes into a numpy array."""
+        """Deserialize raw tensor bytes into a numpy array, dequantizing if scale is present."""
         raw_bytes = self.get_raw_bytes()
         if not raw_bytes:
             return np.zeros(self.tensor_shape, dtype=self.tensor_dtype)
+        if self.tensor_scale is not None and self.tensor_dtype in ("int8", "float8_e4m3fn"):
+            q_arr = np.frombuffer(raw_bytes, dtype=np.int8).reshape(self.tensor_shape)
+            return (q_arr.astype(np.float32) * self.tensor_scale).astype(np.float32)
         return np.frombuffer(raw_bytes, dtype=self.tensor_dtype).reshape(self.tensor_shape)
 
     def encode_binary(self, raw_tensor_bytes: Optional[bytes] = None, msg_type: Optional[int] = None) -> bytes:
-        """Encodes this packet into a 32-byte framed binary packet with raw FP16/FP32 payload."""
+        """Encodes this packet into a 32-byte framed binary packet with raw FP16/FP32/INT8 payload."""
         payload = raw_tensor_bytes if raw_tensor_bytes is not None else self.get_raw_bytes()
         meta = {
             "request_ids": self.request_ids,
@@ -246,6 +253,7 @@ class BatchedActivationPacket(BaseModel):
             "timestamp_sent_ms": self.timestamp_sent_ms,
             "stage_timings": self.stage_timings,
             "reply_to": self.reply_to,
+            "tensor_scale": self.tensor_scale,
         }
         meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
         flags = 0
@@ -253,6 +261,8 @@ class BatchedActivationPacket(BaseModel):
             flags |= FLAG_IS_PREFILL
         if self.use_kv_cache:
             flags |= FLAG_USE_KV_CACHE
+        if self.tensor_scale is not None:
+            flags |= FLAG_QUANTIZED
 
         dtype_code = DTYPE_TO_CODE.get(self.tensor_dtype, 0)
         resolved_msg_type = msg_type or (MSG_FORWARD_ASYNC_REQ if self.reply_to else MSG_FORWARD_BATCHED_REQ)
@@ -291,9 +301,23 @@ class BatchedActivationPacket(BaseModel):
             timestamp_sent_ms=meta.get("timestamp_sent_ms", time.time() * 1000),
             stage_timings=meta.get("stage_timings", {}),
             reply_to=meta.get("reply_to"),
+            tensor_scale=meta.get("tensor_scale"),
         )
         packet.set_raw_tensor(payload_bytes, packet.tensor_shape, packet.tensor_dtype)
         return packet
+
+    @classmethod
+    def from_binary_frame(cls, frame_bytes: bytes) -> BatchedActivationPacket:
+        """Parses a complete framed binary message into a BatchedActivationPacket."""
+        if len(frame_bytes) < HEADER_SIZE:
+            raise ValueError(f"Frame length {len(frame_bytes)} is less than header size {HEADER_SIZE}")
+        hdr = unpack_header(frame_bytes[:HEADER_SIZE])
+        meta_end = HEADER_SIZE + hdr["meta_len"]
+        meta_bytes = frame_bytes[HEADER_SIZE:meta_end]
+        payload_bytes = frame_bytes[meta_end : meta_end + hdr["payload_len"]]
+        dtype_str = CODE_TO_DTYPE.get(hdr["dtype_code"], "float32")
+        shape = hdr["shape"]
+        return cls.decode_binary(meta_bytes, payload_bytes, dtype_str, shape, flags=hdr["flags"])
 
 
 class BatchedGenerationResponse(BaseModel):

@@ -12,6 +12,7 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import gc
+import os
 import time
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -122,10 +123,12 @@ def create_worker_app(
     vocab_size: int = 32000,
     tcp_port: Optional[int] = None,
     downstream_tcp: Optional[str] = None,
+    quantize_activations: bool = False,
 ) -> FastAPI:
     """Creates a FastAPI app and optional persistent binary TCP server for a pipeline stage worker."""
     is_first_stage = (stage_id == 0)
     is_final_stage = (stage_id == total_stages - 1)
+    quantize_activations = quantize_activations or (os.environ.get("USE_FP8_ACTIVATIONS", "0") == "1")
 
     target_downstream_tcp = downstream_tcp or (
         downstream_url.replace("tcp://", "") if downstream_url and downstream_url.startswith("tcp://") else None
@@ -187,11 +190,24 @@ def create_worker_app(
         if use_selective_sharded_loading:
             print(f"[Worker Stage {stage_id}] Fast selective sharded loader active. Materializing layers {start_layer}..{end_layer}...")
             import torch.nn as nn
-            if "mixtral" in getattr(config, "model_type", "").lower():
+            mtype = getattr(config, "model_type", "").lower()
+            if "mixtral" in mtype:
                 from transformers.models.mixtral.modeling_mixtral import (
                     MixtralDecoderLayer as DecoderLayer,
                     MixtralRMSNorm as RMSNorm,
                     MixtralRotaryEmbedding as RotaryEmbedding,
+                )
+            elif "llama" in mtype:
+                from transformers.models.llama.modeling_llama import (
+                    LlamaDecoderLayer as DecoderLayer,
+                    LlamaRMSNorm as RMSNorm,
+                    LlamaRotaryEmbedding as RotaryEmbedding,
+                )
+            elif "qwen2" in mtype:
+                from transformers.models.qwen2.modeling_qwen2 import (
+                    Qwen2DecoderLayer as DecoderLayer,
+                    Qwen2RMSNorm as RMSNorm,
+                    Qwen2RotaryEmbedding as RotaryEmbedding,
                 )
             else:
                 from transformers.models.mistral.modeling_mistral import (
@@ -630,10 +646,18 @@ def create_worker_app(
                         else:
                             raw_bytes = packet.get_raw_bytes()
                             if raw_bytes:
-                                dtype_obj = getattr(torch, packet.tensor_dtype, torch.float16)
-                                hidden_states = torch.frombuffer(
-                                    bytearray(raw_bytes), dtype=dtype_obj
-                                ).reshape(packet.tensor_shape).to(resolved_device, non_blocking=True)
+                                if packet.tensor_scale is not None and packet.tensor_dtype in ("int8", "float8_e4m3fn"):
+                                    if packet.tensor_dtype == "float8_e4m3fn" and hasattr(torch, "float8_e4m3fn"):
+                                        q = torch.frombuffer(bytearray(raw_bytes), dtype=torch.uint8).view(torch.float8_e4m3fn).reshape(packet.tensor_shape).to(resolved_device, non_blocking=True)
+                                        hidden_states = (q.to(torch.float16) * packet.tensor_scale)
+                                    else:
+                                        q = torch.frombuffer(bytearray(raw_bytes), dtype=torch.int8).reshape(packet.tensor_shape).to(resolved_device, non_blocking=True)
+                                        hidden_states = (q.to(torch.float16) * packet.tensor_scale)
+                                else:
+                                    dtype_obj = getattr(torch, packet.tensor_dtype, torch.float16)
+                                    hidden_states = torch.frombuffer(
+                                        bytearray(raw_bytes), dtype=dtype_obj
+                                    ).reshape(packet.tensor_shape).to(resolved_device, non_blocking=True)
                             else:
                                 arr = packet.get_tensor()
                                 hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
@@ -794,13 +818,21 @@ def create_worker_app(
                         stage_timings=timings,
                         reply_to=packet.reply_to,
                     )
-                    cpu_t = hidden_states.contiguous().cpu()
-                    dtype_str = str(hidden_states.dtype).replace("torch.", "")
-                    if dtype_str in ("float16", "bfloat16"):
-                        raw_bytes = cpu_t.view(torch.uint8).numpy().tobytes()
+                    if quantize_activations:
+                        amax = hidden_states.abs().max().item()
+                        scale = 1.0 if amax == 0 else amax / 127.0
+                        q = torch.clamp(torch.round(hidden_states / scale), -128, 127).to(torch.int8)
+                        raw_bytes = q.contiguous().cpu().numpy().tobytes()
+                        next_packet.tensor_scale = scale
+                        next_packet.set_raw_tensor(raw_bytes, list(hidden_states.shape), "int8")
                     else:
-                        raw_bytes = cpu_t.numpy().tobytes()
-                    next_packet.set_raw_tensor(raw_bytes, list(hidden_states.shape), dtype_str)
+                        cpu_t = hidden_states.contiguous().cpu()
+                        dtype_str = str(hidden_states.dtype).replace("torch.", "")
+                        if dtype_str in ("float16", "bfloat16"):
+                            raw_bytes = cpu_t.view(torch.uint8).numpy().tobytes()
+                        else:
+                            raw_bytes = cpu_t.numpy().tobytes()
+                        next_packet.set_raw_tensor(raw_bytes, list(hidden_states.shape), dtype_str)
 
                     if downstream_client is not None:
                         if packet.reply_to:
@@ -809,7 +841,6 @@ def create_worker_app(
                         else:
                             return await downstream_client.send_batched_forward(next_packet)
                     elif downstream_url:
-                        next_packet.set_tensor(cpu_t.numpy())
                         def _post():
                             resp = requests.post(f"{downstream_url}/forward_batched", json=next_packet.model_dump(), timeout=600)
                             resp.raise_for_status()
@@ -867,7 +898,11 @@ def create_worker_app(
                     else:
                         raw_bytes = packet.get_raw_bytes()
                         if raw_bytes:
-                            activation = np.frombuffer(raw_bytes, dtype=packet.tensor_dtype).reshape(packet.tensor_shape)
+                            if packet.tensor_scale is not None and packet.tensor_dtype in ("int8", "float8_e4m3fn"):
+                                q_arr = np.frombuffer(raw_bytes, dtype=np.int8).reshape(packet.tensor_shape)
+                                activation = (q_arr.astype(np.float32) * packet.tensor_scale).astype(np.float32)
+                            else:
+                                activation = np.frombuffer(raw_bytes, dtype=packet.tensor_dtype).reshape(packet.tensor_shape)
                         else:
                             activation = packet.get_tensor()
 
@@ -902,16 +937,24 @@ def create_worker_app(
                         stage_timings=timings,
                         reply_to=packet.reply_to,
                     )
-                    next_packet.set_raw_tensor(activation.tobytes(), list(activation.shape), str(activation.dtype))
+                    if quantize_activations:
+                        amax = float(np.max(np.abs(activation)))
+                        scale = 1.0 if amax == 0 else amax / 127.0
+                        q = np.clip(np.round(activation / scale), -128, 127).astype(np.int8)
+                        raw_bytes = q.tobytes()
+                        next_packet.tensor_scale = scale
+                        next_packet.set_raw_tensor(raw_bytes, list(activation.shape), "int8")
+                    else:
+                        raw_bytes = activation.tobytes()
+                        next_packet.set_raw_tensor(raw_bytes, list(activation.shape), str(activation.dtype))
 
                     if downstream_client is not None:
                         if packet.reply_to:
-                            await downstream_client.send_async_forward(next_packet, raw_tensor_bytes=activation.tobytes())
+                            await downstream_client.send_async_forward(next_packet, raw_tensor_bytes=raw_bytes)
                             return BatchedGenerationResponse(responses=[], batch_size=0, stage_timings=timings)
                         else:
                             return await downstream_client.send_batched_forward(next_packet)
                     elif downstream_url:
-                        next_packet.set_tensor(activation)
                         def _post_synth():
                             resp = requests.post(f"{downstream_url}/forward_batched", json=next_packet.model_dump(), timeout=30)
                             resp.raise_for_status()
@@ -1016,6 +1059,7 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host interface")
     parser.add_argument("--model-name", type=str, default=None, help="Hugging Face model ID to load")
     parser.add_argument("--device", type=str, default=None, help="PyTorch device (cuda, mps, cpu)")
+    parser.add_argument("--quantize-activations", action="store_true", default=False, help="Enable dynamic INT8 activation quantization for inter-stage transport")
     args = parser.parse_args()
 
     app = create_worker_app(
@@ -1026,6 +1070,7 @@ def main():
         device=args.device,
         tcp_port=args.tcp_port,
         downstream_tcp=args.downstream_tcp,
+        quantize_activations=args.quantize_activations,
     )
     print(f"Starting FrontierSplit Worker Stage {args.stage_id}/{args.total_stages} on port {args.port}...")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
