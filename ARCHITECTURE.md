@@ -81,3 +81,19 @@ FrontierSplit decouples the model vertically by **Pipeline Parallelism (PP)**:
    * Drives heavy concurrency into the pipeline to eliminate pipeline bubbles.
    * Integrates benchmarks: **SWE-bench Lite** and **IFEval**.
    * Telemetry tracker measuring GPU compute and VRAM saturation across all nodes.
+
+---
+
+## 4. KV Cache & Execution Architecture
+
+For complete design details, memory layouts, and algorithmic proofs, see [DESIGN_KV_CACHE.md](file:///Users/pixel/code/FrontierSplit/DESIGN_KV_CACHE.md).
+
+* **Mode**: Bounded Tile-Aligned KV Cache with Geometric Doubling.
+* **Concurrency**: Multi-Producer API Layer (FastAPI) feeding a Single-Consumer Execution Engine Thread (Zero GPU mutexes).
+* **Hardware Alignment**: All sequence allocations are aligned to 16-token boundaries ($\operatorname{ceil}_{16}$), matching the $16 \times 16 \times 16$ Tensor Core tile and 32-thread warps.
+* **Allocation Policy**:
+  * If $\text{hard\_cap} \le 256$: Allocate $\operatorname{ceil}_{16}(\text{hard\_cap})$ directly (zero memory waste, zero reallocations).
+  * If $\text{hard\_cap} > 256$: Allocate to nearest power-of-two for initial expected response (~256 tokens), doubling geometrically ($256 \to 512 \to 1024 \dots$) if capacity is exhausted.
+* **Memory Invariant**: Memory remains 100% physically contiguous, enabling standard cuBLAS / PyTorch GEMM execution without custom non-contiguous paging kernels.
+* **Pipeline Boundary Invariant**: Node 1 and Node 2 maintain independent local session caches; only the transient `[M, 4096]` activation tensor crosses the VPC network wire.
+
