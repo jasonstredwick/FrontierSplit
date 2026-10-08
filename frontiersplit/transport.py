@@ -284,11 +284,14 @@ class BinaryTransportServer:
 
     async def start(self) -> None:
         """Starts the persistent TCP server."""
+        kw = {"reuse_address": True}
+        if hasattr(socket, "SO_REUSEPORT"):
+            kw["reuse_port"] = True
         self.server = await asyncio.start_server(
             self._handle_client,
             self.host,
             self.port,
-            reuse_address=True,
+            **kw,
         )
         self.is_running = True
         if self.server.sockets:

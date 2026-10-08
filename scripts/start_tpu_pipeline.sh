@@ -48,7 +48,12 @@ export HF_HOME=/dev/shm/huggingface
 sudo fuser -k 50051/tcp 50052/tcp 50053/tcp 50054/tcp 50055/tcp 50056/tcp 50057/tcp 50058/tcp 50151/tcp 50152/tcp 50153/tcp 50154/tcp 50155/tcp 50156/tcp 50157/tcp 50158/tcp 8000/tcp 2>/dev/null || true
 pkill -9 -f 'frontiersplit' 2>/dev/null || true
 pkill -9 -f 'multiprocessing.spawn' 2>/dev/null || true
-sleep 2
+for poll_i in \$(seq 1 15); do
+  if ! sudo ss -tlpn | grep -qE '5005[1-8]|5015[1-8]|:8000 '; then
+    break
+  fi
+  sleep 1
+done
 
 MODEL=\"${MODEL_ID}\"
 USE_BIN=\"${USE_BINARY_TRANSPORT}\"
@@ -65,7 +70,8 @@ nohup python3 -m frontiersplit.tpu_runner \
 
 # Wait for all 8 stages to become healthy
 echo \"Waiting for all 8 TPU worker stages to become healthy...\"
-for k in \$(seq 1 60); do
+all_ok=0
+for k in \$(seq 1 80); do
   all_ok=1
   for p in \$(seq 50051 50058); do
     if ! curl -s http://127.0.0.1:\$p/health 2>/dev/null | grep -q '\"status\":\"healthy\"'; then
@@ -79,6 +85,12 @@ for k in \$(seq 1 60); do
   fi
   sleep 3
 done
+
+if [ \$all_ok -ne 1 ]; then
+  echo \"Error: TPU stages failed to reach healthy state.\"
+  tail -n 40 /tmp/fs_tpu_workers.log
+  exit 1
+fi
 
 # Ingress Gateway
 ENABLE_1F1B_FLAG=\"$([ "${ENABLE_1F1B}" = "0" ] && echo "--disable-1f1b")\"
