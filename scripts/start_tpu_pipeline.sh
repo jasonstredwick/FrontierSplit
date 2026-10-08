@@ -45,52 +45,30 @@ set -e
 export PATH=/home/pixel/.local/bin:\$PATH
 export PYTHONPATH=/opt/FrontierSplit
 export HF_HOME=/dev/shm/huggingface
-pkill -f 'frontiersplit.worker' 2>/dev/null || true
-pkill -f 'frontiersplit.gateway' 2>/dev/null || true
+pkill -f 'frontiersplit' 2>/dev/null || true
 sleep 1
 
 MODEL=\"${MODEL_ID}\"
 USE_BIN=\"${USE_BINARY_TRANSPORT}\"
 QUANT_FLAG=\"$([ "${QUANTIZE_ACTIVATIONS}" = "1" ] && echo "--quantize-activations")\"
+BIN_FLAG=\"$([ \"\$USE_BIN\" = \"0\" ] && echo \"--disable-binary\")\"
 
-# Stage 7 (Final Stage: LM Head, layers 28..31)
-nohup python3 -m frontiersplit.worker \
-  --stage-id=7 \
+# Launch all 8 TPU worker stages cleanly across the 8 TPU cores
+echo \"Starting 8-stage TPU worker processes via xmp.spawn...\"
+nohup python3 -m frontiersplit.tpu_runner \
   --total-stages=8 \
-  --port=50058 \
-  \$([ \"\$USE_BIN\" = \"1\" ] && echo \"--tcp-port=50158\") \
-  --device=xla:7 \
-  \$QUANT_FLAG \
-  --model-name=\$MODEL > /tmp/fs_stage7.log 2>&1 &
+  --model-name=\$MODEL \
+  \$BIN_FLAG \
+  \$QUANT_FLAG > /tmp/fs_tpu_workers.log 2>&1 &
 
-# Stages 6 down to 1
-for s in 6 5 4 3 2 1; do
-  PORT=\$((50051 + s))
-  TCP_PORT=\$((50151 + s))
-  NEXT_PORT=\$((PORT + 1))
-  NEXT_TCP_PORT=\$((TCP_PORT + 1))
-
-  nohup python3 -m frontiersplit.worker \
-    --stage-id=\$s \
-    --total-stages=8 \
-    --port=\$PORT \
-    \$([ \"\$USE_BIN\" = \"1\" ] && echo \"--tcp-port=\$TCP_PORT --downstream-tcp=127.0.0.1:\$NEXT_TCP_PORT\") \
-    --downstream-url=http://127.0.0.1:\$NEXT_PORT \
-    --device=xla:\$s \
-    \$QUANT_FLAG \
-    --model-name=\$MODEL > /tmp/fs_stage\${s}.log 2>&1 &
+# Wait briefly for Stage 0 port to open before starting Gateway
+for k in \$(seq 1 30); do
+  if curl -s http://127.0.0.1:50051/health 2>/dev/null | grep -q '\"status\":\"healthy\"'; then
+    echo \"Stage 0 is ready! Starting Ingress Gateway...\"
+    break
+  fi
+  sleep 2
 done
-
-# Stage 0
-nohup python3 -m frontiersplit.worker \
-  --stage-id=0 \
-  --total-stages=8 \
-  --port=50051 \
-  \$([ \"\$USE_BIN\" = \"1\" ] && echo \"--tcp-port=50151 --downstream-tcp=127.0.0.1:50152\") \
-  --downstream-url=http://127.0.0.1:50052 \
-  --device=xla:0 \
-  \$QUANT_FLAG \
-  --model-name=\$MODEL > /tmp/fs_stage0.log 2>&1 &
 
 # Ingress Gateway
 ENABLE_1F1B_FLAG=\"$([ "${ENABLE_1F1B}" = "0" ] && echo "--disable-1f1b")\"
