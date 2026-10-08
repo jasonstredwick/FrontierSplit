@@ -1,0 +1,166 @@
+{
+  "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+  "tiers": [
+    {
+      "concurrency_m": 1,
+      "total_requests": 1,
+      "success_count": 1,
+      "total_tokens": 32,
+      "wall_time_s": 6.13,
+      "throughput_tok_per_sec": 5.22,
+      "avg_request_latency_s": 6.13,
+      "per_token_latency_ms": 191.5,
+      "idle_bubble_pct": 87.5,
+      "hardware_saturation_pct": 12.5,
+      "stream_results": [
+        {
+          "stream_id": 1,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 6.127938374876976,
+          "tok_per_sec": 5.22198462882591
+        }
+      ]
+    },
+    {
+      "concurrency_m": 2,
+      "total_requests": 2,
+      "success_count": 2,
+      "total_tokens": 64,
+      "wall_time_s": 12.09,
+      "throughput_tok_per_sec": 5.29,
+      "avg_request_latency_s": 12.0,
+      "per_token_latency_ms": 374.99,
+      "idle_bubble_pct": 77.8,
+      "hardware_saturation_pct": 22.2,
+      "stream_results": [
+        {
+          "stream_id": 1,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 12.089009915944189,
+          "tok_per_sec": 2.6470323229527026
+        },
+        {
+          "stream_id": 2,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 11.910434667021036,
+          "tok_per_sec": 2.6867197457205516
+        }
+      ]
+    },
+    {
+      "concurrency_m": 4,
+      "total_requests": 4,
+      "success_count": 4,
+      "total_tokens": 128,
+      "wall_time_s": 24.08,
+      "throughput_tok_per_sec": 5.32,
+      "avg_request_latency_s": 23.82,
+      "per_token_latency_ms": 744.25,
+      "idle_bubble_pct": 63.6,
+      "hardware_saturation_pct": 36.4,
+      "stream_results": [
+        {
+          "stream_id": 1,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 23.554383208043873,
+          "tok_per_sec": 1.358558180758133
+        },
+        {
+          "stream_id": 2,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 23.727863874752074,
+          "tok_per_sec": 1.348625403825331
+        },
+        {
+          "stream_id": 3,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 23.903746667318046,
+          "tok_per_sec": 1.3387022731357594
+        },
+        {
+          "stream_id": 4,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 24.07850137539208,
+          "tok_per_sec": 1.3289863642719721
+        }
+      ]
+    },
+    {
+      "concurrency_m": 8,
+      "total_requests": 8,
+      "success_count": 8,
+      "total_tokens": 256,
+      "wall_time_s": 48.04,
+      "throughput_tok_per_sec": 5.33,
+      "avg_request_latency_s": 47.42,
+      "per_token_latency_ms": 1481.9,
+      "idle_bubble_pct": 46.7,
+      "hardware_saturation_pct": 53.3,
+      "stream_results": [
+        {
+          "stream_id": 1,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 46.81068683275953,
+          "tok_per_sec": 0.6836045818837556
+        },
+        {
+          "stream_id": 2,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 47.332846249919385,
+          "tok_per_sec": 0.6760632950538972
+        },
+        {
+          "stream_id": 3,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 48.03511870838702,
+          "tok_per_sec": 0.6661792634315431
+        },
+        {
+          "stream_id": 4,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 47.85852645803243,
+          "tok_per_sec": 0.6686373854000934
+        },
+        {
+          "stream_id": 5,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 46.981746916659176,
+          "tok_per_sec": 0.6811155842451907
+        },
+        {
+          "stream_id": 6,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 47.684051708783954,
+          "tok_per_sec": 0.6710839128233147
+        },
+        {
+          "stream_id": 7,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 47.5067914579995,
+          "tok_per_sec": 0.673587902232695
+        },
+        {
+          "stream_id": 8,
+          "status": "success",
+          "tokens": 32,
+          "latency_s": 47.155928334221244,
+          "tok_per_sec": 0.6785997250058902
+        }
+      ]
+    }
+  ]
+}
