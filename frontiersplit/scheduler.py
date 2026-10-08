@@ -378,6 +378,10 @@ class PipelineScheduler:
 
     async def _execute_step(self, req: ScheduledRequest) -> None:
         """Execute a single pipeline forward pass for a request."""
+        if self.stage0_client is not None:
+            await self._execute_batched_step([req])
+            return
+
         if self.use_kv_cache and not req.is_prefill:
             step_tokens = [req.generated_tokens[-1]]
         else:
