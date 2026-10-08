@@ -26,7 +26,7 @@ ${GCLOUD} compute ssh "${NODE_PREFIX}-${FINAL_NODE}" --zone="${ZONE}" --project=
 
 echo "Waiting for Stage ${FINAL_STAGE} on ${NODE_PREFIX}-${FINAL_NODE} to become healthy..."
 ${GCLOUD} compute ssh "${NODE_PREFIX}-${FINAL_NODE}" --zone="${ZONE}" --project="${PROJECT_ID}" --tunnel-through-iap \
-  --command="for i in \$(seq 1 90); do curl -s http://localhost:50051/health | grep -q '\"status\":\"healthy\"' && echo 'Stage ${FINAL_STAGE} is healthy!' && exit 0; echo 'Waiting for worker...'; sleep 2; done; echo 'Timeout waiting for worker'; journalctl --user-unit=fs-worker -n 30 --no-pager; exit 1"
+  --command="for i in \$(seq 1 300); do curl -s http://localhost:50051/health | grep -q '\"status\":\"healthy\"' && echo 'Stage healthy!' && exit 0; echo 'Waiting for worker / weights download...'; sleep 3; done; echo 'Timeout waiting for worker'; journalctl --user-unit=fs-worker -n 50 --no-pager; exit 1"
 
 # Intermediate nodes: from FINAL_NODE-1 down to 2
 for i in $(seq $((NUM_NODES - 1)) -1 2); do
@@ -38,7 +38,7 @@ for i in $(seq $((NUM_NODES - 1)) -1 2); do
 
   echo "Waiting for Stage ${STAGE_ID} on ${NODE_PREFIX}-${i} to become healthy..."
   ${GCLOUD} compute ssh "${NODE_PREFIX}-${i}" --zone="${ZONE}" --project="${PROJECT_ID}" --tunnel-through-iap \
-    --command="for j in \$(seq 1 90); do curl -s http://localhost:50051/health | grep -q '\"status\":\"healthy\"' && echo 'Stage ${STAGE_ID} is healthy!' && exit 0; echo 'Waiting for worker...'; sleep 2; done; echo 'Timeout waiting for worker'; journalctl --user-unit=fs-worker -n 30 --no-pager; exit 1"
+    --command="for j in \$(seq 1 300); do curl -s http://localhost:50051/health | grep -q '\"status\":\"healthy\"' && echo 'Stage ${STAGE_ID} is healthy!' && exit 0; echo 'Waiting for worker / weights download...'; sleep 3; done; echo 'Timeout waiting for worker'; journalctl --user-unit=fs-worker -n 50 --no-pager; exit 1"
 done
 
 # Node 1 (Stage 0 + Ingress Gateway)
@@ -49,7 +49,7 @@ ${GCLOUD} compute ssh "${NODE_PREFIX}-1" --zone="${ZONE}" --project="${PROJECT_I
 
 echo "Waiting for Stage 0 on ${NODE_PREFIX}-1 to become healthy..."
 ${GCLOUD} compute ssh "${NODE_PREFIX}-1" --zone="${ZONE}" --project="${PROJECT_ID}" --tunnel-through-iap \
-  --command="for i in \$(seq 1 90); do curl -s http://localhost:50051/health | grep -q '\"status\":\"healthy\"' && echo 'Stage 0 is healthy!' && exit 0; echo 'Waiting for worker...'; sleep 2; done; echo 'Timeout waiting for worker'; journalctl --user-unit=fs-worker -n 30 --no-pager; exit 1"
+  --command="for i in \$(seq 1 300); do curl -s http://localhost:50051/health | grep -q '\"status\":\"healthy\"' && echo 'Stage 0 is healthy!' && exit 0; echo 'Waiting for worker / weights download...'; sleep 3; done; echo 'Timeout waiting for worker'; journalctl --user-unit=fs-worker -n 50 --no-pager; exit 1"
 
 echo "Ensuring Ingress Gateway is running on ${NODE_PREFIX}-1..."
 ${GCLOUD} compute ssh "${NODE_PREFIX}-1" --zone="${ZONE}" --project="${PROJECT_ID}" --tunnel-through-iap \

@@ -237,23 +237,20 @@ else
   print_fail "Ingress Gateway (:8000) at ${NODE_1_IP} is NOT responding or unhealthy"
 fi
 
-STAGE0_RES=$(curl -s --connect-timeout 4 "http://${NODE_1_IP}:${WORKER_PORT}/health" 2>/dev/null || true)
-if [ -n "${STAGE0_RES}" ] && echo "${STAGE0_RES}" | grep -q '"status":"healthy"'; then
-  S0_LAYERS=$(echo "${STAGE0_RES}" | jq -r '.layer_range | "\(.[0])-\(.[1])"' 2>/dev/null || echo "unknown")
-  S0_DEV=$(echo "${STAGE0_RES}" | jq -r '.device // "unknown"' 2>/dev/null || echo "unknown")
-  print_ok "Stage 0 Worker (:50051) on Node 1 is ONLINE (Layers: ${S0_LAYERS}, Device: ${S0_DEV})"
-else
-  print_fail "Stage 0 Worker (:50051) on Node 1 is NOT responding"
-fi
-
-STAGE1_RES=$(curl -s --connect-timeout 4 "http://${NODE_2_IP}:${WORKER_PORT}/health" 2>/dev/null || true)
-if [ -n "${STAGE1_RES}" ] && echo "${STAGE1_RES}" | grep -q '"status":"healthy"'; then
-  S1_LAYERS=$(echo "${STAGE1_RES}" | jq -r '.layer_range | "\(.[0])-\(.[1])"' 2>/dev/null || echo "unknown")
-  S1_DEV=$(echo "${STAGE1_RES}" | jq -r '.device // "unknown"' 2>/dev/null || echo "unknown")
-  print_ok "Stage 1 Worker (:50051) on Node 2 is ONLINE (Layers: ${S1_LAYERS}, Device: ${S1_DEV})"
-else
-  print_fail "Stage 1 Worker (:50051) on Node 2 is NOT responding"
-fi
+for node_idx in $(seq 1 ${NUM_NODES}); do
+  NODE_IP=$(get_node_ip "${node_idx}")
+  STAGE_ID=$((node_idx - 1))
+  if [ -n "${NODE_IP}" ] && [ "${NODE_IP}" != "127.0.0.1" ]; then
+    STAGE_RES=$(curl -s --connect-timeout 4 "http://${NODE_IP}:${WORKER_PORT}/health" 2>/dev/null || true)
+    if [ -n "${STAGE_RES}" ] && echo "${STAGE_RES}" | grep -q '"status":"healthy"'; then
+      S_LAYERS=$(echo "${STAGE_RES}" | jq -r '.layer_range | "\(.[0])-\(.[1])"' 2>/dev/null || echo "unknown")
+      S_DEV=$(echo "${STAGE_RES}" | jq -r '.device // "unknown"' 2>/dev/null || echo "unknown")
+      print_ok "Stage ${STAGE_ID} Worker (:50051) on Node ${node_idx} [${NODE_IP}] is ONLINE (Layers: ${S_LAYERS}, Device: ${S_DEV})"
+    else
+      print_fail "Stage ${STAGE_ID} Worker (:50051) on Node ${node_idx} [${NODE_IP}] is NOT responding"
+    fi
+  fi
+done
 
 # 2. Real-time Cluster Telemetry
 print_header "2. Real-Time Cluster Telemetry"
@@ -282,8 +279,9 @@ fi
 if [ "${QUICK_MODE}" = false ]; then
   print_header "3. Host Hardware & Systemd Services (via Direct SSH)"
 
-  for node_idx in 1 2; do
+  for node_idx in $(seq 1 ${NUM_NODES}); do
     NODE_IP=$(get_node_ip "${node_idx}")
+    [ -z "${NODE_IP}" ] || [ "${NODE_IP}" = "127.0.0.1" ] && continue
     ROLE="Stage $((node_idx - 1))"
     [ "${node_idx}" -eq 1 ] && ROLE="Gateway + Stage 0"
 

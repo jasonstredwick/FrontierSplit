@@ -523,8 +523,16 @@ def create_worker_app(
                         attn_out = torch.cat(attn_outs, dim=0).transpose(1, 2).reshape(B_cur, 1, -1)
                         hidden_states = residual + layer.self_attn.o_proj(attn_out)
 
-                        # Batched MLP: [B, 1, 4096] in ONE GEMM pass!
-                        hidden_states = hidden_states + layer.mlp(layer.post_attention_layernorm(hidden_states))
+                        # Batched Feed-Forward / MoE: [B, 1, 4096] in ONE GEMM pass!
+                        normed = layer.post_attention_layernorm(hidden_states)
+                        if hasattr(layer, "block_sparse_moe"):
+                            moe_out = layer.block_sparse_moe(normed)
+                            moe_out = moe_out[0] if isinstance(moe_out, tuple) else moe_out
+                            hidden_states = hidden_states + moe_out
+                        elif hasattr(layer, "mlp"):
+                            hidden_states = hidden_states + layer.mlp(normed)
+                        else:
+                            raise RuntimeError(f"Unknown layer feed-forward block: {type(layer)}")
 
                     for req_id in packet.request_ids:
                         kv_store.update_seq_len(req_id, 1)
