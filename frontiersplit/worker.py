@@ -410,8 +410,53 @@ def create_worker_app(
         except Exception as e:
             print(f"[Worker Stage {stage_id}] Warning: Could not import Mistral causal mask functions: {e}")
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Patch MoE experts with static dense-masked routing on TPU / XLA
+        import types
+        for l in assigned_layers:
+            moe_block = getattr(l, "block_sparse_moe", getattr(l, "mlp", None))
+            if moe_block is not None and hasattr(moe_block, "experts") and hasattr(moe_block.experts, "gate_up_proj"):
+                exp_mod = moe_block.experts
+                def _make_static_forward(exp):
+                    def _forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
+                        num_tokens = hidden_states.shape[0]
+                        dense_weights = torch.zeros((num_tokens, exp.num_experts), dtype=hidden_states.dtype, device=hidden_states.device)
+                        dense_weights.scatter_(1, top_k_index, top_k_weights)
+
+                        final_hidden_states = torch.zeros_like(hidden_states)
+                        for expert_idx in range(exp.num_experts):
+                            w = dense_weights[:, expert_idx:expert_idx + 1]
+                            gate, up = F.linear(hidden_states, exp.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                            h = exp.act_fn(gate) * up
+                            h = F.linear(h, exp.down_proj[expert_idx])
+                            final_hidden_states = final_hidden_states + h * w
+                        return final_hidden_states
+                    return _forward
+                exp_mod.forward = types.MethodType(_make_static_forward(exp_mod), exp_mod)
+
+        # Ahead-of-Time JIT Graph Pre-compilation on TPU startup
+        if resolved_device.startswith("xla"):
+            print(f"[Worker Stage {stage_id}] Ahead-of-Time JIT pre-compiling XLA static execution graphs...")
+            try:
+                with torch.no_grad():
+                    dummy_decode = torch.zeros((1, 1, model_config.hidden_size), dtype=torch.float16, device=resolved_device)
+                    pos_ids = torch.tensor([[0]], dtype=torch.long, device=resolved_device)
+                    cur_h = dummy_decode
+                    for l in assigned_layers:
+                        out = l(cur_h, position_ids=pos_ids)
+                        cur_h = out[0] if isinstance(out, tuple) else out
+                    if is_final_stage:
+                        if final_norm is not None:
+                            cur_h = final_norm(cur_h)
+                        if lm_head is not None:
+                            _ = lm_head(cur_h[:, -1, :])
+                    if is_first_stage and embed_tokens is not None:
+                        _ = embed_tokens(torch.tensor([[1]], device=resolved_device, dtype=torch.long))
+
+                    import torch_xla.core.xla_model as xm
+                    xm.mark_step()
+                    print(f"[Worker Stage {stage_id}] XLA static execution graphs successfully compiled into TPU HBM!")
+            except Exception as e:
+                print(f"[Worker Stage {stage_id}] Note: Ahead-of-time pre-compilation note: {e}")
 
         print(f"[Worker Stage {stage_id}] Successfully mounted assigned layers into VRAM.")
 
