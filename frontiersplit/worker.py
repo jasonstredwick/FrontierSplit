@@ -35,6 +35,14 @@ from frontiersplit.transport import BinaryTransportClient, BinaryTransportServer
 try:
     import torch
     import torch.nn.functional as F
+    if not torch.cuda.is_available():
+        class _DummyStream:
+            def wait_stream(self, *a, **kw): pass
+        try:
+            if hasattr(torch, "cuda"):
+                torch.cuda.Stream = _DummyStream
+        except Exception:
+            pass
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     try:
         from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb
@@ -50,6 +58,16 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
+
+
+def _is_static_cache(cache: Any) -> bool:
+    if cache is None:
+        return False
+    return (
+        hasattr(cache, "get_max_length")
+        or hasattr(cache, "get_max_cache_shape")
+        or ("Static" in getattr(cache, "__class__", type).__name__)
+    )
 
 
 class WorkerKVCacheStore:
@@ -100,8 +118,13 @@ class WorkerKVCacheStore:
                 else:
                     from transformers.cache_utils import DynamicCache
                     cache = DynamicCache()
-            except (ImportError, Exception):
-                cache = None
+            except Exception as e:
+                print(f"[WorkerKVCacheStore] Warning: Error initializing cache: {e}. Falling back to DynamicCache.")
+                try:
+                    from transformers.cache_utils import DynamicCache
+                    cache = DynamicCache()
+                except Exception:
+                    cache = None
         else:
             cache = []
 
@@ -482,7 +505,7 @@ def create_worker_app(
                             position_ids=pos_ids,
                         ) if mask_function is not None else None
                         pos_emb = rotary_emb(hidden_states, position_ids=pos_ids) if rotary_emb is not None else None
-                        is_static = hasattr(cache, "get_max_cache_shape") or (cache is not None and cache.__class__.__name__ == "StaticCache")
+                        is_static = _is_static_cache(cache)
                         cache_pos = torch.arange(prompt_len, dtype=torch.long, device=resolved_device) if is_static else None
                         for layer in assigned_layers:
                             kwargs = {
@@ -509,7 +532,7 @@ def create_worker_app(
                                 position_ids=pos_ids,
                             ) if mask_function is not None else None
                             pos_emb = rotary_emb(hidden_states, position_ids=pos_ids) if rotary_emb is not None else None
-                            is_static = hasattr(cache, "get_max_cache_shape") or (cache is not None and cache.__class__.__name__ == "StaticCache")
+                            is_static = _is_static_cache(cache)
                             cache_pos = torch.tensor([curr_len], dtype=torch.long, device=resolved_device) if is_static else None
                             for layer in assigned_layers:
                                 kwargs = {
@@ -740,7 +763,7 @@ def create_worker_app(
                                     q_b = q[b_idx:b_idx+1]
                                     k_b = k[b_idx:b_idx+1]
                                     v_b = v[b_idx:b_idx+1]
-                                    is_static = hasattr(cache, "get_max_cache_shape") or (cache is not None and cache.__class__.__name__ == "StaticCache")
+                                    is_static = _is_static_cache(cache)
                                     if cache is not None:
                                         if is_static:
                                             curr_pos = torch.tensor([kv_store.get_seq_len(req_id)], dtype=torch.long, device=resolved_device)
@@ -757,9 +780,8 @@ def create_worker_app(
                                     if is_static:
                                         curr_len = kv_store.get_seq_len(req_id)
                                         max_k_len = k_cached.shape[2]
-                                        mask = torch.zeros((1, 1, 1, max_k_len), dtype=q_b.dtype, device=resolved_device)
-                                        if curr_len + 1 < max_k_len:
-                                            mask[:, :, :, curr_len + 1:] = -10000.0
+                                        col_indices = torch.arange(max_k_len, device=resolved_device).view(1, 1, 1, max_k_len)
+                                        mask = torch.where(col_indices > curr_len, -10000.0, 0.0).to(dtype=q_b.dtype)
                                         out_b = F.scaled_dot_product_attention(q_b, k_cached, v_cached, attn_mask=mask)
                                     else:
                                         out_b = F.scaled_dot_product_attention(q_b, k_cached, v_cached)
@@ -803,7 +825,7 @@ def create_worker_app(
                                 ) if mask_function is not None else None
                                 pos_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
 
-                                is_static = hasattr(cache, "get_max_cache_shape") or (cache is not None and cache.__class__.__name__ == "StaticCache")
+                                is_static = _is_static_cache(cache)
                                 cache_pos = torch.arange(prompt_len, dtype=torch.long, device=resolved_device) if is_static else None
 
                                 for layer in assigned_layers:
