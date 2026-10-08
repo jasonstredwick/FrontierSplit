@@ -22,6 +22,7 @@ from frontiersplit.protocol import (
     ReleaseSessionPacket,
     ReleaseSessionResponse,
 )
+from frontiersplit.transport import BinaryTransportClient
 
 
 class ScheduledRequest:
@@ -131,6 +132,7 @@ class PipelineScheduler:
         tokenizer: Optional[Any] = None,
         max_batch_size: int = 16,
         use_kv_cache: bool = True,
+        stage0_tcp: Optional[str] = None,
     ):
         self.stage0_url = stage0_url
         self.num_workers = num_workers
@@ -138,6 +140,11 @@ class PipelineScheduler:
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.use_kv_cache = use_kv_cache
+
+        target_peer = stage0_tcp or (
+            stage0_url.replace("tcp://", "") if stage0_url and stage0_url.startswith("tcp://") else None
+        )
+        self.stage0_client = BinaryTransportClient(target_peer) if target_peer else None
 
         self.active_requests: Dict[str, ScheduledRequest] = {}
         self.ready_queue: asyncio.Queue[ScheduledRequest] = asyncio.Queue()
@@ -163,7 +170,7 @@ class PipelineScheduler:
         ]
 
     async def stop(self) -> None:
-        """Gracefully stop scheduler worker tasks."""
+        """Gracefully stop scheduler worker tasks and close binary transport client."""
         if not self.is_running:
             return
         self.is_running = False
@@ -171,6 +178,8 @@ class PipelineScheduler:
             task.cancel()
         await asyncio.gather(*self._worker_tasks, return_exceptions=True)
         self._worker_tasks.clear()
+        if self.stage0_client is not None:
+            await self.stage0_client.close()
 
     async def ensure_started(self) -> None:
         """Ensure the background worker pool is active."""
@@ -309,20 +318,23 @@ class PipelineScheduler:
             attention_mask=attention_masks,
         )
 
-        def _post_batched() -> Dict[str, Any]:
-            resp = requests.post(f"{self.stage0_url}/forward_batched", json=packet.model_dump(), timeout=600)
-            resp.raise_for_status()
-            return resp.json()
-
         step_start = time.time()
-        result_dict = await asyncio.to_thread(_post_batched)
-        if "responses" in result_dict:
-            batched_result = BatchedGenerationResponse.model_validate(result_dict)
-        elif "token_id" in result_dict:
-            single_res = GenerationResponse.model_validate(result_dict)
-            batched_result = BatchedGenerationResponse(responses=[single_res], batch_size=1)
+        if self.stage0_client is not None:
+            batched_result = await self.stage0_client.send_batched_forward(packet)
         else:
-            batched_result = BatchedGenerationResponse.model_validate(result_dict)
+            def _post_batched() -> Dict[str, Any]:
+                resp = requests.post(f"{self.stage0_url}/forward_batched", json=packet.model_dump(), timeout=600)
+                resp.raise_for_status()
+                return resp.json()
+
+            result_dict = await asyncio.to_thread(_post_batched)
+            if "responses" in result_dict:
+                batched_result = BatchedGenerationResponse.model_validate(result_dict)
+            elif "token_id" in result_dict:
+                single_res = GenerationResponse.model_validate(result_dict)
+                batched_result = BatchedGenerationResponse(responses=[single_res], batch_size=1)
+            else:
+                batched_result = BatchedGenerationResponse.model_validate(result_dict)
         step_latency = (time.time() - step_start) * 1000
 
         # Update telemetry
@@ -440,13 +452,19 @@ class PipelineScheduler:
 
     async def _async_release_session(self, request_id: str) -> None:
         """Asynchronously notify stage 0 to release worker session KV cache."""
-        def _post_release():
+        if self.stage0_client is not None:
             try:
-                packet = ReleaseSessionPacket(request_ids=[request_id])
-                requests.post(f"{self.stage0_url}/release_sessions", json=packet.model_dump(), timeout=10)
+                await self.stage0_client.send_release_sessions([request_id])
             except Exception:
                 pass
-        await asyncio.to_thread(_post_release)
+        else:
+            def _post_release():
+                try:
+                    packet = ReleaseSessionPacket(request_ids=[request_id])
+                    requests.post(f"{self.stage0_url}/release_sessions", json=packet.model_dump(), timeout=10)
+                except Exception:
+                    pass
+            await asyncio.to_thread(_post_release)
 
     def get_telemetry(self) -> Dict[str, Any]:
         """Compute real-time pipeline performance and bubble metrics."""

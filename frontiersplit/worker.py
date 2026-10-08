@@ -9,6 +9,8 @@ transformer layers and lightweight synthetic layers for testing.
 from __future__ import annotations
 
 import argparse
+import asyncio
+from contextlib import asynccontextmanager
 import gc
 import time
 from typing import Any, Dict, List, Optional
@@ -26,6 +28,7 @@ from frontiersplit.protocol import (
     ReleaseSessionPacket,
     ReleaseSessionResponse,
 )
+from frontiersplit.transport import BinaryTransportClient, BinaryTransportServer
 
 # Optional PyTorch and Hugging Face imports
 try:
@@ -117,11 +120,19 @@ def create_worker_app(
     device: Optional[str] = None,
     hidden_size: int = 4096,
     vocab_size: int = 32000,
+    tcp_port: Optional[int] = None,
+    downstream_tcp: Optional[str] = None,
 ) -> FastAPI:
-    """Creates a FastAPI app representing a single pipeline stage worker."""
-    app = FastAPI(title=f"FrontierSplit-Worker-Stage-{stage_id}")
+    """Creates a FastAPI app and optional persistent binary TCP server for a pipeline stage worker."""
     is_first_stage = (stage_id == 0)
     is_final_stage = (stage_id == total_stages - 1)
+
+    target_downstream_tcp = downstream_tcp or (
+        downstream_url.replace("tcp://", "") if downstream_url and downstream_url.startswith("tcp://") else None
+    )
+    downstream_client = BinaryTransportClient(target_downstream_tcp) if target_downstream_tcp else None
+
+    app = FastAPI(title=f"FrontierSplit-Worker-Stage-{stage_id}")
 
     use_real_model = bool(model_name_or_path and HAS_TORCH)
     tokenizer = None
@@ -363,24 +374,35 @@ def create_worker_app(
             "allocated_kv_tokens": kv_store.allocated_tokens,
         }
 
-    @app.post("/release_sessions", response_model=ReleaseSessionResponse)
-    def release_sessions(packet: ReleaseSessionPacket):
+    async def do_release_sessions(packet: ReleaseSessionPacket) -> ReleaseSessionResponse:
         released = 0
         for req_id in packet.request_ids:
             if kv_store.release(req_id):
                 released += 1
 
-        if not is_final_stage and downstream_url:
-            try:
-                requests.post(f"{downstream_url}/release_sessions", json=packet.model_dump(), timeout=10)
-            except Exception as e:
-                print(f"[Worker Stage {stage_id}] Warning: Propagating release_sessions to {downstream_url} failed: {e}")
+        if not is_final_stage:
+            if downstream_client is not None:
+                try:
+                    await downstream_client.send_release_sessions(packet.request_ids)
+                except Exception as e:
+                    print(f"[Worker Stage {stage_id}] Warning: Propagating binary release_sessions failed: {e}")
+            elif downstream_url:
+                def _post_rel():
+                    try:
+                        requests.post(f"{downstream_url}/release_sessions", json=packet.model_dump(), timeout=10)
+                    except Exception as e:
+                        print(f"[Worker Stage {stage_id}] Warning: Propagating release_sessions to {downstream_url} failed: {e}")
+                await asyncio.to_thread(_post_rel)
 
         return ReleaseSessionResponse(
             status="ok",
             released_count=released,
             active_sessions=len(kv_store.sessions),
         )
+
+    @app.post("/release_sessions", response_model=ReleaseSessionResponse)
+    async def release_sessions(packet: ReleaseSessionPacket):
+        return await do_release_sessions(packet)
 
     @app.post("/forward", response_model=GenerationResponse)
     def forward(packet: ActivationPacket):
@@ -592,8 +614,7 @@ def create_worker_app(
                     stage_timings=timings,
                 )
 
-    @app.post("/forward_batched", response_model=BatchedGenerationResponse)
-    def forward_batched(packet: BatchedActivationPacket):
+    async def do_forward_batched(packet: BatchedActivationPacket) -> BatchedGenerationResponse:
         start_time = time.time()
         batch_size = len(packet.request_ids)
 
@@ -603,8 +624,15 @@ def create_worker_app(
                     token_tensor = torch.tensor(packet.tokens_batch, device=resolved_device, dtype=torch.long)
                     hidden_states = embed_tokens(token_tensor)
                 else:
-                    arr = packet.get_tensor()
-                    hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
+                    raw_bytes = packet.get_raw_bytes()
+                    if raw_bytes:
+                        dtype_obj = getattr(torch, packet.tensor_dtype, torch.float16)
+                        hidden_states = torch.frombuffer(
+                            bytearray(raw_bytes), dtype=dtype_obj
+                        ).reshape(packet.tensor_shape).to(resolved_device, non_blocking=True)
+                    else:
+                        arr = packet.get_tensor()
+                        hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
 
                 if packet.use_kv_cache and not packet.is_prefill:
                     # True Batched GEMM Decode:
@@ -679,6 +707,7 @@ def create_worker_app(
                         prompt_len = h_b.shape[1]
                         max_tok = packet.max_tokens_list[b_idx] if packet.max_tokens_list else None
                         cache = kv_store.get_or_create(req_id, prompt_len=prompt_len, max_tokens=max_tok)
+
                         pos_ids = torch.arange(prompt_len, dtype=torch.long, device=resolved_device).unsqueeze(0)
                         c_mask = mask_function(
                             config=model_config,
@@ -687,7 +716,8 @@ def create_worker_app(
                             past_key_values=cache,
                             position_ids=pos_ids,
                         ) if mask_function is not None else None
-                        p_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
+                        pos_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
+
                         for layer in assigned_layers:
                             l_out = layer(
                                 h_b,
@@ -695,7 +725,7 @@ def create_worker_app(
                                 position_ids=pos_ids,
                                 past_key_values=cache,
                                 use_cache=True,
-                                position_embeddings=p_emb,
+                                position_embeddings=pos_emb,
                             )
                             h_b = l_out[0] if isinstance(l_out, tuple) else l_out
                         batch_outs.append(h_b)
@@ -733,10 +763,6 @@ def create_worker_app(
                 timings[f"stage_{stage_id}_compute_ms"] = stage_compute_ms
 
                 if not is_final_stage:
-                    if not downstream_url:
-                        raise HTTPException(status_code=500, detail="Missing downstream_url for intermediate stage")
-
-                    next_act = hidden_states.detach().cpu().to(torch.float32).numpy()
                     next_packet = BatchedActivationPacket(
                         request_ids=packet.request_ids,
                         sequence_steps=packet.sequence_steps,
@@ -747,14 +773,26 @@ def create_worker_app(
                         attention_mask=packet.attention_mask,
                         stage_timings=timings,
                     )
-                    next_packet.set_tensor(next_act)
+                    cpu_t = hidden_states.contiguous().cpu()
+                    dtype_str = str(hidden_states.dtype).replace("torch.", "")
+                    if dtype_str in ("float16", "bfloat16"):
+                        raw_bytes = cpu_t.view(torch.uint8).numpy().tobytes()
+                    else:
+                        raw_bytes = cpu_t.numpy().tobytes()
+                    next_packet.set_raw_tensor(raw_bytes, list(hidden_states.shape), dtype_str)
 
-                    try:
-                        resp = requests.post(f"{downstream_url}/forward_batched", json=next_packet.model_dump(), timeout=600)
-                        resp.raise_for_status()
-                        return resp.json()
-                    except Exception as e:
-                        raise HTTPException(status_code=502, detail=f"Downstream batched handoff to {downstream_url} failed: {e}")
+                    if downstream_client is not None:
+                        return await downstream_client.send_batched_forward(next_packet)
+                    elif downstream_url:
+                        next_packet.set_tensor(cpu_t.numpy())
+                        def _post():
+                            resp = requests.post(f"{downstream_url}/forward_batched", json=next_packet.model_dump(), timeout=600)
+                            resp.raise_for_status()
+                            return resp.json()
+                        res_json = await asyncio.to_thread(_post)
+                        return BatchedGenerationResponse.model_validate(res_json)
+                    else:
+                        raise HTTPException(status_code=500, detail="Missing downstream_url for intermediate stage")
 
                 else:
                     if final_norm is not None:
@@ -800,7 +838,11 @@ def create_worker_app(
                 tokens_arr = np.array(padded_batch)
                 activation = embeddings[tokens_arr]
             else:
-                activation = packet.get_tensor()
+                raw_bytes = packet.get_raw_bytes()
+                if raw_bytes:
+                    activation = np.frombuffer(raw_bytes, dtype=packet.tensor_dtype).reshape(packet.tensor_shape)
+                else:
+                    activation = packet.get_tensor()
 
             if packet.use_kv_cache:
                 for b_idx, req_id in enumerate(packet.request_ids):
@@ -817,9 +859,6 @@ def create_worker_app(
             timings[f"stage_{stage_id}_compute_ms"] = stage_compute_ms
 
             if not is_final_stage:
-                if not downstream_url:
-                    raise HTTPException(status_code=500, detail="Missing downstream_url for intermediate stage")
-
                 next_packet = BatchedActivationPacket(
                     request_ids=packet.request_ids,
                     sequence_steps=packet.sequence_steps,
@@ -830,14 +869,20 @@ def create_worker_app(
                     attention_mask=packet.attention_mask,
                     stage_timings=timings,
                 )
-                next_packet.set_tensor(activation)
+                next_packet.set_raw_tensor(activation.tobytes(), list(activation.shape), str(activation.dtype))
 
-                try:
-                    resp = requests.post(f"{downstream_url}/forward_batched", json=next_packet.model_dump(), timeout=30)
-                    resp.raise_for_status()
-                    return resp.json()
-                except Exception as e:
-                    raise HTTPException(status_code=502, detail=f"Downstream batched handoff to {downstream_url} failed: {e}")
+                if downstream_client is not None:
+                    return await downstream_client.send_batched_forward(next_packet)
+                elif downstream_url:
+                    next_packet.set_tensor(activation)
+                    def _post_synth():
+                        resp = requests.post(f"{downstream_url}/forward_batched", json=next_packet.model_dump(), timeout=30)
+                        resp.raise_for_status()
+                        return resp.json()
+                    res_json = await asyncio.to_thread(_post_synth)
+                    return BatchedGenerationResponse.model_validate(res_json)
+                else:
+                    raise HTTPException(status_code=500, detail="Missing downstream_url for intermediate stage")
 
             else:
                 last_token_hidden = activation[:, -1, :]
@@ -862,6 +907,33 @@ def create_worker_app(
                     stage_timings=timings,
                 )
 
+    @app.post("/forward_batched", response_model=BatchedGenerationResponse)
+    async def forward_batched(packet: BatchedActivationPacket):
+        return await do_forward_batched(packet)
+
+    binary_server = None
+    if tcp_port is not None:
+        binary_server = BinaryTransportServer(
+            host="0.0.0.0",
+            port=tcp_port,
+            forward_handler=do_forward_batched,
+            release_handler=do_release_sessions,
+        )
+
+    @asynccontextmanager
+    async def lifespan(fastapi_app: FastAPI):
+        if binary_server is not None:
+            await binary_server.start()
+        yield
+        if binary_server is not None:
+            await binary_server.stop()
+        if downstream_client is not None:
+            await downstream_client.close()
+
+    app.router.lifespan_context = lifespan
+    app.state.binary_server = binary_server
+    app.state.downstream_client = downstream_client
+
     return app
 
 
@@ -870,7 +942,9 @@ def main():
     parser.add_argument("--stage-id", type=int, required=True, help="Stage index (0 to total_stages - 1)")
     parser.add_argument("--total-stages", type=int, default=2, help="Total pipeline stages")
     parser.add_argument("--port", type=int, default=50051, help="Port to listen on")
+    parser.add_argument("--tcp-port", type=int, default=None, help="Persistent binary TCP port to listen on")
     parser.add_argument("--downstream-url", type=str, default=None, help="Downstream worker URL")
+    parser.add_argument("--downstream-tcp", type=str, default=None, help="Downstream persistent binary TCP peer (host:port)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host interface")
     parser.add_argument("--model-name", type=str, default=None, help="Hugging Face model ID to load")
     parser.add_argument("--device", type=str, default=None, help="PyTorch device (cuda, mps, cpu)")
@@ -882,6 +956,8 @@ def main():
         downstream_url=args.downstream_url,
         model_name_or_path=args.model_name,
         device=args.device,
+        tcp_port=args.tcp_port,
+        downstream_tcp=args.downstream_tcp,
     )
     print(f"Starting FrontierSplit Worker Stage {args.stage_id}/{args.total_stages} on port {args.port}...")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

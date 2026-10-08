@@ -73,6 +73,7 @@ def create_gateway_app(
     scheduler: Optional[PipelineScheduler] = None,
     max_batch_size: int = 16,
     use_kv_cache: bool = True,
+    stage0_tcp: Optional[str] = None,
 ) -> FastAPI:
     """Create FastAPI application with interleaved pipeline scheduler."""
     if scheduler is None:
@@ -90,6 +91,7 @@ def create_gateway_app(
             tokenizer=tokenizer,
             max_batch_size=max_batch_size,
             use_kv_cache=use_kv_cache,
+            stage0_tcp=stage0_tcp,
         )
 
     @asynccontextmanager
@@ -166,6 +168,7 @@ def create_gateway_app(
 def main():
     parser = argparse.ArgumentParser(description="FrontierSplit Ingress Gateway")
     parser.add_argument("--stage0-url", type=str, default="http://localhost:50051", help="URL of Stage 0 worker")
+    parser.add_argument("--stage0-tcp", type=str, default=None, help="Persistent binary TCP address of Stage 0 worker (host:port)")
     parser.add_argument("--port", type=int, default=8000, help="Gateway port to listen on")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host interface")
     parser.add_argument("--model-name", type=str, default="frontiersplit-mixtral-8x7b", help="Model name to advertise")
@@ -177,6 +180,7 @@ def main():
 
     app = create_gateway_app(
         stage0_url=args.stage0_url,
+        stage0_tcp=args.stage0_tcp,
         model_name=args.model_name,
         num_workers=args.num_workers,
         total_stages=args.total_stages,
