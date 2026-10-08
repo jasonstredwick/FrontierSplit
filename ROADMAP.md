@@ -56,6 +56,26 @@
 - [x] **Unified Evaluation CLI & Markdown Reporter** (`benchmarks/run_evals.py`, `tests/test_run_evals.py`):
   - Correlates cognitive scores with real-time cluster telemetry (tok/s, latency, $F_{bubble}$ idle bubble reduction).
   - Automated report generation (`eval_results/eval_report.md`, `eval_results/eval_summary.json`).
-- [ ] **Living Demo Cluster Run**: Execute live benchmark sprint on the 4x L4 GCP cluster.
+- [x] **Live Cluster Validation & Saturation Sweep**: Executed full saturation curve ($M=1..32$) and 3-trial IFEval/SWE-bench evaluation on 8-node Mixtral 8x7B FP16 cluster (`experiments/20261008_mixtral8x7b_fp16_8x_t4/`).
 - [ ] **Tier 2 (Google TPU Showcase)**: Port pipeline orchestration to Cloud TPU v5e (comparing ICI vs. VPC mesh).
 - [ ] **Tier 3 (Flagship Benchmark Sprint)**: Execute scaled-out benchmark on a frontier 1.6T–2TB model.
+
+---
+
+## Phase 6: High-Throughput & Low-Latency Optimization Roadmap
+Techniques identified for future re-evaluation to scale generation speeds and minimize step latency:
+- [ ] **Binary Transport Layer Modernization (gRPC / Async Raw TCP)**:
+  - Replace HTTP/JSON/base64 payload serialization with gRPC protobuf or custom async binary TCP sockets with memory-pinned PyTorch tensors.
+  - Eliminates ~10-15 ms serialization overhead per hop, targeting < 1.5 ms hop transport and halving round-trip step latency from ~200 ms to ~100 ms.
+- [ ] **Pipeline-Parallel Speculative Decoding**:
+  - Deploy a lightweight draft model (e.g. 1B parameter dense model) on Stage 0 to propose $K=3-5$ candidate tokens.
+  - Pipe candidate verification sequences through the pipeline in a single forward pass, accepting multiple verified tokens per round-trip.
+  - Expected speedup: 2.5x–3.5x boost in single-stream generation speed without altering model weights.
+- [ ] **Wire-Only Activation Quantization (Dynamic FP8 E4M3/E5M2)**:
+  - Dynamically quantize intermediate hidden state tensors from FP16 to FP8 solely across the network wire, immediately dequantizing upon receipt on the next stage.
+  - Halves inter-node network bandwidth (from 8 KB to 4 KB per token) while keeping all model weights strictly unquantized in FP16.
+- [ ] **CUDA Graph Capture for Fixed Micro-Batches**:
+  - Pre-capture static forward-pass execution graphs for discrete micro-batch sizes ($B \in [1, 2, 4, 8]$) on each stage.
+  - Completely eliminates PyTorch/Python dispatch overhead and CPU-GPU synchronization bubbles inside each node's local 4-layer execution.
+- [ ] **Asynchronous Prefill & Decode Overlapping**:
+  - Decouple compute-bound prompt prefill bursts from latency-bound autoregressive decode steps so prefill micro-batches fill pipeline bubbles without starving active streams.
