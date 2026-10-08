@@ -758,6 +758,13 @@ def create_worker_app(
                         )
                         hidden_states = l_out[0] if isinstance(l_out, tuple) else l_out
 
+                if resolved_device.startswith("xla"):
+                    try:
+                        import torch_xla.core.xla_model as xm
+                        xm.mark_step()
+                    except ImportError:
+                        pass
+
                 stage_compute_ms = (time.time() - start_time) * 1000
                 timings = dict(packet.stage_timings)
                 timings[f"stage_{stage_id}_compute_ms"] = stage_compute_ms

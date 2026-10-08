@@ -243,7 +243,7 @@ async def main():
     parser.add_argument("--base-url", type=str, default=None, help="Base API URL")
     parser.add_argument("--gateway-url", type=str, default=None, help="Root Gateway URL for telemetry")
     parser.add_argument("--model", type=str, default="mistralai/Mistral-7B-Instruct-v0.3", help="Model name")
-    parser.add_argument("--concurrency-levels", type=str, default="1,2,4,8,12,16", help="Comma-separated concurrency tiers")
+    parser.add_argument("--concurrency-levels", type=str, default="1,2,4,8,16,24,32", help="Comma-separated concurrency tiers")
     parser.add_argument("--max-tokens", type=int, default=128, help="Max tokens per generation")
     parser.add_argument("--experiment-dir", type=str, default=None, help="Experiment directory path")
     args = parser.parse_args()
