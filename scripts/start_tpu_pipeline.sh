@@ -45,11 +45,13 @@ set -e
 export PATH=/home/pixel/.local/bin:\$PATH
 export PYTHONPATH=/opt/FrontierSplit
 export HF_HOME=/dev/shm/huggingface
+sudo sysctl -w net.ipv4.ip_local_reserved_ports="50051-50058,50151-50158" 2>/dev/null || true
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null || true
 sudo fuser -k 50051/tcp 50052/tcp 50053/tcp 50054/tcp 50055/tcp 50056/tcp 50057/tcp 50058/tcp 50151/tcp 50152/tcp 50153/tcp 50154/tcp 50155/tcp 50156/tcp 50157/tcp 50158/tcp 8000/tcp 2>/dev/null || true
 pkill -9 -f 'frontiersplit' 2>/dev/null || true
 pkill -9 -f 'multiprocessing.spawn' 2>/dev/null || true
-for poll_i in \$(seq 1 15); do
-  if ! sudo ss -tlpn | grep -qE '5005[1-8]|5015[1-8]|:8000 '; then
+for poll_i in \$(seq 1 30); do
+  if ! sudo ss -tan | grep -qE '5005[1-8]|5015[1-8]|:8000 '; then
     break
   fi
   sleep 1
