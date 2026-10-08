@@ -34,16 +34,17 @@ TPU_SSH() {
     --command="$1"
 }
 
-echo "Setting up repository and Python dependencies on TPU VM..."
+echo "Updating repository on TPU VM..."
 TPU_SSH "sudo mkdir -p /opt/FrontierSplit && sudo chown -R \$USER:\$USER /opt/FrontierSplit && \
-  (git clone https://github.com/jasonstredwick/FrontierSplit.git /opt/FrontierSplit 2>/dev/null || (cd /opt/FrontierSplit && git pull origin main)) && \
-  pip install -q fastapi uvicorn pydantic requests httpx transformers accelerate safetensors"
+  (git clone https://github.com/jasonstredwick/FrontierSplit.git /opt/FrontierSplit 2>/dev/null || (cd /opt/FrontierSplit && git pull origin main))"
 
 echo "Creating launcher script on TPU VM..."
 TPU_SSH "cat <<'EOF' > /tmp/fs_tpu_launcher.sh
 #!/usr/bin/env bash
 set -e
+export PATH=/home/pixel/.local/bin:\$PATH
 export PYTHONPATH=/opt/FrontierSplit
+export HF_HOME=/dev/shm/huggingface
 pkill -f 'frontiersplit.worker' 2>/dev/null || true
 pkill -f 'frontiersplit.gateway' 2>/dev/null || true
 sleep 1
