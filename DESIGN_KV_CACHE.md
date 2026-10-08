@@ -96,6 +96,25 @@ For each incoming request:
 * A single layer forward pass takes $\sim 25\text{ ms}$.
 * The copy overhead is **$< 0.2\%$ of one token step**, occurring at most 2–3 times over the entire lifetime of a long sequence (amortized $O(1)$).
 
+### 4.4 VRAM Budget & Preemption Guard (Out-of-Memory Prevention)
+
+To guarantee that the cluster never triggers an unrecoverable CUDA Out-of-Memory (`torch.cuda.OutOfMemoryError`) crash when multiple requests expand concurrently:
+
+1. **Token Footprint Constant**:
+   * For 16 layers (Mistral 7B FP16): $16 \text{ layers} \times 2 \times 8 \text{ heads} \times 128 \text{ dim} \times 2 \text{ bytes} = \mathbf{64\text{ KB per token}}$.
+   * On a 16 GB Tesla T4 with ~7.2 GB usable KV headroom, the maximum safe token budget is:
+     $$\text{Max Safe Budget} = \frac{7.2\text{ GB}}{64\text{ KB}} \approx \mathbf{100,000\text{ tokens}}$$
+
+2. **Admission Control (Queue Pausing)**:
+   * When a new request arrives, the scheduler checks if `total_reserved_tokens + initial_capacity <= Max Safe Budget`.
+   * If memory is temporarily constrained, the request is **held in the queue** until an active request concludes.
+
+3. **Preemption / Pausing During Geometric Doubling**:
+   * If an active sequence needs to double (e.g. $512 \to 1024$), but doing so would breach the budget:
+     * The scheduler **pauses the newest active request** for 1–2 token steps.
+     * The older request completes its generation and emits `EOS`, immediately freeing its memory.
+     * The freed memory is allocated to resume the paused request.
+
 ---
 
 ## 5. Pipeline Parallelism Contract (FrontierSplit Invariant)
