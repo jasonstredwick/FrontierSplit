@@ -3,7 +3,7 @@
 **Target Model:** `mistralai/Mixtral-8x7B-Instruct-v0.1`  
 **Cluster Architecture:** 8-Stage Distributed Pipeline Parallelism over VPC Ethernet  
 **Hardware Silicon:** 8x NVIDIA Tesla T4 (16 GB each, 128 GB total VRAM)  
-**Evaluated Date:** 2026-10-08 15:25:36 UTC  
+**Evaluated Date:** 2026-10-09 04:30:47 UTC  
 
 ---
 
@@ -14,9 +14,9 @@ This benchmark measures the empirical **Throughput Saturation Curve** of Frontie
 By distributing weights across 8 nodes, each node retains **$\sim 3.9\text{ GB}$ of unallocated VRAM**, unlocking multi-stream concurrency that would cause an instant Out-Of-Memory (OOM) crash on a single 16 GB GPU.
 
 ### Key Highlights:
-* **Peak Aggregate Throughput:** **`31.09 tok/s`** achieved at Concurrency $M = 32$.
-* **Hardware Saturation:** Scaled from **`12.5%`** at $M=1$ (unmitigated bubble) up to **`82.1%`** at $M=32$.
-* **Pipeline Bubble Reduction:** Shrinks the idle bubble from 87.5\% down to **`17.9%`**.
+* **Peak Aggregate Throughput:** **`11.72 tok/s`** achieved at Concurrency $M = 8$.
+* **Hardware Saturation:** Scaled from **`12.5%`** at $M=1$ (unmitigated bubble) up to **`53.3%`** at $M=8$.
+* **Pipeline Bubble Reduction:** Shrinks the idle bubble from 87.5\% down to **`46.7%`**.
 * **Reliability:** 100% request completion with zero dropped activation packets across all concurrency tiers.
 
 ---
@@ -25,13 +25,11 @@ By distributing weights across 8 nodes, each node retains **$\sim 3.9\text{ GB}$
 
 | Concurrency ($M$) | Aggregate Throughput | Avg Request Latency | Inter-Token Latency | Hardware Saturation | Idle Bubble ($F$) | Total Tokens |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `1` | **`4.65 tok/s`** | `13.78 s` | `215.24 ms` | **`12.5%`** | `87.5%` | `64` |
-| `2` | **`7.99 tok/s`** | `16.01 s` | `250.15 ms` | **`22.2%`** | `77.8%` | `128` |
-| `4` | **`16.85 tok/s`** | `14.97 s` | `233.91 ms` | **`36.4%`** | `63.6%` | `256` |
-| `8` | **`29.94 tok/s`** | `16.59 s` | `259.22 ms` | **`53.3%`** | `46.7%` | `512` |
-| `16` | **`18.96 tok/s`** | `40.64 s` | `635.02 ms` | **`69.6%`** | `30.4%` | `1024` |
-| `24` | **`24.63 tok/s`** | `49.81 s` | `778.21 ms` | **`77.4%`** | `22.6%` | `1536` |
-| `32` | **`31.09 tok/s`** | `54.2 s` | `846.83 ms` | **`82.1%`** | `17.9%` | `2048` |
+| `1` | **`1.71 tok/s`** | `9.36 s` | `584.87 ms` | **`12.5%`** | `87.5%` | `16` |
+| `2` | **`3.83 tok/s`** | `8.16 s` | `509.83 ms` | **`22.2%`** | `77.8%` | `32` |
+| `4` | **`7.72 tok/s`** | `8.13 s` | `508.28 ms` | **`36.4%`** | `63.6%` | `64` |
+| `8` | **`11.72 tok/s`** | `10.0 s` | `624.94 ms` | **`53.3%`** | `46.7%` | `128` |
+| `16` | **`10.94 tok/s`** | `21.21 s` | `1325.72 ms` | **`69.6%`** | `30.4%` | `256` |
 
 ---
 

@@ -7,36 +7,36 @@
   "valid_diff_rate_pct": 100.0,
   "target_files_matched_count": 5,
   "target_files_matched_pct": 100.0,
-  "total_tokens": 1798,
-  "elapsed_s": 155.96,
-  "throughput_tok_per_sec": 11.53,
-  "avg_latency_s": 89.776,
+  "total_tokens": 1908,
+  "elapsed_s": 393.463,
+  "throughput_tok_per_sec": 4.85,
+  "avg_latency_s": 193.113,
   "bubble_fraction": 0.4286,
   "bubble_elimination_pct": 57.1,
   "results": [
     {
       "instance_id": "django__django-11099",
       "repo": "django/django",
-      "total_tokens": 384,
-      "elapsed_s": 101.38,
+      "total_tokens": 372,
+      "elapsed_s": 184.025,
       "step_metrics": [
         {
           "step": "analysis",
           "tokens": 128,
-          "latency_s": 44.534
+          "latency_s": 61.686
         },
         {
           "step": "patch_generation",
-          "tokens": 256,
-          "latency_s": 56.845
+          "tokens": 244,
+          "latency_s": 122.338
         }
       ],
-      "generated_patch": "Here's the minimal unified git diff patch to fix the issue:\n\n```diff\ndiff --git a/django/contrib/auth/validators.py b/django/contrib/auth/validators.py\nindex 1c2121d..8100000 100644\n--- a/django/contrib/auth/validators.py\n+++ b/django/contrib/auth/validators.py\n@@ -11,7 +11,7 @@ from django.core.exceptions import ValidationError\n from django.utils.deconstruct import deconstructible\n from django.utils.translation import gettext_lazy as _\n\n-ASCII_USERNAME_REGEX = r'^[a-zA-Z0-9_-]{1,30}$'\n+ASCII_USERNAME_REGEX = r'^[a-zA-Z0-9_-]{1,30}\\b'\n\n class ASCIIUsernameValidator:\n     \"\"\"\n@@ -20,7 +20,7 @@ class ASCIIUsernameValidator:\n         \"\"\"",
+      "generated_patch": "Here is the minimal unified git diff patch to fix the issue:\n```diff\n--- a/django/contrib/auth/validators.py\n+++ b/django/contrib/auth/validators.py\n@@ -102,7 +102,7 @@ class ASCIIUsernameValidator(UsernameValidator):\n         '^[a-zA-Z0-9_-]{1,150}$'\n\n class UnicodeUsernameValidator(UsernameValidator):\n-    regex = re.compile(r'^[\\w.@+-]{1,150}\\n?$')\n+    regex = re.compile(r'^[\\w.@+-]{1,150}$')\n```\nThis patch removes the optional `\\n?` at the end of the regular expression in the `UnicodeUsernameValidator` class, which prohibits a trailing newline character in the username. The same change is also made in the `ASCIIUsernameValidator` class, even though it is not explicitly mentioned in the issue description, to ensure consistency and avoid any potential issues in the future.",
       "is_valid_diff": true,
       "affected_files": [
         "django/contrib/auth/validators.py"
       ],
-      "hunk_count": 2,
+      "hunk_count": 1,
       "lines_added": 1,
       "lines_removed": 1,
       "matches_target_files": true,
@@ -45,27 +45,27 @@
     {
       "instance_id": "psf__requests-2148",
       "repo": "psf/requests",
-      "total_tokens": 357,
-      "elapsed_s": 95.578,
+      "total_tokens": 384,
+      "elapsed_s": 190.161,
       "step_metrics": [
         {
           "step": "analysis",
           "tokens": 128,
-          "latency_s": 44.535
+          "latency_s": 62.063
         },
         {
           "step": "patch_generation",
-          "tokens": 229,
-          "latency_s": 51.044
+          "tokens": 256,
+          "latency_s": 128.097
         }
       ],
-      "generated_patch": "```diff\ndiff --git a/requests/models.py b/requests/models.py\nindex 1234567..89abcde 100644\n--- a/requests/models.py\n+++ b/requests/models.py\n@@ -123,7 +123,7 @@ class Response(object):\n         \"\"\"\n         :param stream: (optional) If True, the response body is not read into\n                        memory but returned as an iterator.\n-        :raises socket.error:\n+        :raises requests.exceptions.ConnectionError:\n         \"\"\"\n         if stream:\n             self.raw = self.raw.read(1024)\n```\n\nThis minimal unified git diff patch wraps the `socket.error` exception in a `requests.exceptions.ConnectionError` in the `requests/models.py` file. This ensures that the exception is caught and wrapped consistently across the application, making it easier to handle connection errors.",
+      "generated_patch": "Here is the minimal unified git diff patch to fix the issue:\n```diff\n--- a/requests/models.py\n+++ b/requests/models.py\n@@ -312,7 +312,7 @@\n             resp.raw.read(chunk_size)\n         except ProxyError as e:\n             if not self.proxies:\n-                raise\n+                raise ProxyError(\n+                    \"An error occurred while connecting to the proxy: %s\" % e, e\n+                ) from e\n             else:\n                 raise\n         except (\n```\nExplanation of the patch:\n\nWe are wrapping the socket.error in a ProxyError in the case where a proxy is being used. This is because a socket.error can occur when connecting to the proxy, and in this case, it is appropriate to raise a ProxyError.\n\nThe `raise ProxyError(...) from e` syntax is used to preserve the original socket.error as the cause of the ProxyError. This is important for maintaining the correct error traceback.\n\nThis change fixes the issue by ensuring",
       "is_valid_diff": true,
       "affected_files": [
         "requests/models.py"
       ],
       "hunk_count": 1,
-      "lines_added": 1,
+      "lines_added": 3,
       "lines_removed": 1,
       "matches_target_files": true,
       "verification_error": null
@@ -74,26 +74,26 @@
       "instance_id": "sympy__sympy-13480",
       "repo": "sympy/sympy",
       "total_tokens": 384,
-      "elapsed_s": 95.967,
+      "elapsed_s": 191.487,
       "step_metrics": [
         {
           "step": "analysis",
           "tokens": 128,
-          "latency_s": 36.261
+          "latency_s": 62.701
         },
         {
           "step": "patch_generation",
           "tokens": 256,
-          "latency_s": 59.706
+          "latency_s": 128.786
         }
       ],
-      "generated_patch": "```diff\ndiff --git a/sympy/functions/elementary/hyperbolic.py b/sympy/functions/elementary/hyperbolic.py\nindex 11e100e..001111c 100644\n--- a/sympy/functions/elementary/hyperbolic.py\n+++ b/sympy/functions/elementary/hyperbolic.py\n@@ -111,6 +111,7 @@ class HyperbolicFunction(Function):\n         \"\"\"\n         coth(x) -> cosh(x)/sinh(x)\n         \"\"\"\n+        x = sympify(x)\n         if x.is_Number:\n             if x is S.NaN:\n                 return S.NaN\n@@ -120,6 +121,7 @@ class HyperbolicFunction(Function):\n         if x.func is self:\n             return cosh(x.args[0])/sinh(x.args[0])\n         if x.func is cosh:\n+            x = sympify(x",
+      "generated_patch": "Here's the minimal unified git diff patch to fix the issue in `sympy/functions/elementary/hyperbolic.py`:\n\n```diff\ndiff --git a/sympy/functions/elementary/hyperbolic.py b/sympy/functions/elementary/hyperbolic.py\nindex 86c8e2e..8e0684d 100644\n--- a/sympy/functions/elementary/hyperbolic.py\n+++ b/sympy/functions/elementary/hyperbolic.py\n@@ -110,6 +110,10 @@ class coth(Function):\n         \"\"\"\n         See :class:`hyperbolic.Function` for details.\n         \"\"\"\n+        from sympy.functions.special import I, exp, log\n+\n+        if isinstance(arg, log):\n+            x = arg.args[0]\n         if x.is_complex:\n             return (1 + tanh(x)) / (1 - tanh(x))\n         else:\n@@ -118,7 +1",
       "is_valid_diff": true,
       "affected_files": [
         "sympy/functions/elementary/hyperbolic.py"
       ],
-      "hunk_count": 2,
-      "lines_added": 2,
+      "hunk_count": 1,
+      "lines_added": 4,
       "lines_removed": 0,
       "matches_target_files": true,
       "verification_error": null
@@ -101,56 +101,56 @@
     {
       "instance_id": "pytest-dev__pytest-5221",
       "repo": "pytest-dev/pytest",
-      "total_tokens": 333,
-      "elapsed_s": 84.74,
+      "total_tokens": 384,
+      "elapsed_s": 190.499,
       "step_metrics": [
         {
           "step": "analysis",
           "tokens": 128,
-          "latency_s": 36.245
+          "latency_s": 62.641
         },
         {
           "step": "patch_generation",
-          "tokens": 205,
-          "latency_s": 48.495
+          "tokens": 256,
+          "latency_s": 127.858
         }
       ],
-      "generated_patch": "```diff\ndiff --git a/src/_pytest/python.py b/src/_pytest/python.py\nindex 1234567..89abcde 100644\n--- a/src/_pytest/python.py\n+++ b/src/_pytest/python.py\n@@ -123,7 +123,7 @@ def _get_fixture_info(fixturedef, config):\n         info['doc'] = fixturedef.args[0].__doc__\n         info['argnames'] = [arg.arg for arg in fixturedef.args]\n         info['kind'] = fixturedef.kind\n-        return info\n+        info['scope'] = fixturedef.scope\n+        return info\n```\n\nThis diff patch adds the fixture scope to the fixture info dictionary in the `_get_fixture_info` function.",
+      "generated_patch": "Here is the minimal unified git diff patch to fix the issue:\n\n--- a/src/_pytest/python.py\n+++ b/src/_pytest/python.py\n@@ -121,6 +121,7 @@ def pytest_report_teststatus(report):\n\n def pytest_collect_file(parent, path):\n     return File(path, parent)\n+from _pytest.fixtures import FixtureInfo\n\n def pytest_configure(config):\n     config.pluginmanager.register(FixtureRecorder(config))\n@@ -131,6 +132,9 @@ def pytest_sessionstart(session):\n     config._do_collect(session.items)\n\n def pytest_sessionfinish(session, exitstatus):\n+    if session.config.option.fixtures:\n+        session.config.pluginmanager.getplugin('fixtures').print_fixtures()\n+\n     if session.testsfailed:\n         session.warn(\"some tests failed\", pytest.PytestWarningMark)\n\n@@ -185,6 +189",
       "is_valid_diff": true,
       "affected_files": [
         "src/_pytest/python.py"
       ],
-      "hunk_count": 1,
-      "lines_added": 2,
-      "lines_removed": 1,
+      "hunk_count": 2,
+      "lines_added": 4,
+      "lines_removed": 0,
       "matches_target_files": true,
       "verification_error": null
     },
     {
       "instance_id": "pallets__flask-4045",
       "repo": "pallets/flask",
-      "total_tokens": 340,
-      "elapsed_s": 71.214,
+      "total_tokens": 384,
+      "elapsed_s": 209.394,
       "step_metrics": [
         {
           "step": "analysis",
           "tokens": 128,
-          "latency_s": 27.24
+          "latency_s": 68.286
         },
         {
           "step": "patch_generation",
-          "tokens": 212,
-          "latency_s": 43.974
+          "tokens": 256,
+          "latency_s": 141.107
         }
       ],
-      "generated_patch": "Here's the minimal unified git diff patch to fix the issue:\n\n```diff\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -101,6 +101,7 @@ class Blueprint(object):\n         self.static_folder = static_folder\n         self.static_url_path = static_url_path\n         self.url_prefix = url_prefix\n+        if '.' in name:\n+            raise ValueError('Blueprint name should not contain a dot.')\n         self.import_name = import_name\n         self.root_path = root_path\n         self.record = None\n```\n\nThis patch modifies the `__init__` method of the `Blueprint` class in `blueprints.py`. It checks if the blueprint name contains a dot and raises a `ValueError` if it does.",
+      "generated_patch": "Here is the minimal unified git diff patch to fix the issue:\n\n```diff\n--- a/src/flask/blueprints.py\n+++ b/src/flask/blueprints.py\n@@ -33,6 +33,7 @@ from flask import current_app, RequestStartedEvent\n from werkzeug.routing import Map, Rule\n from werkzeug.utils import import_string\n\n+import re\n \n class Blueprint(object):\n     \"\"\"A blueprint is the central piece for structuring Flask applications.\n@@ -42,6 +43,10 @@ class Blueprint(object):\n         name: The blueprint's name.  This will also be used as the URL prefix\n             if no url_prefix is specified.  This name may not contain dots.\n         import_name: The name of the blueprint's module.  Used for importing\n-            functions for the before_request and after_request handlers.\n+            functions for the before_request and after_request handlers.\n+            This should not contain dots.  It will be imported using\n",
       "is_valid_diff": true,
       "affected_files": [
         "src/flask/blueprints.py"
       ],
-      "hunk_count": 1,
-      "lines_added": 2,
-      "lines_removed": 0,
+      "hunk_count": 2,
+      "lines_added": 3,
+      "lines_removed": 1,
       "matches_target_files": true,
       "verification_error": null
     }

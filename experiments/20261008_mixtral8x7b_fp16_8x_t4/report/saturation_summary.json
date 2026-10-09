@@ -5,20 +5,20 @@
       "concurrency_m": 1,
       "total_requests": 1,
       "success_count": 1,
-      "total_tokens": 64,
-      "wall_time_s": 13.78,
-      "throughput_tok_per_sec": 4.65,
-      "avg_request_latency_s": 13.78,
-      "per_token_latency_ms": 215.24,
+      "total_tokens": 16,
+      "wall_time_s": 9.36,
+      "throughput_tok_per_sec": 1.71,
+      "avg_request_latency_s": 9.36,
+      "per_token_latency_ms": 584.87,
       "idle_bubble_pct": 87.5,
       "hardware_saturation_pct": 12.5,
       "stream_results": [
         {
           "stream_id": 1,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 13.77547804126516,
-          "tok_per_sec": 4.645936773176559
+          "tokens": 16,
+          "latency_s": 9.357848343000114,
+          "tok_per_sec": 1.7097947534027271
         }
       ]
     },
@@ -26,27 +26,27 @@
       "concurrency_m": 2,
       "total_requests": 2,
       "success_count": 2,
-      "total_tokens": 128,
-      "wall_time_s": 16.02,
-      "throughput_tok_per_sec": 7.99,
-      "avg_request_latency_s": 16.01,
-      "per_token_latency_ms": 250.15,
+      "total_tokens": 32,
+      "wall_time_s": 8.36,
+      "throughput_tok_per_sec": 3.83,
+      "avg_request_latency_s": 8.16,
+      "per_token_latency_ms": 509.83,
       "idle_bubble_pct": 77.8,
       "hardware_saturation_pct": 22.2,
       "stream_results": [
         {
           "stream_id": 1,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 16.01940929191187,
-          "tok_per_sec": 3.9951535561497464
+          "tokens": 16,
+          "latency_s": 8.358216335999941,
+          "tok_per_sec": 1.914284023863547
         },
         {
           "stream_id": 2,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 16.0000875829719,
-          "tok_per_sec": 3.99997810437688
+          "tokens": 16,
+          "latency_s": 7.956212888999971,
+          "tok_per_sec": 2.011007023469814
         }
       ]
     },
@@ -54,41 +54,41 @@
       "concurrency_m": 4,
       "total_requests": 4,
       "success_count": 4,
-      "total_tokens": 256,
-      "wall_time_s": 15.2,
-      "throughput_tok_per_sec": 16.85,
-      "avg_request_latency_s": 14.97,
-      "per_token_latency_ms": 233.91,
+      "total_tokens": 64,
+      "wall_time_s": 8.29,
+      "throughput_tok_per_sec": 7.72,
+      "avg_request_latency_s": 8.13,
+      "per_token_latency_ms": 508.28,
       "idle_bubble_pct": 63.6,
       "hardware_saturation_pct": 36.4,
       "stream_results": [
         {
           "stream_id": 1,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 14.715974458027631,
-          "tok_per_sec": 4.349015430988854
+          "tokens": 16,
+          "latency_s": 8.215978163999807,
+          "tok_per_sec": 1.9474248446895428
         },
         {
           "stream_id": 2,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 14.81950758304447,
-          "tok_per_sec": 4.318632022107448
+          "tokens": 16,
+          "latency_s": 7.982240561000026,
+          "tok_per_sec": 2.004449737855996
         },
         {
           "stream_id": 3,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 15.151192458346486,
-          "tok_per_sec": 4.224089963608356
+          "tokens": 16,
+          "latency_s": 8.290839214999778,
+          "tok_per_sec": 1.9298408261316677
         },
         {
           "stream_id": 4,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 15.195193334016949,
-          "tok_per_sec": 4.2118582233978845
+          "tokens": 16,
+          "latency_s": 8.040923414999952,
+          "tok_per_sec": 1.9898212150799468
         }
       ]
     },
@@ -96,69 +96,69 @@
       "concurrency_m": 8,
       "total_requests": 8,
       "success_count": 8,
-      "total_tokens": 512,
-      "wall_time_s": 17.1,
-      "throughput_tok_per_sec": 29.94,
-      "avg_request_latency_s": 16.59,
-      "per_token_latency_ms": 259.22,
+      "total_tokens": 128,
+      "wall_time_s": 10.92,
+      "throughput_tok_per_sec": 11.72,
+      "avg_request_latency_s": 10.0,
+      "per_token_latency_ms": 624.94,
       "idle_bubble_pct": 46.7,
       "hardware_saturation_pct": 53.3,
       "stream_results": [
         {
           "stream_id": 1,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 16.331417417153716,
-          "tok_per_sec": 3.9188270292312506
+          "tokens": 16,
+          "latency_s": 9.982871206000027,
+          "tok_per_sec": 1.6027453094239545
         },
         {
           "stream_id": 2,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 16.599462375044823,
-          "tok_per_sec": 3.8555465565087124
+          "tokens": 16,
+          "latency_s": 9.742342357000098,
+          "tok_per_sec": 1.6423155144515764
         },
         {
           "stream_id": 3,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 16.28499595914036,
-          "tok_per_sec": 3.9299979048553833
+          "tokens": 16,
+          "latency_s": 10.450309638999897,
+          "tok_per_sec": 1.5310551125001126
         },
         {
           "stream_id": 4,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 16.627348208334297,
-          "tok_per_sec": 3.849080394426372
+          "tokens": 16,
+          "latency_s": 9.561153048000051,
+          "tok_per_sec": 1.6734383310961423
         },
         {
           "stream_id": 5,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 16.52525549987331,
-          "tok_per_sec": 3.8728599385643783
+          "tokens": 16,
+          "latency_s": 9.620443810000097,
+          "tok_per_sec": 1.6631249364367775
         },
         {
           "stream_id": 6,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 16.89499295828864,
-          "tok_per_sec": 3.788104567904053
+          "tokens": 16,
+          "latency_s": 9.920220706999999,
+          "tok_per_sec": 1.6128673416217374
         },
         {
           "stream_id": 7,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 17.09956366708502,
-          "tok_per_sec": 3.7427855614347463
+          "tokens": 16,
+          "latency_s": 10.91627719500002,
+          "tok_per_sec": 1.465701146479541
         },
         {
           "stream_id": 8,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 16.35720800003037,
-          "tok_per_sec": 3.9126481732017577
+          "tokens": 16,
+          "latency_s": 9.799097931999995,
+          "tok_per_sec": 1.6328033571080354
         }
       ]
     },
@@ -166,545 +166,125 @@
       "concurrency_m": 16,
       "total_requests": 16,
       "success_count": 16,
-      "total_tokens": 1024,
-      "wall_time_s": 54.01,
-      "throughput_tok_per_sec": 18.96,
-      "avg_request_latency_s": 40.64,
-      "per_token_latency_ms": 635.02,
+      "total_tokens": 256,
+      "wall_time_s": 23.41,
+      "throughput_tok_per_sec": 10.94,
+      "avg_request_latency_s": 21.21,
+      "per_token_latency_ms": 1325.72,
       "idle_bubble_pct": 30.4,
       "hardware_saturation_pct": 69.6,
       "stream_results": [
         {
           "stream_id": 1,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 53.99903795821592,
-          "tok_per_sec": 1.1852063003330309
+          "tokens": 16,
+          "latency_s": 21.52073531899987,
+          "tok_per_sec": 0.7434690201256361
         },
         {
           "stream_id": 2,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 24.879491375293583,
-          "tok_per_sec": 2.572399854747625
+          "tokens": 16,
+          "latency_s": 20.52069996599994,
+          "tok_per_sec": 0.7797004988382397
         },
         {
           "stream_id": 3,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 53.998012457974255,
-          "tok_per_sec": 1.1852288091123746
+          "tokens": 16,
+          "latency_s": 21.99249621900003,
+          "tok_per_sec": 0.7275208707857855
         },
         {
           "stream_id": 4,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 28.551725959405303,
-          "tok_per_sec": 2.241545750719059
+          "tokens": 16,
+          "latency_s": 20.278713709000158,
+          "tok_per_sec": 0.7890046789752169
         },
         {
           "stream_id": 5,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 24.897361208684742,
-          "tok_per_sec": 2.570553540335648
+          "tokens": 16,
+          "latency_s": 20.33817058999989,
+          "tok_per_sec": 0.7866980921021022
         },
         {
           "stream_id": 6,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 25.068884249776602,
-          "tok_per_sec": 2.552965635100825
+          "tokens": 16,
+          "latency_s": 20.100544133000085,
+          "tok_per_sec": 0.7959983517924765
         },
         {
           "stream_id": 7,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 24.467508625239134,
-          "tok_per_sec": 2.6157138015262267
+          "tokens": 16,
+          "latency_s": 21.45776276299989,
+          "tok_per_sec": 0.7456508945839015
         },
         {
           "stream_id": 8,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 54.00721291685477,
-          "tok_per_sec": 1.1850268981391308
+          "tokens": 16,
+          "latency_s": 20.396429489000184,
+          "tok_per_sec": 0.7844510240691301
         },
         {
           "stream_id": 9,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 53.9943065000698,
-          "tok_per_sec": 1.1853101585797248
+          "tokens": 16,
+          "latency_s": 20.576457849000008,
+          "tok_per_sec": 0.7775876740989986
         },
         {
           "stream_id": 10,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 54.005399874877185,
-          "tok_per_sec": 1.185066681262964
+          "tokens": 16,
+          "latency_s": 22.92664849599987,
+          "tok_per_sec": 0.6978778430171162
         },
         {
           "stream_id": 11,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 54.00480283331126,
-          "tok_per_sec": 1.1850797825804393
+          "tokens": 16,
+          "latency_s": 22.456666149000057,
+          "tok_per_sec": 0.7124833175966524
         },
         {
           "stream_id": 12,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 23.751865749713033,
-          "tok_per_sec": 2.694525165913471
+          "tokens": 16,
+          "latency_s": 20.694134342000098,
+          "tok_per_sec": 0.7731659481656575
         },
         {
           "stream_id": 13,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 42.88115775026381,
-          "tok_per_sec": 1.4924970163522757
+          "tokens": 16,
+          "latency_s": 20.812101351000138,
+          "tok_per_sec": 0.7687834942832964
         },
         {
           "stream_id": 14,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 23.75106762489304,
-          "tok_per_sec": 2.694615712050048
+          "tokens": 16,
+          "latency_s": 23.39755107499991,
+          "tok_per_sec": 0.6838322501663804
         },
         {
           "stream_id": 15,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 54.00365075003356,
-          "tok_per_sec": 1.1851050644008587
+          "tokens": 16,
+          "latency_s": 20.928702870999814,
+          "tok_per_sec": 0.7645003179901154
         },
         {
           "stream_id": 16,
           "status": "success",
-          "tokens": 64,
-          "latency_s": 53.996433292049915,
-          "tok_per_sec": 1.1852634720120105
-        }
-      ]
-    },
-    {
-      "concurrency_m": 24,
-      "total_requests": 24,
-      "success_count": 24,
-      "total_tokens": 1536,
-      "wall_time_s": 62.38,
-      "throughput_tok_per_sec": 24.63,
-      "avg_request_latency_s": 49.81,
-      "per_token_latency_ms": 778.21,
-      "idle_bubble_pct": 22.6,
-      "hardware_saturation_pct": 77.4,
-      "stream_results": [
-        {
-          "stream_id": 1,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 34.86511345813051,
-          "tok_per_sec": 1.8356458262170166
-        },
-        {
-          "stream_id": 2,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 26.28099837480113,
-          "tok_per_sec": 2.435219510586203
-        },
-        {
-          "stream_id": 3,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 38.70115362480283,
-          "tok_per_sec": 1.6536974742526442
-        },
-        {
-          "stream_id": 4,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 26.6720839580521,
-          "tok_per_sec": 2.399512542801474
-        },
-        {
-          "stream_id": 5,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.37439829111099,
-          "tok_per_sec": 1.026062002254548
-        },
-        {
-          "stream_id": 6,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.354417209047824,
-          "tok_per_sec": 1.0263907973902673
-        },
-        {
-          "stream_id": 7,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 38.699791999999434,
-          "tok_per_sec": 1.6537556584283692
-        },
-        {
-          "stream_id": 8,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.34882662491873,
-          "tok_per_sec": 1.0264828299819415
-        },
-        {
-          "stream_id": 9,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 26.159262125380337,
-          "tok_per_sec": 2.4465521884084676
-        },
-        {
-          "stream_id": 10,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.364682666026056,
-          "tok_per_sec": 1.0262218496762239
-        },
-        {
-          "stream_id": 11,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.35863120900467,
-          "tok_per_sec": 1.0263214371318388
-        },
-        {
-          "stream_id": 12,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.37180950026959,
-          "tok_per_sec": 1.0261045897621965
-        },
-        {
-          "stream_id": 13,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.367523666936904,
-          "tok_per_sec": 1.0261751026348434
-        },
-        {
-          "stream_id": 14,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.355561583302915,
-          "tok_per_sec": 1.0263719606550288
-        },
-        {
-          "stream_id": 15,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.35001237504184,
-          "tok_per_sec": 1.0264633087004589
-        },
-        {
-          "stream_id": 16,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 38.698962832801044,
-          "tok_per_sec": 1.6537910919347412
-        },
-        {
-          "stream_id": 17,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 26.37373699992895,
-          "tok_per_sec": 2.426656487860344
-        },
-        {
-          "stream_id": 18,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.35525820823386,
-          "tok_per_sec": 1.0263769542301238
-        },
-        {
-          "stream_id": 19,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.349673042073846,
-          "tok_per_sec": 1.0264688951426018
-        },
-        {
-          "stream_id": 20,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 26.20035320939496,
-          "tok_per_sec": 2.4427151606891613
-        },
-        {
-          "stream_id": 21,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.351952041033655,
-          "tok_per_sec": 1.0264313771264413
-        },
-        {
-          "stream_id": 22,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 39.68106604134664,
-          "tok_per_sec": 1.6128598947748447
-        },
-        {
-          "stream_id": 23,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.352282708045095,
-          "tok_per_sec": 1.0264259337492114
-        },
-        {
-          "stream_id": 24,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 62.345276332926005,
-          "tok_per_sec": 1.026541283709093
-        }
-      ]
-    },
-    {
-      "concurrency_m": 32,
-      "total_requests": 32,
-      "success_count": 32,
-      "total_tokens": 2048,
-      "wall_time_s": 65.88,
-      "throughput_tok_per_sec": 31.09,
-      "avg_request_latency_s": 54.2,
-      "per_token_latency_ms": 846.83,
-      "idle_bubble_pct": 17.9,
-      "hardware_saturation_pct": 82.1,
-      "stream_results": [
-        {
-          "stream_id": 1,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87884125020355,
-          "tok_per_sec": 0.9714803537137541
-        },
-        {
-          "stream_id": 2,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87696970812976,
-          "tok_per_sec": 0.9715079531367982
-        },
-        {
-          "stream_id": 3,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87858770834282,
-          "tok_per_sec": 0.9714840925755772
-        },
-        {
-          "stream_id": 4,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 37.71999654173851,
-          "tok_per_sec": 1.6967127748588666
-        },
-        {
-          "stream_id": 5,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 26.96322604175657,
-          "tok_per_sec": 2.3736032142773444
-        },
-        {
-          "stream_id": 6,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87832333287224,
-          "tok_per_sec": 0.9714879912261672
-        },
-        {
-          "stream_id": 7,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 27.505761958193034,
-          "tok_per_sec": 2.326785205851626
-        },
-        {
-          "stream_id": 8,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 35.255916957743466,
-          "tok_per_sec": 1.8152981264594028
-        },
-        {
-          "stream_id": 9,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 53.99547891598195,
-          "tok_per_sec": 1.1852844216751053
-        },
-        {
-          "stream_id": 10,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 35.255451708100736,
-          "tok_per_sec": 1.8153220820964422
-        },
-        {
-          "stream_id": 11,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 37.718229374848306,
-          "tok_per_sec": 1.6967922689042556
-        },
-        {
-          "stream_id": 12,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87633125018328,
-          "tok_per_sec": 0.9715173687639433
-        },
-        {
-          "stream_id": 13,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 27.917209332808852,
-          "tok_per_sec": 2.2924927501541474
-        },
-        {
-          "stream_id": 14,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87240991694853,
-          "tok_per_sec": 0.9715752024359022
-        },
-        {
-          "stream_id": 15,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87546600028872,
-          "tok_per_sec": 0.9715301292854535
-        },
-        {
-          "stream_id": 16,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87675958266482,
-          "tok_per_sec": 0.9715110519316029
-        },
-        {
-          "stream_id": 17,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87264545774087,
-          "tok_per_sec": 0.9715717283748346
-        },
-        {
-          "stream_id": 18,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 53.99495074991137,
-          "tok_per_sec": 1.1852960158520944
-        },
-        {
-          "stream_id": 19,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 53.99519908428192,
-          "tok_per_sec": 1.1852905644463212
-        },
-        {
-          "stream_id": 20,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87424545921385,
-          "tok_per_sec": 0.97154813013571
-        },
-        {
-          "stream_id": 21,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87381216697395,
-          "tok_per_sec": 0.9715545206003215
-        },
-        {
-          "stream_id": 22,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 53.993029166013,
-          "tok_per_sec": 1.1853381999224093
-        },
-        {
-          "stream_id": 23,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 46.20821708301082,
-          "tok_per_sec": 1.3850350444170374
-        },
-        {
-          "stream_id": 24,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 27.826598667073995,
-          "tok_per_sec": 2.2999577047024586
-        },
-        {
-          "stream_id": 25,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87018437497318,
-          "tok_per_sec": 0.9716080288415931
-        },
-        {
-          "stream_id": 26,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 53.99213762488216,
-          "tok_per_sec": 1.1853577727307048
-        },
-        {
-          "stream_id": 27,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.87043400015682,
-          "tok_per_sec": 0.9716043467976487
-        },
-        {
-          "stream_id": 28,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 53.99336583400145,
-          "tok_per_sec": 1.18533080891388
-        },
-        {
-          "stream_id": 29,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 53.99183608405292,
-          "tok_per_sec": 1.185364392875372
-        },
-        {
-          "stream_id": 30,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.8696416253224,
-          "tok_per_sec": 0.9716160346528491
-        },
-        {
-          "stream_id": 31,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.86852987483144,
-          "tok_per_sec": 0.971632433904595
-        },
-        {
-          "stream_id": 32,
-          "status": "success",
-          "tokens": 64,
-          "latency_s": 65.86854204209521,
-          "tok_per_sec": 0.9716322544242582
+          "tokens": 16,
+          "latency_s": 20.986637107999968,
+          "tok_per_sec": 0.762389892085231
         }
       ]
     }
