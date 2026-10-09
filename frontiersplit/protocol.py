@@ -420,6 +420,7 @@ class ChunkActivationPacket(BaseModel):
     chunk_size: int = 16        # C = 16
     valid_tokens: int = 16      # Number of valid tokens in chunk (1..C)
     is_prefill: bool = True
+    seq_pos: int = 0            # Global sequence position of the current chunk/token
     stage_id: int = 0
     tokens: Optional[List[int]] = None   # Token IDs of length C (passed to Stage 0 for embedding)
     tensor_shape: List[int] = Field(default_factory=lambda: [16, 4096])

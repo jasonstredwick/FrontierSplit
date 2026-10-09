@@ -327,10 +327,12 @@ class PipelineScheduler:
             tokens = req.prefill_chunks[chunk_idx]
             valid_tokens = req.chunk_valid_lens[chunk_idx]
             total_chunks = req.total_prefill_chunks
+            seq_pos = chunk_idx * 16
         else:
-            chunk_idx = req.total_prefill_chunks + len(req.generated_tokens) - 1
+            seq_pos = len(req.input_tokens) + len(req.generated_tokens) - 1
             tokens = [req.generated_tokens[-1]] + [0] * 15
             valid_tokens = 1
+            chunk_idx = seq_pos // 16
             total_chunks = chunk_idx + 1
 
         packet = ChunkActivationPacket(
@@ -340,6 +342,7 @@ class PipelineScheduler:
             chunk_size=16,
             valid_tokens=valid_tokens,
             is_prefill=req.is_prefill,
+            seq_pos=seq_pos,
             stage_id=0,
             tokens=tokens,
             tensor_shape=[16, 4096],

@@ -1339,7 +1339,9 @@ def create_worker_app(
         valid_tokens = packet.valid_tokens
         chunk_idx = packet.chunk_idx
         total_chunks = packet.total_chunks
-        is_final_chunk = (chunk_idx == total_chunks - 1) or (not packet.is_prefill)
+        is_prefill = packet.is_prefill
+        seq_pos = getattr(packet, "seq_pos", chunk_idx * chunk_size)
+        is_final_chunk = (chunk_idx == total_chunks - 1) if is_prefill else True
 
         try:
             if use_real_model:
@@ -1363,18 +1365,11 @@ def create_worker_app(
                         hidden_states = hidden_states.view(chunk_size, -1)
 
                         # Look up session cache in PagedBlockPool
-                        cache = kv_store.get_or_create(packet.request_id, prompt_len=total_chunks * chunk_size)
-                        if hasattr(cache, "pool") and cache.pool is not None:
-                            if len(cache.block_table) <= chunk_idx:
-                                needed = chunk_idx + 1 - len(cache.block_table)
-                                cache.block_table.extend(cache.pool.allocate(needed))
-                            blk_id = cache.block_table[chunk_idx]
-                        else:
-                            blk_id = 0
+                        cache = kv_store.get_or_create(packet.request_id, prompt_len=max(total_chunks * chunk_size, seq_pos + 64))
 
-                        start_pos = chunk_idx * chunk_size
-                        pos_ids = torch.arange(start_pos, start_pos + chunk_size, device=resolved_device, dtype=torch.long)
-                        cos, sin = rotary_emb(hidden_states, pos_ids) if rotary_emb is not None else (None, None)
+                        start_pos = chunk_idx * chunk_size if is_prefill else seq_pos
+                        pos_ids = torch.arange(start_pos, start_pos + chunk_size, device=resolved_device, dtype=torch.long).unsqueeze(0)
+                        cos, sin = rotary_emb(hidden_states.unsqueeze(0), pos_ids) if rotary_emb is not None else (None, None)
 
                         for layer in assigned_layers:
                             residual = hidden_states
@@ -1396,30 +1391,62 @@ def create_worker_app(
                                 k = k.squeeze(0)
 
                             if hasattr(cache, "pool") and cache.pool is not None:
-                                # Write key and value directly into physical block blk_id
-                                cache.pool.k_pool[layer_idx, blk_id, :] = k.permute(1, 0, 2)
-                                cache.pool.v_pool[layer_idx, blk_id, :] = v.permute(1, 0, 2)
+                                if is_prefill:
+                                    if len(cache.block_table) <= chunk_idx:
+                                        needed = chunk_idx + 1 - len(cache.block_table)
+                                        cache.block_table.extend(cache.pool.allocate(needed))
+                                    blk_id = cache.block_table[chunk_idx]
+                                    cache.pool.k_pool[layer_idx, blk_id, :] = k.permute(1, 0, 2)
+                                    cache.pool.v_pool[layer_idx, blk_id, :] = v.permute(1, 0, 2)
 
-                                active_blks = cache.block_table[:chunk_idx + 1]
-                                k_blks = cache.pool.k_pool[layer_idx, active_blks]
-                                v_blks = cache.pool.v_pool[layer_idx, active_blks]
+                                    active_blks = cache.block_table[:chunk_idx + 1]
+                                    k_blks = cache.pool.k_pool[layer_idx, active_blks]
+                                    v_blks = cache.pool.v_pool[layer_idx, active_blks]
 
-                                total_k = (chunk_idx + 1) * chunk_size
-                                k_all = k_blks.reshape(total_k, num_kv_heads, head_dim).permute(1, 0, 2)
-                                v_all = v_blks.reshape(total_k, num_kv_heads, head_dim).permute(1, 0, 2)
+                                    total_k = (chunk_idx + 1) * chunk_size
+                                    k_all = k_blks.reshape(total_k, num_kv_heads, head_dim).permute(1, 0, 2)
+                                    v_all = v_blks.reshape(total_k, num_kv_heads, head_dim).permute(1, 0, 2)
 
-                                num_kv_groups = num_q_heads // num_kv_heads
-                                if num_kv_groups > 1:
-                                    k_all = k_all.repeat_interleave(num_kv_groups, dim=0)
-                                    v_all = v_all.repeat_interleave(num_kv_groups, dim=0)
+                                    num_kv_groups = num_q_heads // num_kv_heads
+                                    if num_kv_groups > 1:
+                                        k_all = k_all.repeat_interleave(num_kv_groups, dim=0)
+                                        v_all = v_all.repeat_interleave(num_kv_groups, dim=0)
 
-                                q_idx = torch.arange(start_pos, start_pos + chunk_size, device=resolved_device).view(chunk_size, 1)
-                                k_idx = torch.arange(total_k, device=resolved_device).view(1, total_k)
-                                valid_limit = start_pos + valid_tokens - 1
-                                mask = torch.where((k_idx <= q_idx) & (k_idx <= valid_limit), 0.0, -10000.0).view(1, 1, chunk_size, total_k).to(dtype=q.dtype)
+                                    q_idx = torch.arange(start_pos, start_pos + chunk_size, device=resolved_device).view(chunk_size, 1)
+                                    k_idx = torch.arange(total_k, device=resolved_device).view(1, total_k)
+                                    valid_limit = start_pos + valid_tokens - 1
+                                    mask = torch.where((k_idx <= q_idx) & (k_idx <= valid_limit), 0.0, -10000.0).view(1, 1, chunk_size, total_k).to(dtype=q.dtype)
 
-                                attn_out = F.scaled_dot_product_attention(q.unsqueeze(0), k_all.unsqueeze(0), v_all.unsqueeze(0), attn_mask=mask)
-                                attn_out = attn_out.squeeze(0).transpose(0, 1).reshape(chunk_size, -1)
+                                    attn_out = F.scaled_dot_product_attention(q.unsqueeze(0), k_all.unsqueeze(0), v_all.unsqueeze(0), attn_mask=mask)
+                                    attn_out = attn_out.squeeze(0).transpose(0, 1).reshape(chunk_size, -1)
+                                else:
+                                    blk_idx = seq_pos // chunk_size
+                                    slot_idx = seq_pos % chunk_size
+                                    if len(cache.block_table) <= blk_idx:
+                                        needed = blk_idx + 1 - len(cache.block_table)
+                                        cache.block_table.extend(cache.pool.allocate(needed))
+                                    blk_id = cache.block_table[blk_idx]
+                                    cache.pool.k_pool[layer_idx, blk_id, slot_idx] = k[:, 0, :]
+                                    cache.pool.v_pool[layer_idx, blk_id, slot_idx] = v[:, 0, :]
+
+                                    total_tokens = seq_pos + 1
+                                    active_blks = cache.block_table[:blk_idx + 1]
+                                    k_blks = cache.pool.k_pool[layer_idx, active_blks].reshape(len(active_blks) * chunk_size, num_kv_heads, head_dim)
+                                    v_blks = cache.pool.v_pool[layer_idx, active_blks].reshape(len(active_blks) * chunk_size, num_kv_heads, head_dim)
+                                    k_all = k_blks[:total_tokens].permute(1, 0, 2)
+                                    v_all = v_blks[:total_tokens].permute(1, 0, 2)
+
+                                    num_kv_groups = num_q_heads // num_kv_heads
+                                    if num_kv_groups > 1:
+                                        k_all = k_all.repeat_interleave(num_kv_groups, dim=0)
+                                        v_all = v_all.repeat_interleave(num_kv_groups, dim=0)
+
+                                    q_single = q[:, 0:1, :]
+                                    attn_single = F.scaled_dot_product_attention(q_single.unsqueeze(0), k_all.unsqueeze(0), v_all.unsqueeze(0))
+                                    attn_single = attn_single.squeeze(0).transpose(0, 1).reshape(1, -1)
+
+                                    attn_out = torch.zeros((chunk_size, hidden_states.shape[-1]), dtype=q.dtype, device=resolved_device)
+                                    attn_out[0:1, :] = attn_single
                             else:
                                 attn_out = F.scaled_dot_product_attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
                                 attn_out = attn_out.squeeze(0).transpose(0, 1).reshape(chunk_size, -1)
@@ -1429,9 +1456,10 @@ def create_worker_app(
                             normed = layer.post_attention_layernorm(hidden_states)
                             moe_block = getattr(layer, "block_sparse_moe", getattr(layer, "mlp", None))
                             if moe_block is not None:
-                                moe_out = moe_block(normed)
+                                moe_input = normed.unsqueeze(0)
+                                moe_out = moe_block(moe_input)
                                 moe_out = moe_out[0] if isinstance(moe_out, tuple) else moe_out
-                                hidden_states = hidden_states + moe_out
+                                hidden_states = hidden_states + moe_out.squeeze(0)
 
                         if resolved_device.startswith("xla"):
                             try:
@@ -1445,7 +1473,7 @@ def create_worker_app(
                             if final_norm is not None:
                                 hidden_states = final_norm(hidden_states)
                             if is_final_chunk and lm_head is not None:
-                                last_tok_idx = max(0, min(valid_tokens - 1, chunk_size - 1))
+                                last_tok_idx = (valid_tokens - 1) if is_prefill else 0
                                 logits = lm_head(hidden_states[last_tok_idx:last_tok_idx + 1, :])
                                 next_tok_id = int(torch.argmax(logits, dim=-1).item())
 
@@ -1525,7 +1553,8 @@ def create_worker_app(
                     return chunk_resp
 
         except Exception as e:
-            if is_final_stage and packet.reply_to:
+            traceback.print_exc()
+            if packet.reply_to:
                 err_resp = ChunkGenerationResponse(
                     request_id=packet.request_id,
                     chunk_idx=chunk_idx,
