@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 import gc
 import os
 import time
+import traceback
 from typing import Any, Dict, List, Optional
 import numpy as np
 import requests
@@ -201,7 +202,7 @@ class WorkerKVCacheStore:
         self.session_seq_lens: Dict[str, int] = {}
         self.block_pool: Optional[PagedBlockPool] = None
 
-        if HAS_TORCH and (use_static_cache or (device and device.startswith("xla"))):
+        if HAS_TORCH:
             num_kv_heads = (
                 getattr(model_config, "num_key_value_heads", getattr(model_config, "num_attention_heads", 8))
                 if model_config is not None
@@ -1448,7 +1449,10 @@ def create_worker_app(
                                     attn_out = torch.zeros((chunk_size, hidden_states.shape[-1]), dtype=q.dtype, device=resolved_device)
                                     attn_out[0:1, :] = attn_single
                             else:
-                                attn_out = F.scaled_dot_product_attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
+                                num_kv_groups = num_q_heads // num_kv_heads
+                                k_fb = k.repeat_interleave(num_kv_groups, dim=0) if num_kv_groups > 1 else k
+                                v_fb = v.repeat_interleave(num_kv_groups, dim=0) if num_kv_groups > 1 else v
+                                attn_out = F.scaled_dot_product_attention(q.unsqueeze(0), k_fb.unsqueeze(0), v_fb.unsqueeze(0))
                                 attn_out = attn_out.squeeze(0).transpose(0, 1).reshape(chunk_size, -1)
 
                             hidden_states = residual + layer.self_attn.o_proj(attn_out)
