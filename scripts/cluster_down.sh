@@ -22,7 +22,7 @@ fi
 
 for NODE in ${INSTANCES}; do
     echo "Deleting instance: ${NODE}..."
-    ${GCLOUD} compute instances delete "${NODE}" --project="${PROJECT_ID}" --zone="${ZONE}" --quiet &
+    ${GCLOUD} compute instances delete "${NODE}" --project="${PROJECT_ID}" --zone="${ZONE}" --delete-disks=all --quiet &
 done
 
 wait
