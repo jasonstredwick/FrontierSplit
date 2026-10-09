@@ -1053,6 +1053,8 @@ def create_worker_app(
                                     ) if mask_function is not None else None
                                     cache_pos = None
 
+                                pos_emb = rotary_emb(h_b, position_ids=pos_ids) if rotary_emb is not None else None
+
                                 for layer in assigned_layers:
                                     kwargs = {
                                         "attention_mask": c_mask,
