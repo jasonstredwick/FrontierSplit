@@ -148,9 +148,9 @@ tokens = disagg_model.generate(
 )
 ```
 
-Run the runnable HuggingFace Llama demo:
+Run the runnable HuggingFace causal LM demo:
 ```bash
-python examples/hf_llama_disaggregated_demo.py
+python examples/hf_disaggregated_demo.py
 ```
 
 ---
@@ -184,7 +184,7 @@ FrontierSplit/
 │   └── hf_model.py                        # HuggingFace DisaggregatedModel wrapper & patcher
 ├── examples/
 │   ├── disaggregated_demo.py              # Quickstart: 10k-token offload with 8 KB payloads
-│   └── hf_llama_disaggregated_demo.py     # End-to-end HuggingFace Llama generation demo
+│   └── hf_disaggregated_demo.py          # End-to-end HuggingFace causal LM generation demo
 ├── tests/
 │   ├── test_online_softmax.py             # Online Softmax mathematical equivalence tests
 │   ├── test_context_server.py             # TCP socket lifecycle & partial query tests

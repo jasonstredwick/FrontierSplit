@@ -1,11 +1,11 @@
-"""HuggingFace Llama Model Disaggregated Inference Demo.
+"""HuggingFace Model Disaggregated Inference Demo.
 
-Demonstrates wrapping a standard HuggingFace Llama architecture with FrontierSplit's
+Demonstrates wrapping a standard HuggingFace causal LM architecture with FrontierSplit's
 DisaggregatedModel to offload the prompt KV cache to an independent Context Server
 over TCP and generate tokens with 100% token-for-token identical outputs.
 
 Run with:
-    python examples/hf_llama_disaggregated_demo.py
+    python examples/hf_disaggregated_demo.py
 """
 
 from __future__ import annotations
