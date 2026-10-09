@@ -1,5 +1,10 @@
 """FrontierSplit: Disaggregated Long-Context Inference Engine using Online Softmax."""
 
+from frontiersplit.context_server import (
+    ContextClient,
+    ContextServer,
+    ContextStore,
+)
 from frontiersplit.online_softmax import (
     PartialAttentionChunk,
     compute_partial_attention,
@@ -12,6 +17,9 @@ from frontiersplit.online_softmax import (
 __version__ = "0.2.0.dev0"
 
 __all__ = [
+    "ContextClient",
+    "ContextServer",
+    "ContextStore",
     "PartialAttentionChunk",
     "compute_partial_attention",
     "finalize_attention",
