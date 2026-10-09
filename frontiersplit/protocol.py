@@ -478,6 +478,7 @@ class ChunkActivationPacket(BaseModel):
             "chunk_size": self.chunk_size,
             "valid_tokens": self.valid_tokens,
             "is_prefill": self.is_prefill,
+            "seq_pos": self.seq_pos,
             "stage_id": self.stage_id,
             "tokens": self.tokens,
             "tensor_shape": self.tensor_shape,
@@ -516,13 +517,17 @@ class ChunkActivationPacket(BaseModel):
         flags: int = 0,
     ) -> ChunkActivationPacket:
         meta = json.loads(meta_bytes.decode("utf-8")) if meta_bytes else {}
+        is_prefill_val = meta.get("is_prefill")
+        if is_prefill_val is None:
+            is_prefill_val = bool(flags & FLAG_IS_PREFILL)
         packet = cls(
             request_id=meta.get("request_id", ""),
             chunk_idx=meta.get("chunk_idx", 0),
             total_chunks=meta.get("total_chunks", 1),
             chunk_size=meta.get("chunk_size", 16),
             valid_tokens=meta.get("valid_tokens", 16),
-            is_prefill=bool(flags & FLAG_IS_PREFILL) or meta.get("is_prefill", True),
+            is_prefill=bool(is_prefill_val),
+            seq_pos=meta.get("seq_pos", 0),
             stage_id=meta.get("stage_id", 0),
             tokens=meta.get("tokens"),
             tensor_shape=meta.get("tensor_shape", shape),

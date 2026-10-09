@@ -1490,6 +1490,7 @@ def create_worker_app(
                 if not is_final_stage:
                     next_packet = packet.model_copy()
                     next_packet.stage_id = stage_id + 1
+                    next_packet.seq_pos = seq_pos
                     next_packet.tokens = None
                     next_packet.stage_timings = timings
                     next_packet.tensor_shape = [chunk_size, hidden_states.shape[-1]]
