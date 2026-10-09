@@ -182,16 +182,18 @@ class BinaryTransportClient:
                     self.writer.write(frame)
                     await self.writer.drain()
 
-                    # Await immediate 32-byte ACK frame (<0.1 ms)
-                    msg_type, flags, meta, payload, dtype_str, shape = await asyncio.wait_for(
-                        read_binary_frame_async(self.reader),
-                        timeout=min(self.timeout, 10.0),
-                    )
-
-                    if msg_type == MSG_FORWARD_ACK:
-                        return
-                    else:
-                        raise RuntimeError(f"Expected MSG_FORWARD_ACK (8), got {msg_type}")
+                    # Await immediate 32-byte ACK frame (<0.1 ms), draining any interleaved release/pong frames
+                    while True:
+                        msg_type, flags, meta, payload, dtype_str, shape = await asyncio.wait_for(
+                            read_binary_frame_async(self.reader),
+                            timeout=min(self.timeout, 10.0),
+                        )
+                        if msg_type == MSG_FORWARD_ACK:
+                            return
+                        elif msg_type in (MSG_RELEASE_SESSION_RESP, MSG_PONG):
+                            continue
+                        else:
+                            raise RuntimeError(f"Expected MSG_FORWARD_ACK (8), got {msg_type}")
 
                 except (ConnectionError, asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError) as e:
                     logger.warning(
@@ -241,15 +243,17 @@ class BinaryTransportClient:
                     self.writer.write(frame)
                     await self.writer.drain()
 
-                    msg_type, flags, meta, payload, dtype_str, shape = await asyncio.wait_for(
-                        read_binary_frame_async(self.reader),
-                        timeout=self.timeout,
-                    )
-
-                    if msg_type == MSG_RELEASE_SESSION_RESP:
-                        return ReleaseSessionResponse.decode_binary(json.dumps(meta).encode("utf-8"))
-                    else:
-                        raise RuntimeError(f"Unexpected response to release session: {msg_type}")
+                    while True:
+                        msg_type, flags, meta, payload, dtype_str, shape = await asyncio.wait_for(
+                            read_binary_frame_async(self.reader),
+                            timeout=self.timeout,
+                        )
+                        if msg_type == MSG_RELEASE_SESSION_RESP:
+                            return ReleaseSessionResponse.decode_binary(json.dumps(meta).encode("utf-8"))
+                        elif msg_type in (MSG_FORWARD_ACK, MSG_PONG):
+                            continue
+                        else:
+                            raise RuntimeError(f"Unexpected response to release session: {msg_type}")
 
                 except (ConnectionError, asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError) as e:
                     await self.close()
