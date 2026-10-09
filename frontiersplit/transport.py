@@ -147,7 +147,7 @@ class BinaryTransportClient:
                     else:
                         raise RuntimeError(f"Unexpected response message type from peer: {msg_type}")
 
-                except (ConnectionError, asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError) as e:
+                except (ConnectionError, asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError, asyncio.TimeoutError) as e:
                     logger.warning(
                         f"[BinaryClient] Socket error on attempt {attempt + 1}/{self.max_retries} to {self.current_peer}: {e}"
                     )
@@ -186,7 +186,7 @@ class BinaryTransportClient:
                     while True:
                         msg_type, flags, meta, payload, dtype_str, shape = await asyncio.wait_for(
                             read_binary_frame_async(self.reader),
-                            timeout=min(self.timeout, 10.0),
+                            timeout=self.timeout,
                         )
                         if msg_type == MSG_FORWARD_ACK:
                             return
@@ -195,7 +195,7 @@ class BinaryTransportClient:
                         else:
                             raise RuntimeError(f"Expected MSG_FORWARD_ACK (8), got {msg_type}")
 
-                except (ConnectionError, asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError) as e:
+                except (ConnectionError, asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError, asyncio.TimeoutError) as e:
                     logger.warning(
                         f"[BinaryClient] Socket error on send_async_forward attempt {attempt + 1}/{self.max_retries} to {self.current_peer}: {e}"
                     )
