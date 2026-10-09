@@ -125,17 +125,47 @@ Sample output:
 
 ---
 
+## HuggingFace Integration
+
+You can wrap any standard HuggingFace causal language model (Llama, Mistral, Qwen2, Gemma) with `DisaggregatedModel` to run disaggregated long-context inference out of the box with zero model surgery:
+
+```python
+from transformers import AutoModelForCausalLM
+from frontiersplit import ContextClient, ContextServer, DisaggregatedModel
+
+# 1. Load any standard HuggingFace model
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+
+# 2. Connect to remote Context Server
+client = ContextClient(host="10.0.0.1", port=50055)
+disagg_model = DisaggregatedModel(model=model, context_client=client)
+
+# 3. Generate tokens natively (prompts offloaded, attention merged via Online Softmax)
+tokens = disagg_model.generate(
+    input_ids=prompt_tokens,
+    max_new_tokens=64,
+    session_id="chat-session-123",
+)
+```
+
+Run the runnable HuggingFace Llama demo:
+```bash
+python examples/hf_llama_disaggregated_demo.py
+```
+
+---
+
 ## Running Unit Tests
 
 We enforce strict open-source standards with 100% type annotations and Ruff linting:
 
 ```bash
-# Run the test suite
-pytest
+# Run the test suite (all 12 numerical & integration tests)
+pytest tests/test_online_softmax.py tests/test_context_server.py tests/test_decode_worker.py tests/test_hf_model.py -v
 
 # Audit code formatting and linting
-ruff check .
-ruff format --check .
+ruff check frontiersplit tests examples
+ruff format --check frontiersplit tests examples
 ```
 
 ---
@@ -144,19 +174,23 @@ ruff format --check .
 
 ```text
 FrontierSplit/
-├── pyproject.toml                # Open-source packaging and Ruff configuration
-├── README.md                     # Project overview and quickstart
+├── pyproject.toml                         # Packaging, dependencies, and Ruff configuration
+├── README.md                              # Project overview, math formulation, and guides
 ├── frontiersplit/
-│   ├── online_softmax.py         # Pure PyTorch Online Softmax merging kernel
-│   ├── context_server.py         # Static Prompt Server and persistent TCP client
-│   └── decode_worker.py          # Decode Worker with DisaggregatedAttention module
+│   ├── __init__.py                        # Public package exports
+│   ├── online_softmax.py                  # Pure PyTorch Online Softmax merging kernel
+│   ├── context_server.py                  # Context Server and persistent TCP client
+│   ├── decode_worker.py                   # Decode Worker with DisaggregatedAttention module
+│   └── hf_model.py                        # HuggingFace DisaggregatedModel wrapper & patcher
 ├── examples/
-│   └── disaggregated_demo.py     # Runnable disaggregated inference demonstration
+│   ├── disaggregated_demo.py              # Quickstart: 10k-token offload with 8 KB payloads
+│   └── hf_llama_disaggregated_demo.py     # End-to-end HuggingFace Llama generation demo
 ├── tests/
-│   ├── test_online_softmax.py    # Numerical equivalence tests against native attention
-│   ├── test_context_server.py    # TCP socket lifecycle & partial query tests
-│   └── test_decode_worker.py     # Multi-step autoregressive decode simulation
-└── experiments/                  # Historical empirical benchmarks (8-Node Mixtral FP16)
+│   ├── test_online_softmax.py             # Online Softmax mathematical equivalence tests
+│   ├── test_context_server.py             # TCP socket lifecycle & partial query tests
+│   ├── test_decode_worker.py              # Multi-step autoregressive decode simulation
+│   └── test_hf_model.py                   # HuggingFace sync/async bit-for-bit generation tests
+└── experiments/                           # Historical empirical benchmarks (8-Node Mixtral FP16)
 ```
 
 ---

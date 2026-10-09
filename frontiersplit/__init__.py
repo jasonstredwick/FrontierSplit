@@ -10,6 +10,10 @@ from frontiersplit.decode_worker import (
     DisaggregatedAttention,
     LocalOutputKVCache,
 )
+from frontiersplit.hf_model import (
+    DisaggregatedAttentionPatcher,
+    DisaggregatedModel,
+)
 from frontiersplit.online_softmax import (
     PartialAttentionChunk,
     compute_partial_attention,
@@ -27,6 +31,8 @@ __all__ = [
     "ContextStore",
     "DecodeWorker",
     "DisaggregatedAttention",
+    "DisaggregatedAttentionPatcher",
+    "DisaggregatedModel",
     "LocalOutputKVCache",
     "PartialAttentionChunk",
     "compute_partial_attention",

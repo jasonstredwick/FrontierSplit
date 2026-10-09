@@ -7,11 +7,13 @@ attention on demand for decode workers via Online Softmax.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
 import socket
 import struct
+import threading
 from typing import Any
 
 import torch
@@ -68,6 +70,37 @@ async def read_context_frame_async(
     meta = json.loads(meta_bytes.decode("utf-8"))
 
     payload = await reader.readexactly(payload_len) if payload_len > 0 else b""
+    return msg_type, meta, payload
+
+
+def read_context_frame_sync(
+    sock: socket.socket,
+) -> tuple[int, dict[str, Any], bytes]:
+    """Synchronously reads a full binary frame from a raw socket."""
+
+    def recv_exact(n: int) -> bytes:
+        buf = bytearray(n)
+        view = memoryview(buf)
+        pos = 0
+        while pos < n:
+            nbytes = sock.recv_into(view[pos:])
+            if nbytes == 0:
+                raise ConnectionResetError("Socket closed while reading binary frame")
+            pos += nbytes
+        return bytes(buf)
+
+    header_bytes = recv_exact(CONTEXT_HEADER_SIZE)
+    magic, msg_type, _, meta_len, payload_len = struct.unpack(
+        CONTEXT_HEADER_FORMAT, header_bytes
+    )
+    if magic != CONTEXT_MAGIC:
+        raise ValueError(
+            f"Invalid protocol magic: expected {CONTEXT_MAGIC!r}, got {magic!r}"
+        )
+
+    meta_bytes = recv_exact(meta_len) if meta_len > 0 else b"{}"
+    meta = json.loads(meta_bytes.decode("utf-8"))
+    payload = recv_exact(payload_len) if payload_len > 0 else b""
     return msg_type, meta, payload
 
 
@@ -167,6 +200,9 @@ class ContextServer:
         self.device = torch.device(device)
         self.store = ContextStore()
         self._server: asyncio.Server | None = None
+        self._thread: threading.Thread | None = None
+        self._thread_loop: asyncio.AbstractEventLoop | None = None
+        self._active_tasks: set[asyncio.Task[Any]] = set()
 
     def register_prompt(
         self,
@@ -214,6 +250,10 @@ class ContextServer:
         sock = writer.get_extra_info("socket")
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_tasks.add(current_task)
 
         try:
             while not reader.at_eof():
@@ -282,11 +322,16 @@ class ContextServer:
                     writer.write(resp)
                     await writer.drain()
 
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
             logger.debug("Client connection terminated: %s", e)
         finally:
-            writer.close()
-            await writer.wait_closed()
+            if current_task is not None:
+                self._active_tasks.discard(current_task)
+            with contextlib.suppress(Exception):
+                writer.close()
+                await writer.wait_closed()
 
     async def start_server(
         self, host: str = "127.0.0.1", port: int = 50055
@@ -296,10 +341,68 @@ class ContextServer:
         return self._server
 
     async def stop_server(self) -> None:
-        """Stops the TCP server."""
+        """Stops the TCP server and waits for client tasks to finish."""
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
+            self._server = None
+
+        if self._active_tasks:
+            for t in list(self._active_tasks):
+                t.cancel()
+            await asyncio.gather(*list(self._active_tasks), return_exceptions=True)
+            self._active_tasks.clear()
+        await asyncio.sleep(0)
+
+    def start_in_thread(self, host: str = "127.0.0.1", port: int = 0) -> int:
+        """Starts the Context Server in a dedicated background daemon thread.
+
+        Useful for embedded testing and single-process demonstrations without
+        blocking the main thread's synchronous PyTorch forward passes.
+
+        Args:
+            host: IP address to bind (defaults to "127.0.0.1").
+            port: Port to bind (0 for automatic dynamic free port).
+
+        Returns:
+            The bound TCP port.
+        """
+        ready = threading.Event()
+        server_port: list[int] = []
+
+        def _runner() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._thread_loop = loop
+
+            async def _start() -> None:
+                srv = await self.start_server(host, port)
+                sock = srv.sockets[0]
+                server_port.append(sock.getsockname()[1])
+                ready.set()
+
+            loop.run_until_complete(_start())
+            loop.run_forever()
+
+        self._thread = threading.Thread(target=_runner, daemon=True)
+        self._thread.start()
+        ready.wait(timeout=10.0)
+        return server_port[0]
+
+    def stop_thread(self) -> None:
+        """Stops the background server thread and closes active server sockets."""
+        if self._thread_loop is not None and self._thread_loop.is_running():
+
+            async def _cleanup() -> None:
+                await self.stop_server()
+                assert self._thread_loop is not None
+                self._thread_loop.stop()
+
+            fut = asyncio.run_coroutine_threadsafe(_cleanup(), self._thread_loop)
+            with contextlib.suppress(Exception):
+                fut.result(timeout=3.0)
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
 
 
 class ContextClient:
@@ -313,7 +416,16 @@ class ContextClient:
         self.timeout = timeout
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
+        self._sync_sock: socket.socket | None = None
         self._lock = asyncio.Lock()
+
+    def connect_sync(self) -> socket.socket:
+        """Establishes or returns a synchronous persistent TCP socket."""
+        if self._sync_sock is None or self._sync_sock.fileno() == -1:
+            self._sync_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sync_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self._sync_sock.connect((self.host, self.port))
+        return self._sync_sock
 
     async def connect(self) -> None:
         """Establishes a persistent TCP connection to the Context Server."""
@@ -325,7 +437,11 @@ class ContextClient:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     async def close(self) -> None:
-        """Closes the TCP connection."""
+        """Closes both async and sync TCP connections."""
+        if self._sync_sock is not None:
+            self._sync_sock.close()
+            self._sync_sock = None
+
         if self.writer is not None:
             self.writer.close()
             await self.writer.wait_closed()
@@ -387,6 +503,69 @@ class ContextClient:
                 )
             return deserialize_chunk(resp_payload)
 
+    def query_partial_attention_sync(
+        self,
+        session_id: str,
+        layer_idx: int,
+        q: torch.Tensor,
+        scale: float | None = None,
+    ) -> PartialAttentionChunk:
+        """Queries the remote Context Server synchronously over raw TCP socket."""
+        sock = self.connect_sync()
+        payload = serialize_tensor(q)
+        frame = pack_context_frame(
+            MSG_QUERY_PARTIAL_REQ,
+            {"session_id": session_id, "layer_idx": layer_idx, "scale": scale},
+            payload,
+        )
+        sock.sendall(frame)
+        msg_type, meta, resp_payload = read_context_frame_sync(sock)
+        if meta.get("status") != "ok":
+            raise RuntimeError(
+                f"Context Server error: {meta.get('error', 'unknown error')}"
+            )
+        return deserialize_chunk(resp_payload)
+
+    def close_sync(self) -> None:
+        """Synchronously closes the persistent TCP socket."""
+        if self._sync_sock is not None:
+            self._sync_sock.close()
+            self._sync_sock = None
+
+    def register_prompt_sync(
+        self,
+        session_id: str,
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> bool:
+        """Synchronously registers static prompt KV cache for a layer over TCP."""
+        sock = self.connect_sync()
+        buf = io.BytesIO()
+        torch.save({"k": k.contiguous(), "v": v.contiguous()}, buf)
+        payload = buf.getvalue()
+
+        frame = pack_context_frame(
+            MSG_REGISTER_PROMPT_REQ,
+            {"session_id": session_id, "layer_idx": layer_idx},
+            payload,
+        )
+        sock.sendall(frame)
+        msg_type, meta, _ = read_context_frame_sync(sock)
+        return meta.get("status") == "ok"
+
+    def release_session_sync(self, session_id: str) -> bool:
+        """Synchronously releases the prompt KV cache on the remote Context Server."""
+        sock = self.connect_sync()
+        frame = pack_context_frame(
+            MSG_RELEASE_SESSION_REQ,
+            {"session_id": session_id},
+            b"",
+        )
+        sock.sendall(frame)
+        msg_type, meta, _ = read_context_frame_sync(sock)
+        return bool(meta.get("evicted", False))
+
     async def release_session(self, session_id: str) -> bool:
         """Releases the prompt KV cache on the remote Context Server."""
         async with self._lock:
@@ -402,7 +581,7 @@ class ContextClient:
             await self.writer.drain()
 
             msg_type, meta, _ = await read_context_frame_async(self.reader)
-            return meta.get("evicted", False)
+            return bool(meta.get("evicted", False))
 
 
 __all__ = [
@@ -413,6 +592,7 @@ __all__ = [
     "deserialize_tensor",
     "pack_context_frame",
     "read_context_frame_async",
+    "read_context_frame_sync",
     "serialize_chunk",
     "serialize_tensor",
 ]
