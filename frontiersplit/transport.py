@@ -23,10 +23,14 @@ from frontiersplit.protocol import (
     MSG_PONG,
     MSG_FORWARD_ASYNC_REQ,
     MSG_FORWARD_ACK,
+    MSG_FORWARD_CHUNK_REQ,
+    MSG_FORWARD_CHUNK_RESP,
     MSG_RELEASE_SESSION_REQ,
     MSG_RELEASE_SESSION_RESP,
     BatchedActivationPacket,
     BatchedGenerationResponse,
+    ChunkActivationPacket,
+    ChunkGenerationResponse,
     ReleaseSessionPacket,
     ReleaseSessionResponse,
     pack_header,
@@ -360,15 +364,24 @@ class BinaryTransportServer:
                             writer.write(resp_frame)
                             await writer.drain()
 
-                elif msg_type == MSG_FORWARD_ASYNC_REQ:
+                elif msg_type in (MSG_FORWARD_ASYNC_REQ, MSG_FORWARD_CHUNK_REQ):
                     meta_bytes = json.dumps(meta).encode("utf-8")
-                    packet = BatchedActivationPacket.decode_binary(
-                        meta_bytes=meta_bytes,
-                        payload_bytes=payload,
-                        dtype_str=dtype_str,
-                        shape=shape,
-                        flags=flags,
-                    )
+                    if msg_type == MSG_FORWARD_CHUNK_REQ or "chunk_idx" in meta:
+                        packet = ChunkActivationPacket.decode_binary(
+                            meta_bytes=meta_bytes,
+                            payload_bytes=payload,
+                            dtype_str=dtype_str,
+                            shape=shape,
+                            flags=flags,
+                        )
+                    else:
+                        packet = BatchedActivationPacket.decode_binary(
+                            meta_bytes=meta_bytes,
+                            payload_bytes=payload,
+                            dtype_str=dtype_str,
+                            shape=shape,
+                            flags=flags,
+                        )
                     # Immediate acknowledgment back to sender so sender unblocks in <0.1 ms!
                     ack_header = pack_header(
                         msg_type=MSG_FORWARD_ACK,
@@ -383,9 +396,12 @@ class BinaryTransportServer:
                     if self.forward_handler is not None:
                         asyncio.create_task(self.forward_handler(packet))
 
-                elif msg_type == MSG_FORWARD_BATCHED_RESP:
+                elif msg_type in (MSG_FORWARD_BATCHED_RESP, MSG_FORWARD_CHUNK_RESP):
                     meta_bytes = json.dumps(meta).encode("utf-8")
-                    resp = BatchedGenerationResponse.decode_binary(meta_bytes)
+                    if msg_type == MSG_FORWARD_CHUNK_RESP or "next_token_id" in meta:
+                        resp = ChunkGenerationResponse.decode_binary(meta_bytes)
+                    else:
+                        resp = BatchedGenerationResponse.decode_binary(meta_bytes)
                     if self.response_handler is not None:
                         asyncio.create_task(self.response_handler(resp))
 

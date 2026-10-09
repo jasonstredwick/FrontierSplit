@@ -25,6 +25,10 @@ from frontiersplit.protocol import (
     ActivationPacket,
     BatchedActivationPacket,
     BatchedGenerationResponse,
+    ChunkActivationPacket,
+    ChunkGenerationResponse,
+    MSG_FORWARD_CHUNK_REQ,
+    MSG_FORWARD_CHUNK_RESP,
     GenerationResponse,
     ReleaseSessionPacket,
     ReleaseSessionResponse,
@@ -564,15 +568,15 @@ def create_worker_app(
                     return _forward
                 exp_mod.forward = types.MethodType(_make_static_forward(exp_mod), exp_mod)
 
-        # Ahead-of-Time JIT Graph Pre-compilation on TPU startup
+        # Ahead-of-Time JIT Graph Pre-compilation on TPU startup for static Chunk size C=16
         if resolved_device.startswith("xla"):
-            print(f"[Worker Stage {stage_id}] Ahead-of-Time JIT pre-compiling XLA static execution graphs...")
+            print(f"[Worker Stage {stage_id}] Ahead-of-Time JIT pre-compiling XLA static [16, {model_config.hidden_size}] execution graphs...")
             try:
                 with torch.no_grad():
-                    dummy_decode = torch.zeros((1, 1, model_config.hidden_size), dtype=torch.float16, device=resolved_device)
-                    pos_ids = torch.tensor([[0]], dtype=torch.long, device=resolved_device)
-                    pos_emb = rotary_emb(dummy_decode, position_ids=pos_ids) if rotary_emb is not None else None
-                    cur_h = dummy_decode
+                    dummy_chunk = torch.zeros((16, model_config.hidden_size), dtype=torch.float16, device=resolved_device)
+                    pos_ids = torch.arange(0, 16, dtype=torch.long, device=resolved_device)
+                    pos_emb = rotary_emb(dummy_chunk, position_ids=pos_ids) if rotary_emb is not None else None
+                    cur_h = dummy_chunk
                     for l in assigned_layers:
                         out = l(cur_h, position_ids=pos_ids, position_embeddings=pos_emb)
                         cur_h = out[0] if isinstance(out, tuple) else out
@@ -580,13 +584,13 @@ def create_worker_app(
                         if final_norm is not None:
                             cur_h = final_norm(cur_h)
                         if lm_head is not None:
-                            _ = lm_head(cur_h[:, -1, :])
+                            _ = lm_head(cur_h[0:1, :])
                     if is_first_stage and embed_tokens is not None:
-                        _ = embed_tokens(torch.tensor([[1]], device=resolved_device, dtype=torch.long))
+                        _ = embed_tokens(torch.zeros(16, device=resolved_device, dtype=torch.long))
 
                     import torch_xla.core.xla_model as xm
                     xm.mark_step()
-                    print(f"[Worker Stage {stage_id}] XLA static execution graphs successfully compiled into TPU HBM!")
+                    print(f"[Worker Stage {stage_id}] XLA static [16, {model_config.hidden_size}] execution graphs successfully compiled into TPU HBM!")
             except Exception as e:
                 print(f"[Worker Stage {stage_id}] Note: Ahead-of-time pre-compilation note: {e}")
 
@@ -1326,16 +1330,236 @@ def create_worker_app(
                     pass
             raise
 
+    async def do_forward_chunk(packet: ChunkActivationPacket) -> ChunkGenerationResponse:
+        """Executes a single atomic chunk of fixed size C (default 16 tokens) through assigned pipeline stages.
+        Guarantees strictly invariant [C, hidden_size] tensor shape everywhere with ZERO variable batch dimension B.
+        """
+        start_time = time.time()
+        chunk_size = packet.chunk_size
+        valid_tokens = packet.valid_tokens
+        chunk_idx = packet.chunk_idx
+        total_chunks = packet.total_chunks
+        is_final_chunk = (chunk_idx == total_chunks - 1) or (not packet.is_prefill)
+
+        try:
+            if use_real_model:
+                async with compute_lock:
+                    with torch.no_grad():
+                        if is_first_stage and packet.tokens:
+                            tok_t = torch.tensor(packet.tokens, device=resolved_device, dtype=torch.long)
+                            hidden_states = embed_tokens(tok_t)
+                        else:
+                            raw_bytes = packet.get_raw_bytes()
+                            if raw_bytes:
+                                dtype_obj = getattr(torch, packet.tensor_dtype, torch.float16)
+                                hidden_states = torch.frombuffer(
+                                    bytearray(raw_bytes), dtype=dtype_obj
+                                ).reshape(packet.tensor_shape).to(resolved_device, non_blocking=True)
+                            else:
+                                arr = packet.get_tensor()
+                                hidden_states = torch.from_numpy(arr).to(device=resolved_device, dtype=torch.float16)
+
+                        # Enforce invariant 2D shape [C, hidden_size]
+                        hidden_states = hidden_states.view(chunk_size, -1)
+
+                        # Look up session cache in PagedBlockPool
+                        cache = kv_store.get_or_create(packet.request_id, prompt_len=total_chunks * chunk_size)
+                        if hasattr(cache, "pool") and cache.pool is not None:
+                            if len(cache.block_table) <= chunk_idx:
+                                needed = chunk_idx + 1 - len(cache.block_table)
+                                cache.block_table.extend(cache.pool.allocate(needed))
+                            blk_id = cache.block_table[chunk_idx]
+                        else:
+                            blk_id = 0
+
+                        start_pos = chunk_idx * chunk_size
+                        pos_ids = torch.arange(start_pos, start_pos + chunk_size, device=resolved_device, dtype=torch.long)
+                        cos, sin = rotary_emb(hidden_states, pos_ids) if rotary_emb is not None else (None, None)
+
+                        for layer in assigned_layers:
+                            residual = hidden_states
+                            hidden_norm = layer.input_layernorm(hidden_states)
+
+                            num_q_heads = layer.self_attn.config.num_attention_heads
+                            num_kv_heads = layer.self_attn.config.num_key_value_heads
+                            head_dim = layer.self_attn.head_dim
+                            layer_idx = layer.self_attn.layer_idx
+
+                            # Batched Q, K, V projections for Chunk [C, 4096]
+                            q = layer.self_attn.q_proj(hidden_norm).view(chunk_size, num_q_heads, head_dim).transpose(0, 1)
+                            k = layer.self_attn.k_proj(hidden_norm).view(chunk_size, num_kv_heads, head_dim).transpose(0, 1)
+                            v = layer.self_attn.v_proj(hidden_norm).view(chunk_size, num_kv_heads, head_dim).transpose(0, 1)
+
+                            if cos is not None and sin is not None:
+                                q, k = apply_rotary_pos_emb(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
+                                q = q.squeeze(0)
+                                k = k.squeeze(0)
+
+                            if hasattr(cache, "pool") and cache.pool is not None:
+                                # Write key and value directly into physical block blk_id
+                                cache.pool.k_pool[layer_idx, blk_id, :] = k.permute(1, 0, 2)
+                                cache.pool.v_pool[layer_idx, blk_id, :] = v.permute(1, 0, 2)
+
+                                active_blks = cache.block_table[:chunk_idx + 1]
+                                k_blks = cache.pool.k_pool[layer_idx, active_blks]
+                                v_blks = cache.pool.v_pool[layer_idx, active_blks]
+
+                                total_k = (chunk_idx + 1) * chunk_size
+                                k_all = k_blks.reshape(total_k, num_kv_heads, head_dim).permute(1, 0, 2)
+                                v_all = v_blks.reshape(total_k, num_kv_heads, head_dim).permute(1, 0, 2)
+
+                                num_kv_groups = num_q_heads // num_kv_heads
+                                if num_kv_groups > 1:
+                                    k_all = k_all.repeat_interleave(num_kv_groups, dim=0)
+                                    v_all = v_all.repeat_interleave(num_kv_groups, dim=0)
+
+                                q_idx = torch.arange(start_pos, start_pos + chunk_size, device=resolved_device).view(chunk_size, 1)
+                                k_idx = torch.arange(total_k, device=resolved_device).view(1, total_k)
+                                valid_limit = start_pos + valid_tokens - 1
+                                mask = torch.where((k_idx <= q_idx) & (k_idx <= valid_limit), 0.0, -10000.0).view(1, 1, chunk_size, total_k).to(dtype=q.dtype)
+
+                                attn_out = F.scaled_dot_product_attention(q.unsqueeze(0), k_all.unsqueeze(0), v_all.unsqueeze(0), attn_mask=mask)
+                                attn_out = attn_out.squeeze(0).transpose(0, 1).reshape(chunk_size, -1)
+                            else:
+                                attn_out = F.scaled_dot_product_attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
+                                attn_out = attn_out.squeeze(0).transpose(0, 1).reshape(chunk_size, -1)
+
+                            hidden_states = residual + layer.self_attn.o_proj(attn_out)
+
+                            normed = layer.post_attention_layernorm(hidden_states)
+                            moe_block = getattr(layer, "block_sparse_moe", getattr(layer, "mlp", None))
+                            if moe_block is not None:
+                                moe_out = moe_block(normed)
+                                moe_out = moe_out[0] if isinstance(moe_out, tuple) else moe_out
+                                hidden_states = hidden_states + moe_out
+
+                        if resolved_device.startswith("xla"):
+                            try:
+                                import torch_xla.core.xla_model as xm
+                                xm.mark_step()
+                            except ImportError:
+                                pass
+
+                        next_tok_id = None
+                        if is_final_stage:
+                            if final_norm is not None:
+                                hidden_states = final_norm(hidden_states)
+                            if is_final_chunk and lm_head is not None:
+                                last_tok_idx = max(0, min(valid_tokens - 1, chunk_size - 1))
+                                logits = lm_head(hidden_states[last_tok_idx:last_tok_idx + 1, :])
+                                next_tok_id = int(torch.argmax(logits, dim=-1).item())
+
+                stage_compute_ms = (time.time() - start_time) * 1000
+                timings = dict(packet.stage_timings)
+                timings[f"stage_{stage_id}_compute_ms"] = stage_compute_ms
+
+                if not is_final_stage:
+                    next_packet = packet.model_copy()
+                    next_packet.stage_id = stage_id + 1
+                    next_packet.tokens = None
+                    next_packet.stage_timings = timings
+                    next_packet.tensor_shape = [chunk_size, hidden_states.shape[-1]]
+
+                    raw_bytes = hidden_states.contiguous().cpu().view(torch.uint8).numpy().tobytes()
+                    if downstream_client is not None:
+                        await downstream_client.send_async_forward(next_packet, raw_tensor_bytes=raw_bytes)
+                        return ChunkGenerationResponse(
+                            request_id=packet.request_id,
+                            chunk_idx=chunk_idx,
+                            is_final_chunk=is_final_chunk,
+                            stage_timings=timings,
+                        )
+                    else:
+                        resp = requests.post(f"{downstream_url}/forward_chunk", json=next_packet.model_dump(), timeout=600)
+                        return ChunkGenerationResponse.model_validate(resp.json())
+
+                else:
+                    is_finished = False
+                    finish_reason = None
+                    if next_tok_id is not None:
+                        eos_id = getattr(model_config, "eos_token_id", None)
+                        if eos_id is not None and next_tok_id == eos_id:
+                            is_finished = True
+                            finish_reason = "stop"
+
+                    chunk_resp = ChunkGenerationResponse(
+                        request_id=packet.request_id,
+                        chunk_idx=chunk_idx,
+                        is_final_chunk=is_final_chunk,
+                        next_token_id=next_tok_id,
+                        is_finished=is_finished,
+                        finish_reason=finish_reason,
+                        stage_timings=timings,
+                    )
+                    if packet.reply_to:
+                        if packet.reply_to not in reply_clients:
+                            reply_clients[packet.reply_to] = BinaryTransportClient(packet.reply_to)
+                        await reply_clients[packet.reply_to].send_response_frame(chunk_resp)
+                    return chunk_resp
+
+            else:
+                # Synthetic mode for unit tests
+                stage_compute_ms = (time.time() - start_time) * 1000
+                timings = dict(packet.stage_timings)
+                timings[f"stage_{stage_id}_compute_ms"] = stage_compute_ms
+                next_tok_id = 42 if is_final_chunk else None
+                chunk_resp = ChunkGenerationResponse(
+                    request_id=packet.request_id,
+                    chunk_idx=chunk_idx,
+                    is_final_chunk=is_final_chunk,
+                    next_token_id=next_tok_id,
+                    stage_timings=timings,
+                )
+                if not is_final_stage:
+                    next_packet = packet.model_copy()
+                    next_packet.stage_id = stage_id + 1
+                    next_packet.stage_timings = timings
+                    if downstream_client is not None:
+                        await downstream_client.send_async_forward(next_packet)
+                    return chunk_resp
+                else:
+                    if packet.reply_to:
+                        if packet.reply_to not in reply_clients:
+                            reply_clients[packet.reply_to] = BinaryTransportClient(packet.reply_to)
+                        await reply_clients[packet.reply_to].send_response_frame(chunk_resp)
+                    return chunk_resp
+
+        except Exception as e:
+            if is_final_stage and packet.reply_to:
+                err_resp = ChunkGenerationResponse(
+                    request_id=packet.request_id,
+                    chunk_idx=chunk_idx,
+                    is_final_chunk=is_final_chunk,
+                    is_finished=True,
+                    finish_reason=f"error: {e}",
+                )
+                try:
+                    if packet.reply_to not in reply_clients:
+                        reply_clients[packet.reply_to] = BinaryTransportClient(packet.reply_to)
+                    await reply_clients[packet.reply_to].send_response_frame(err_resp)
+                except Exception:
+                    pass
+            raise
+
+    async def unified_forward_handler(packet: Any):
+        if isinstance(packet, ChunkActivationPacket):
+            return await do_forward_chunk(packet)
+        return await do_forward_batched(packet)
+
     @app.post("/forward_batched", response_model=BatchedGenerationResponse)
     async def forward_batched(packet: BatchedActivationPacket):
         return await do_forward_batched(packet)
+
+    @app.post("/forward_chunk", response_model=ChunkGenerationResponse)
+    async def forward_chunk(packet: ChunkActivationPacket):
+        return await do_forward_chunk(packet)
 
     binary_server = None
     if tcp_port is not None:
         binary_server = BinaryTransportServer(
             host="0.0.0.0",
             port=tcp_port,
-            forward_handler=do_forward_batched,
+            forward_handler=unified_forward_handler,
             release_handler=do_release_sessions,
         )
 

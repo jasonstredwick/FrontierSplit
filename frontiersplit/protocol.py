@@ -25,6 +25,8 @@ MSG_PING = 5
 MSG_PONG = 6
 MSG_FORWARD_ASYNC_REQ = 7
 MSG_FORWARD_ACK = 8
+MSG_FORWARD_CHUNK_REQ = 9
+MSG_FORWARD_CHUNK_RESP = 10
 
 FLAG_IS_PREFILL = 0x01
 FLAG_USE_KV_CACHE = 0x02
@@ -406,3 +408,187 @@ class ReleaseSessionResponse(BaseModel):
             released_count=meta.get("released_count", 0),
             active_sessions=meta.get("active_sessions", 0),
         )
+
+
+class ChunkActivationPacket(BaseModel):
+    """Network packet representing an atomic chunk of tokens of fixed size C (default 16).
+    Shape of hidden_states is always strictly [chunk_size, hidden_size] with ZERO variable batch dimension B.
+    """
+    request_id: str
+    chunk_idx: int = 0          # Chunk index d in [0 .. D-1]
+    total_chunks: int = 1       # D = ceil(S / C)
+    chunk_size: int = 16        # C = 16
+    valid_tokens: int = 16      # Number of valid tokens in chunk (1..C)
+    is_prefill: bool = True
+    stage_id: int = 0
+    tokens: Optional[List[int]] = None   # Token IDs of length C (passed to Stage 0 for embedding)
+    tensor_shape: List[int] = Field(default_factory=lambda: [16, 4096])
+    tensor_dtype: str = "float16"
+    tensor_bytes_b64: Optional[str] = None
+    timestamp_sent_ms: float = Field(default_factory=lambda: time.time() * 1000)
+    stage_timings: Dict[str, float] = Field(default_factory=dict)
+    reply_to: Optional[str] = None
+    temperature: float = 0.0
+    max_tokens: int = 128
+    _raw_tensor_bytes: Optional[bytes] = None
+
+    def set_raw_tensor(self, raw_bytes: bytes, shape: List[int], dtype_str: str = "float16") -> None:
+        self._raw_tensor_bytes = raw_bytes
+        self.tensor_shape = shape
+        self.tensor_dtype = dtype_str
+
+    def get_raw_bytes(self) -> bytes:
+        if self._raw_tensor_bytes is not None:
+            return self._raw_tensor_bytes
+        if self.tensor_bytes_b64:
+            return base64.b64decode(self.tensor_bytes_b64.encode("ascii"))
+        return b""
+
+    def set_tensor(self, arr: Any) -> None:
+        if hasattr(arr, "contiguous") and hasattr(arr, "cpu"):
+            self.tensor_shape = list(arr.shape)
+            self.tensor_dtype = str(arr.dtype).replace("torch.", "")
+            cpu_t = arr.contiguous().cpu()
+            try:
+                import torch
+                raw_bytes = cpu_t.view(torch.uint8).numpy().tobytes()
+            except Exception:
+                raw_bytes = cpu_t.numpy().tobytes()
+        else:
+            self.tensor_shape = list(arr.shape)
+            self.tensor_dtype = str(arr.dtype)
+            raw_bytes = arr.tobytes()
+
+        self._raw_tensor_bytes = raw_bytes
+        self.tensor_bytes_b64 = base64.b64encode(raw_bytes).decode("ascii")
+
+    def get_tensor(self) -> np.ndarray:
+        raw_bytes = self.get_raw_bytes()
+        if not raw_bytes:
+            return np.zeros(self.tensor_shape, dtype=self.tensor_dtype)
+        return np.frombuffer(raw_bytes, dtype=self.tensor_dtype).reshape(self.tensor_shape)
+
+    def encode_binary(self, raw_tensor_bytes: Optional[bytes] = None, msg_type: Optional[int] = None) -> bytes:
+        payload = raw_tensor_bytes if raw_tensor_bytes is not None else self.get_raw_bytes()
+        meta = {
+            "request_id": self.request_id,
+            "chunk_idx": self.chunk_idx,
+            "total_chunks": self.total_chunks,
+            "chunk_size": self.chunk_size,
+            "valid_tokens": self.valid_tokens,
+            "is_prefill": self.is_prefill,
+            "stage_id": self.stage_id,
+            "tokens": self.tokens,
+            "tensor_shape": self.tensor_shape,
+            "tensor_dtype": self.tensor_dtype,
+            "timestamp_sent_ms": self.timestamp_sent_ms,
+            "stage_timings": self.stage_timings,
+            "reply_to": self.reply_to,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+        flags = 0
+        if self.is_prefill:
+            flags |= FLAG_IS_PREFILL
+        flags |= FLAG_USE_KV_CACHE
+
+        dtype_code = DTYPE_TO_CODE.get(self.tensor_dtype, 1)
+        resolved_msg_type = msg_type or MSG_FORWARD_CHUNK_REQ
+        header = pack_header(
+            msg_type=resolved_msg_type,
+            flags=flags,
+            meta_len=len(meta_bytes),
+            payload_len=len(payload),
+            dtype_code=dtype_code,
+            shape=self.tensor_shape,
+        )
+        return header + meta_bytes + payload
+
+    @classmethod
+    def decode_binary(
+        cls,
+        meta_bytes: bytes,
+        payload_bytes: bytes,
+        dtype_str: str,
+        shape: List[int],
+        flags: int = 0,
+    ) -> ChunkActivationPacket:
+        meta = json.loads(meta_bytes.decode("utf-8")) if meta_bytes else {}
+        packet = cls(
+            request_id=meta.get("request_id", ""),
+            chunk_idx=meta.get("chunk_idx", 0),
+            total_chunks=meta.get("total_chunks", 1),
+            chunk_size=meta.get("chunk_size", 16),
+            valid_tokens=meta.get("valid_tokens", 16),
+            is_prefill=bool(flags & FLAG_IS_PREFILL) or meta.get("is_prefill", True),
+            stage_id=meta.get("stage_id", 0),
+            tokens=meta.get("tokens"),
+            tensor_shape=meta.get("tensor_shape", shape),
+            tensor_dtype=meta.get("tensor_dtype", dtype_str),
+            timestamp_sent_ms=meta.get("timestamp_sent_ms", time.time() * 1000),
+            stage_timings=meta.get("stage_timings", {}),
+            reply_to=meta.get("reply_to"),
+            temperature=meta.get("temperature", 0.0),
+            max_tokens=meta.get("max_tokens", 128),
+        )
+        packet.set_raw_tensor(payload_bytes, packet.tensor_shape, packet.tensor_dtype)
+        return packet
+
+    @classmethod
+    def from_binary_frame(cls, frame_bytes: bytes) -> ChunkActivationPacket:
+        if len(frame_bytes) < HEADER_SIZE:
+            raise ValueError(f"Frame length {len(frame_bytes)} is less than header size {HEADER_SIZE}")
+        hdr = unpack_header(frame_bytes[:HEADER_SIZE])
+        meta_end = HEADER_SIZE + hdr["meta_len"]
+        meta_bytes = frame_bytes[HEADER_SIZE:meta_end]
+        payload_bytes = frame_bytes[meta_end : meta_end + hdr["payload_len"]]
+        dtype_str = CODE_TO_DTYPE.get(hdr["dtype_code"], "float16")
+        shape = hdr["shape"]
+        return cls.decode_binary(meta_bytes, payload_bytes, dtype_str, shape, flags=hdr["flags"])
+
+
+class ChunkGenerationResponse(BaseModel):
+    """Output packet generated by the final stage for a chunk step."""
+    request_id: str
+    chunk_idx: int
+    is_final_chunk: bool
+    next_token_id: Optional[int] = None
+    is_finished: bool = False
+    finish_reason: Optional[str] = None
+    stage_timings: Dict[str, float] = Field(default_factory=dict)
+
+    def encode_binary(self) -> bytes:
+        meta = {
+            "request_id": self.request_id,
+            "chunk_idx": self.chunk_idx,
+            "is_final_chunk": self.is_final_chunk,
+            "next_token_id": self.next_token_id,
+            "is_finished": self.is_finished,
+            "finish_reason": self.finish_reason,
+            "stage_timings": self.stage_timings,
+        }
+        meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+        header = pack_header(
+            msg_type=MSG_FORWARD_CHUNK_RESP,
+            flags=0,
+            meta_len=len(meta_bytes),
+            payload_len=0,
+            dtype_code=0,
+            shape=None,
+        )
+        return header + meta_bytes
+
+    @classmethod
+    def decode_binary(cls, meta_bytes: bytes) -> ChunkGenerationResponse:
+        meta = json.loads(meta_bytes.decode("utf-8"))
+        return cls(
+            request_id=meta.get("request_id", ""),
+            chunk_idx=meta.get("chunk_idx", 0),
+            is_final_chunk=meta.get("is_final_chunk", False),
+            next_token_id=meta.get("next_token_id"),
+            is_finished=meta.get("is_finished", False),
+            finish_reason=meta.get("finish_reason"),
+            stage_timings=meta.get("stage_timings", {}),
+        )
+
