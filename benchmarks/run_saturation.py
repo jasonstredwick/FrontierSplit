@@ -60,8 +60,8 @@ async def dispatch_single_request(
     max_tokens: int,
     stream_id: int,
 ) -> Dict[str, Any]:
-    """Dispatch a single chat completion request and measure exact latency and tokens."""
-    url = f"{base_url.rstrip('/')}/chat/completions"
+    base = base_url.rstrip("/")
+    url = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
