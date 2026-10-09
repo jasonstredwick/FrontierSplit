@@ -208,7 +208,10 @@ class WorkerKVCacheStore:
                 if model_config is not None
                 else 8
             )
-            head_dim = getattr(model_config, "head_dim", 128) if model_config is not None else 128
+            head_dim = (
+                getattr(model_config, "head_dim", None)
+                or (model_config.hidden_size // model_config.num_attention_heads if model_config is not None and hasattr(model_config, "hidden_size") else 128)
+            )
             try:
                 self.block_pool = PagedBlockPool(
                     num_layers=num_layers,
@@ -1372,14 +1375,13 @@ def create_worker_app(
                         pos_ids = torch.arange(start_pos, start_pos + chunk_size, device=resolved_device, dtype=torch.long).unsqueeze(0)
                         cos, sin = rotary_emb(hidden_states.unsqueeze(0), pos_ids) if rotary_emb is not None else (None, None)
 
-                        for layer in assigned_layers:
+                        for local_layer_idx, layer in enumerate(assigned_layers):
                             residual = hidden_states
                             hidden_norm = layer.input_layernorm(hidden_states)
 
                             num_q_heads = layer.self_attn.config.num_attention_heads
                             num_kv_heads = layer.self_attn.config.num_key_value_heads
                             head_dim = layer.self_attn.head_dim
-                            layer_idx = layer.self_attn.layer_idx
 
                             # Batched Q, K, V projections for Chunk [C, 4096]
                             q = layer.self_attn.q_proj(hidden_norm).view(chunk_size, num_q_heads, head_dim).transpose(0, 1)
@@ -1397,12 +1399,12 @@ def create_worker_app(
                                         needed = chunk_idx + 1 - len(cache.block_table)
                                         cache.block_table.extend(cache.pool.allocate(needed))
                                     blk_id = cache.block_table[chunk_idx]
-                                    cache.pool.k_pool[layer_idx, blk_id, :] = k.permute(1, 0, 2)
-                                    cache.pool.v_pool[layer_idx, blk_id, :] = v.permute(1, 0, 2)
+                                    cache.pool.k_pool[local_layer_idx, blk_id, :] = k.permute(1, 0, 2)
+                                    cache.pool.v_pool[local_layer_idx, blk_id, :] = v.permute(1, 0, 2)
 
                                     active_blks = cache.block_table[:chunk_idx + 1]
-                                    k_blks = cache.pool.k_pool[layer_idx, active_blks]
-                                    v_blks = cache.pool.v_pool[layer_idx, active_blks]
+                                    k_blks = cache.pool.k_pool[local_layer_idx, active_blks]
+                                    v_blks = cache.pool.v_pool[local_layer_idx, active_blks]
 
                                     total_k = (chunk_idx + 1) * chunk_size
                                     k_all = k_blks.reshape(total_k, num_kv_heads, head_dim).permute(1, 0, 2)
@@ -1427,13 +1429,13 @@ def create_worker_app(
                                         needed = blk_idx + 1 - len(cache.block_table)
                                         cache.block_table.extend(cache.pool.allocate(needed))
                                     blk_id = cache.block_table[blk_idx]
-                                    cache.pool.k_pool[layer_idx, blk_id, slot_idx] = k[:, 0, :]
-                                    cache.pool.v_pool[layer_idx, blk_id, slot_idx] = v[:, 0, :]
+                                    cache.pool.k_pool[local_layer_idx, blk_id, slot_idx] = k[:, 0, :]
+                                    cache.pool.v_pool[local_layer_idx, blk_id, slot_idx] = v[:, 0, :]
 
                                     total_tokens = seq_pos + 1
                                     active_blks = cache.block_table[:blk_idx + 1]
-                                    k_blks = cache.pool.k_pool[layer_idx, active_blks].reshape(len(active_blks) * chunk_size, num_kv_heads, head_dim)
-                                    v_blks = cache.pool.v_pool[layer_idx, active_blks].reshape(len(active_blks) * chunk_size, num_kv_heads, head_dim)
+                                    k_blks = cache.pool.k_pool[local_layer_idx, active_blks].reshape(len(active_blks) * chunk_size, num_kv_heads, head_dim)
+                                    v_blks = cache.pool.v_pool[local_layer_idx, active_blks].reshape(len(active_blks) * chunk_size, num_kv_heads, head_dim)
                                     k_all = k_blks[:total_tokens].permute(1, 0, 2)
                                     v_all = v_blks[:total_tokens].permute(1, 0, 2)
 
