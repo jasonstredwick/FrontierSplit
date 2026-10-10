@@ -32,6 +32,12 @@ from frontiersplit.prefix_cache import (
     RadixNode,
     RadixPrefixCache,
 )
+from frontiersplit.routing import (
+    ConsistentHashRing,
+    ContextShardNode,
+    PrefixRouter,
+    ShardRoutingDecision,
+)
 
 __version__ = "0.2.0.dev0"
 
@@ -39,8 +45,10 @@ __all__ = [
     "ChatCompletionRequest",
     "ChatCompletionResponse",
     "ChatMessage",
+    "ConsistentHashRing",
     "ContextClient",
     "ContextServer",
+    "ContextShardNode",
     "ContextStore",
     "DecodeWorker",
     "DisaggregatedAttention",
@@ -48,8 +56,10 @@ __all__ = [
     "DisaggregatedModel",
     "LocalOutputKVCache",
     "PartialAttentionChunk",
+    "PrefixRouter",
     "RadixNode",
     "RadixPrefixCache",
+    "ShardRoutingDecision",
     "compute_partial_attention",
     "create_gateway_app",
     "finalize_attention",
