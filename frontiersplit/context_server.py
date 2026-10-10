@@ -22,6 +22,7 @@ from frontiersplit.online_softmax import (
     PartialAttentionChunk,
     compute_partial_attention,
 )
+from frontiersplit.prefix_cache import RadixPrefixCache
 
 logger = logging.getLogger("frontiersplit.context_server")
 
@@ -32,6 +33,8 @@ MSG_QUERY_PARTIAL_REQ = 0x22
 MSG_QUERY_PARTIAL_RESP = 0x23
 MSG_RELEASE_SESSION_REQ = 0x24
 MSG_RELEASE_SESSION_RESP = 0x25
+MSG_MATCH_PREFIX_REQ = 0x26
+MSG_MATCH_PREFIX_RESP = 0x27
 
 # 16-byte fixed binary header: MAGIC (2B), msg_type (1B), flags (1B), meta_len (4B), payload_len (8B)
 CONTEXT_HEADER_FORMAT = "<2sBB I Q"
@@ -183,6 +186,12 @@ class ContextStore:
             return True
         return False
 
+    def get_session_layers(
+        self, session_id: str
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
+        """Retrieves all layer KV caches for a given session."""
+        return self._store.get(session_id)
+
     @property
     def num_sessions(self) -> int:
         """Returns the number of active sessions stored in memory."""
@@ -196,9 +205,11 @@ class ContextStore:
 class ContextServer:
     """Server that computes partial attention against stored prompt KV caches."""
 
-    def __init__(self, device: str = "cpu") -> None:
+    def __init__(self, device: str = "cpu", max_cached_tokens: int = 1_000_000) -> None:
         self.device = torch.device(device)
         self.store = ContextStore()
+        self.prefix_cache = RadixPrefixCache(max_cached_tokens=max_cached_tokens)
+        self._session_tokens: dict[str, list[int]] = {}
         self._server: asyncio.Server | None = None
         self._thread: threading.Thread | None = None
         self._thread_loop: asyncio.AbstractEventLoop | None = None
@@ -210,14 +221,50 @@ class ContextServer:
         layer_idx: int,
         k: torch.Tensor,
         v: torch.Tensor,
+        token_ids: list[int] | None = None,
     ) -> None:
-        """Registers a static prompt KV cache in memory."""
+        """Registers a static prompt KV cache in memory and indexes into prefix cache."""
+        if token_ids is not None:
+            self._session_tokens[session_id] = token_ids
+
         self.store.register_prompt(
             session_id=session_id,
             layer_idx=layer_idx,
             k=k.to(self.device),
             v=v.to(self.device),
         )
+
+        # Index into RadixPrefixCache if token_ids are associated
+        if session_id in self._session_tokens:
+            toks = self._session_tokens[session_id]
+            layers = self.store.get_session_layers(session_id)
+            if layers is not None:
+                k_dict = {layer_i: kv[0] for layer_i, kv in layers.items()}
+                v_dict = {layer_i: kv[1] for layer_i, kv in layers.items()}
+                self.prefix_cache.insert(toks, k_dict, v_dict)
+
+    def match_prefix(
+        self,
+        token_ids: list[int],
+        target_session_id: str | None = None,
+    ) -> tuple[int, str | None]:
+        """Matches a token sequence against cached prefixes in the Radix tree.
+
+        Returns:
+            Tuple of (matched_length, bound_session_id).
+        """
+        nodes, matched_len = self.prefix_cache.match(token_ids)
+        if matched_len == 0:
+            return 0, None
+
+        session_id = (
+            target_session_id or f"prefix-{abs(hash(tuple(token_ids[:matched_len]))):x}"
+        )
+        k_by_layer, v_by_layer = self.prefix_cache.assemble_kv(nodes)
+        for layer_idx, k in k_by_layer.items():
+            self.store.register_prompt(session_id, layer_idx, k, v_by_layer[layer_idx])
+
+        return matched_len, session_id
 
     def query_partial_attention(
         self,
@@ -294,9 +341,14 @@ class ContextServer:
                 elif msg_type == MSG_REGISTER_PROMPT_REQ:
                     session_id = meta["session_id"]
                     layer_idx = meta["layer_idx"]
+                    token_ids = meta.get("token_ids")
                     tensors = torch.load(io.BytesIO(payload), weights_only=True)
                     self.register_prompt(
-                        session_id, layer_idx, tensors["k"], tensors["v"]
+                        session_id,
+                        layer_idx,
+                        tensors["k"],
+                        tensors["v"],
+                        token_ids=token_ids,
                     )
 
                     resp = pack_context_frame(
@@ -305,6 +357,25 @@ class ContextServer:
                             "status": "ok",
                             "session_id": session_id,
                             "layer_idx": layer_idx,
+                        },
+                        b"",
+                    )
+                    writer.write(resp)
+                    await writer.drain()
+
+                elif msg_type == MSG_MATCH_PREFIX_REQ:
+                    token_ids = meta["token_ids"]
+                    target_session_id = meta.get("session_id")
+                    matched_len, bound_session_id = self.match_prefix(
+                        token_ids=token_ids,
+                        target_session_id=target_session_id,
+                    )
+                    resp = pack_context_frame(
+                        MSG_MATCH_PREFIX_RESP,
+                        {
+                            "status": "ok",
+                            "matched_len": matched_len,
+                            "session_id": bound_session_id,
                         },
                         b"",
                     )
@@ -454,6 +525,7 @@ class ContextClient:
         layer_idx: int,
         k: torch.Tensor,
         v: torch.Tensor,
+        token_ids: list[int] | None = None,
     ) -> bool:
         """Registers a static prompt KV cache on the remote Context Server."""
         async with self._lock:
@@ -464,11 +536,11 @@ class ContextClient:
             torch.save({"k": k.contiguous(), "v": v.contiguous()}, buf)
             payload = buf.getvalue()
 
-            frame = pack_context_frame(
-                MSG_REGISTER_PROMPT_REQ,
-                {"session_id": session_id, "layer_idx": layer_idx},
-                payload,
-            )
+            meta: dict[str, Any] = {"session_id": session_id, "layer_idx": layer_idx}
+            if token_ids is not None:
+                meta["token_ids"] = token_ids
+
+            frame = pack_context_frame(MSG_REGISTER_PROMPT_REQ, meta, payload)
             self.writer.write(frame)
             await self.writer.drain()
 
@@ -538,6 +610,7 @@ class ContextClient:
         layer_idx: int,
         k: torch.Tensor,
         v: torch.Tensor,
+        token_ids: list[int] | None = None,
     ) -> bool:
         """Synchronously registers static prompt KV cache for a layer over TCP."""
         sock = self.connect_sync()
@@ -545,14 +618,59 @@ class ContextClient:
         torch.save({"k": k.contiguous(), "v": v.contiguous()}, buf)
         payload = buf.getvalue()
 
-        frame = pack_context_frame(
-            MSG_REGISTER_PROMPT_REQ,
-            {"session_id": session_id, "layer_idx": layer_idx},
-            payload,
-        )
+        meta: dict[str, Any] = {"session_id": session_id, "layer_idx": layer_idx}
+        if token_ids is not None:
+            meta["token_ids"] = token_ids
+
+        frame = pack_context_frame(MSG_REGISTER_PROMPT_REQ, meta, payload)
         sock.sendall(frame)
         msg_type, meta, _ = read_context_frame_sync(sock)
         return meta.get("status") == "ok"
+
+    async def match_prefix(
+        self,
+        token_ids: list[int],
+        session_id: str | None = None,
+    ) -> tuple[int, str | None]:
+        """Queries the Context Server for the longest matching cached token prefix."""
+        async with self._lock:
+            await self.connect()
+            assert self.writer is not None and self.reader is not None
+
+            meta: dict[str, Any] = {"token_ids": token_ids}
+            if session_id is not None:
+                meta["session_id"] = session_id
+
+            frame = pack_context_frame(MSG_MATCH_PREFIX_REQ, meta, b"")
+            self.writer.write(frame)
+            await self.writer.drain()
+
+            msg_type, resp_meta, _ = await read_context_frame_async(self.reader)
+            if resp_meta.get("status") != "ok":
+                raise RuntimeError(
+                    f"Context Server error: {resp_meta.get('error', 'unknown error')}"
+                )
+            return resp_meta.get("matched_len", 0), resp_meta.get("session_id")
+
+    def match_prefix_sync(
+        self,
+        token_ids: list[int],
+        session_id: str | None = None,
+    ) -> tuple[int, str | None]:
+        """Synchronously queries the Context Server for matching cached token prefix."""
+        sock = self.connect_sync()
+        meta: dict[str, Any] = {"token_ids": token_ids}
+        if session_id is not None:
+            meta["session_id"] = session_id
+
+        frame = pack_context_frame(MSG_MATCH_PREFIX_REQ, meta, b"")
+        sock.sendall(frame)
+        msg_type, resp_meta, _ = read_context_frame_sync(sock)
+        if resp_meta.get("status") != "ok":
+            raise RuntimeError(
+                f"Context Server error: {resp_meta.get('error', 'unknown error')}"
+            )
+        return resp_meta.get("matched_len", 0), resp_meta.get("session_id")
 
     def release_session_sync(self, session_id: str) -> bool:
         """Synchronously releases the prompt KV cache on the remote Context Server."""

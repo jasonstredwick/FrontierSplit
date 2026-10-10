@@ -22,6 +22,10 @@ from frontiersplit.online_softmax import (
     merge_two_partial_attentions,
     repeat_kv,
 )
+from frontiersplit.prefix_cache import (
+    RadixNode,
+    RadixPrefixCache,
+)
 
 __version__ = "0.2.0.dev0"
 
@@ -35,6 +39,8 @@ __all__ = [
     "DisaggregatedModel",
     "LocalOutputKVCache",
     "PartialAttentionChunk",
+    "RadixNode",
+    "RadixPrefixCache",
     "compute_partial_attention",
     "finalize_attention",
     "merge_partial_attentions",

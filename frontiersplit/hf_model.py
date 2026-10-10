@@ -118,12 +118,15 @@ class DisaggregatedAttentionPatcher:
             scale=scaling,
         )
 
-        # Compute local partial attention on volatile output tokens
-        local_chunk = compute_partial_attention(q, k, v, scale=scaling)
+        if past_key_values is None:
+            attn_out = finalize_attention(prompt_chunk)
+        else:
+            # Compute local partial attention on volatile output tokens
+            local_chunk = compute_partial_attention(q, k, v, scale=scaling)
 
-        # Merge via Online Softmax
-        merged = merge_two_partial_attentions(prompt_chunk, local_chunk)
-        attn_out = finalize_attention(merged)
+            # Merge via Online Softmax
+            merged = merge_two_partial_attentions(prompt_chunk, local_chunk)
+            attn_out = finalize_attention(merged)
 
         # 5. Reshape and project out
         attn_out = attn_out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
@@ -185,6 +188,7 @@ class DisaggregatedModel:
             next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
         prompt_len = input_ids.shape[1]
+        tokens = input_ids[0].tolist()
 
         # Offload each layer's static prompt KV cache to the remote Context Server
         for l_idx, layer in enumerate(prompt_cache.layers):
@@ -195,6 +199,7 @@ class DisaggregatedModel:
                 layer_idx=l_idx,
                 k=k_prompt,
                 v=v_prompt,
+                token_ids=tokens,
             )
 
         # Bind session to all patchers for subsequent decode steps
@@ -206,6 +211,7 @@ class DisaggregatedModel:
         input_ids: torch.Tensor,
         max_new_tokens: int = 32,
         session_id: str = "default-session",
+        use_prefix_cache: bool = True,
     ) -> list[int]:
         """Generates tokens synchronously using disaggregated attention merging.
 
@@ -213,12 +219,36 @@ class DisaggregatedModel:
             input_ids: Prompt token tensor of shape `[1, prompt_len]`.
             max_new_tokens: Maximum number of new tokens to generate.
             session_id: Session identifier.
+            use_prefix_cache: If True, checks for existing prefix cache on Context Server.
 
         Returns:
             List of generated token IDs (including the first generated token).
         """
-        # 1. Prefill and offload prompt KV
-        next_tok, prompt_len = self.prefill_and_offload(input_ids, session_id)
+        tokens = input_ids[0].tolist()
+        prompt_len = len(tokens)
+
+        # Check for warm prefix cache hit on Context Server
+        cache_hit = False
+        if use_prefix_cache:
+            matched_len, _ = self.context_client.match_prefix_sync(
+                tokens, session_id=session_id
+            )
+            if matched_len == prompt_len:
+                cache_hit = True
+
+        if cache_hit:
+            # 100% prefix cache hit: skip full prefill compute
+            self.set_active_session(session_id)
+            last_tok = input_ids[:, -1:]
+            pos_tensor = torch.tensor([[prompt_len - 1]], device=input_ids.device)
+            with torch.no_grad():
+                out_fast = self.model(
+                    last_tok, position_ids=pos_tensor, use_cache=False
+                )
+                next_tok = out_fast.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        else:
+            # 1. Prefill and offload prompt KV
+            next_tok, prompt_len = self.prefill_and_offload(input_ids, session_id)
 
         generated_tokens = [next_tok.item()]
         cur_tok = next_tok
@@ -263,6 +293,7 @@ class DisaggregatedModel:
             next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
         prompt_len = input_ids.shape[1]
+        tokens = input_ids[0].tolist()
 
         tasks = []
         for l_idx, layer in enumerate(prompt_cache.layers):
@@ -274,6 +305,7 @@ class DisaggregatedModel:
                     layer_idx=l_idx,
                     k=k_prompt,
                     v=v_prompt,
+                    token_ids=tokens,
                 )
             )
         await asyncio.gather(*tasks)
@@ -286,11 +318,43 @@ class DisaggregatedModel:
         input_ids: torch.Tensor,
         max_new_tokens: int = 32,
         session_id: str = "default-session",
+        use_prefix_cache: bool = True,
     ) -> list[int]:
-        """Asynchronously generates tokens using disaggregated attention merging."""
-        next_tok, prompt_len = await self.prefill_and_offload_async(
-            input_ids, session_id
-        )
+        """Asynchronously generates tokens using disaggregated attention merging.
+
+        Args:
+            input_ids: Prompt token tensor of shape `[1, prompt_len]`.
+            max_new_tokens: Maximum number of new tokens to generate.
+            session_id: Session identifier.
+            use_prefix_cache: If True, checks for existing prefix cache on Context Server.
+
+        Returns:
+            List of generated token IDs (including the first generated token).
+        """
+        tokens = input_ids[0].tolist()
+        prompt_len = len(tokens)
+
+        cache_hit = False
+        if use_prefix_cache:
+            matched_len, _ = await self.context_client.match_prefix(
+                tokens, session_id=session_id
+            )
+            if matched_len == prompt_len:
+                cache_hit = True
+
+        if cache_hit:
+            self.set_active_session(session_id)
+            last_tok = input_ids[:, -1:]
+            pos_tensor = torch.tensor([[prompt_len - 1]], device=input_ids.device)
+            with torch.no_grad():
+                out_fast = self.model(
+                    last_tok, position_ids=pos_tensor, use_cache=False
+                )
+                next_tok = out_fast.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        else:
+            next_tok, prompt_len = await self.prefill_and_offload_async(
+                input_ids, session_id
+            )
 
         generated_tokens = [next_tok.item()]
         cur_tok = next_tok

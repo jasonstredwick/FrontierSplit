@@ -115,3 +115,42 @@ def test_huggingface_disaggregated_model_async_generation(
             server.stop_thread()
 
     asyncio.run(_run())
+
+
+def test_huggingface_disaggregated_model_prefix_cache_hit(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify that a warm prefix cache hit bypasses prefill and produces identical tokens."""
+    model, prompt, expected_tokens = llama_model_and_prompt
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    try:
+        disagg_model = DisaggregatedModel(model=model, context_client=client)
+
+        # Request 1: Cold start (runs full prefill and indexes prompt into RadixPrefixCache)
+        cold_tokens = disagg_model.generate(
+            input_ids=prompt,
+            max_new_tokens=len(expected_tokens),
+            session_id="query-1",
+        )
+        assert cold_tokens == expected_tokens
+
+        # Verify that prompt is now cached in ContextServer's Radix tree
+        tokens_list = prompt[0].tolist()
+        m_len, _ = client.match_prefix_sync(tokens_list)
+        assert m_len == len(tokens_list)
+
+        # Request 2: Warm hit with exact same prompt (bypasses prefill!)
+        warm_tokens = disagg_model.generate(
+            input_ids=prompt,
+            max_new_tokens=len(expected_tokens),
+            session_id="query-2",
+        )
+        assert warm_tokens == expected_tokens
+
+    finally:
+        client.close_sync()
+        server.stop_thread()

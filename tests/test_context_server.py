@@ -138,3 +138,51 @@ def test_context_server_client_tcp_roundtrip():
             await server.stop_server()
 
     asyncio.run(_run())
+
+
+def test_context_server_prefix_caching_over_tcp():
+    """Verify that ContextServer indexes token prefixes and allows TCP prefix matching."""
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    try:
+        tokens_prompt = [101, 102, 103, 104, 105, 106]
+        k_prompt = torch.randn(1, 4, len(tokens_prompt), 32)
+        v_prompt = torch.randn(1, 4, len(tokens_prompt), 32)
+
+        # 1. Register prompt with token_ids
+        ok = client.register_prompt_sync(
+            session_id="first-user-session",
+            layer_idx=0,
+            k=k_prompt,
+            v=v_prompt,
+            token_ids=tokens_prompt,
+        )
+        assert ok is True
+
+        # 2. Query prefix match for a new prompt that shares the first 6 tokens + 2 new tokens
+        new_prompt = [101, 102, 103, 104, 105, 106, 999, 1000]
+        matched_len, bound_session = client.match_prefix_sync(new_prompt)
+        assert matched_len == 6
+        assert bound_session is not None
+
+        # 3. Query partial attention using the bound session
+        q = torch.randn(1, 4, 1, 32)
+        chunk = client.query_partial_attention_sync(
+            session_id=bound_session,
+            layer_idx=0,
+            q=q,
+        )
+        expected_chunk = compute_partial_attention(q, k_prompt, v_prompt)
+        assert torch.allclose(chunk.accumulator, expected_chunk.accumulator, atol=1e-5)
+
+        # 4. Query prefix match for a completely disjoint prompt
+        disjoint_prompt = [555, 666, 777]
+        m_len, dis_sess = client.match_prefix_sync(disjoint_prompt)
+        assert m_len == 0
+        assert dis_sess is None
+
+    finally:
+        client.close_sync()
+        server.stop_thread()
