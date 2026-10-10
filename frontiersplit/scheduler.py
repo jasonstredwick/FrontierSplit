@@ -7,22 +7,21 @@ pipeline stages, streaming Server-Sent Events (SSE), and pipeline bubble telemet
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any
+
 import requests
-from pydantic import BaseModel, Field
 
 from frontiersplit.models import resolve_model_spec
 from frontiersplit.protocol import (
     ActivationPacket,
-    BatchedActivationPacket,
     BatchedGenerationResponse,
     ChunkActivationPacket,
     ChunkGenerationResponse,
     GenerationResponse,
     ReleaseSessionPacket,
-    ReleaseSessionResponse,
 )
 from frontiersplit.transport import BinaryTransportClient, BinaryTransportServer
 
@@ -35,11 +34,11 @@ class ScheduledRequest:
         request_id: str,
         model: str,
         prompt_text: str,
-        prompt_tokens: List[int],
-        max_tokens: Optional[int] = None,
+        prompt_tokens: list[int],
+        max_tokens: int | None = None,
         temperature: float = 0.7,
         stream: bool = False,
-        tokenizer: Optional[Any] = None,
+        tokenizer: Any | None = None,
     ):
         self.request_id = request_id
         self.model = model
@@ -66,9 +65,11 @@ class ScheduledRequest:
         # Chunked Sequence Processing: S tokens chunked into D blocks of size C=16
         self.chunk_size = 16
         s_len = len(self.input_tokens)
-        self.total_prefill_chunks = max(1, (s_len + self.chunk_size - 1) // self.chunk_size)
-        self.prefill_chunks: List[List[int]] = []
-        self.chunk_valid_lens: List[int] = []
+        self.total_prefill_chunks = max(
+            1, (s_len + self.chunk_size - 1) // self.chunk_size
+        )
+        self.prefill_chunks: list[list[int]] = []
+        self.chunk_valid_lens: list[int] = []
         for d in range(self.total_prefill_chunks):
             start_i = d * self.chunk_size
             end_i = min(start_i + self.chunk_size, s_len)
@@ -80,22 +81,24 @@ class ScheduledRequest:
             self.chunk_valid_lens.append(v_len)
         self.current_chunk_idx = 0
 
-        self.generated_tokens: List[int] = []
-        self.generated_chunks: List[str] = []
+        self.generated_tokens: list[int] = []
+        self.generated_chunks: list[str] = []
         self.is_finished: bool = False
-        self.finish_reason: Optional[str] = None
-        self.error: Optional[str] = None
+        self.finish_reason: str | None = None
+        self.error: str | None = None
 
         self.done_event = asyncio.Event()
-        self.stream_queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+        self.stream_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
-        self.step_latencies: List[float] = []
-        self.stage_timings: List[Dict[str, float]] = []
+        self.step_latencies: list[float] = []
+        self.stage_timings: list[dict[str, float]] = []
 
-    def to_chat_completion_response(self) -> Dict[str, Any]:
+    def to_chat_completion_response(self) -> dict[str, Any]:
         """Format as standard OpenAI ChatCompletion response."""
         if self.tokenizer is not None and self.generated_tokens:
-            content = self.tokenizer.decode(self.generated_tokens, skip_special_tokens=True)
+            content = self.tokenizer.decode(
+                self.generated_tokens, skip_special_tokens=True
+            )
         else:
             content = "".join(self.generated_chunks)
         prompt_count = len(self.prompt_tokens)
@@ -122,7 +125,9 @@ class ScheduledRequest:
             },
         }
 
-    def to_chunk_dict(self, delta_content: str, finish_reason: Optional[str] = None) -> Dict[str, Any]:
+    def to_chunk_dict(
+        self, delta_content: str, finish_reason: str | None = None
+    ) -> dict[str, Any]:
         """Format as standard OpenAI ChatCompletionChunk response."""
         delta = {"content": delta_content} if delta_content else {}
         return {
@@ -148,14 +153,14 @@ class PipelineScheduler:
         stage0_url: str = "http://localhost:50051",
         num_workers: int = 1,
         total_stages: int = 4,
-        tokenizer: Optional[Any] = None,
+        tokenizer: Any | None = None,
         max_batch_size: int = 16,
         use_kv_cache: bool = True,
-        stage0_tcp: Optional[str] = None,
+        stage0_tcp: str | None = None,
         enable_1f1b: bool = True,
-        gateway_host: Optional[str] = None,
+        gateway_host: str | None = None,
         reply_port: int = 50060,
-        max_in_flight: Optional[int] = None,
+        max_in_flight: int | None = None,
     ):
         self.stage0_url = stage0_url
         self.num_workers = num_workers
@@ -165,30 +170,34 @@ class PipelineScheduler:
         self.use_kv_cache = use_kv_cache
 
         target_peer = stage0_tcp or (
-            stage0_url.replace("tcp://", "") if stage0_url and stage0_url.startswith("tcp://") else None
+            stage0_url.replace("tcp://", "")
+            if stage0_url and stage0_url.startswith("tcp://")
+            else None
         )
         self.stage0_client = BinaryTransportClient(target_peer) if target_peer else None
 
         self.enable_1f1b = enable_1f1b and (self.stage0_client is not None)
         self.gateway_host = gateway_host or "127.0.0.1"
         self.reply_port = reply_port
-        self.reply_server: Optional[BinaryTransportServer] = None
-        self._in_flight_times: Dict[str, float] = {}
+        self.reply_server: BinaryTransportServer | None = None
+        self._in_flight_times: dict[str, float] = {}
 
         flight_limit = max_in_flight or max(self.total_stages * 4, 32)
-        self._in_flight_sem: Optional[asyncio.Semaphore] = asyncio.Semaphore(flight_limit) if self.enable_1f1b else None
+        self._in_flight_sem: asyncio.Semaphore | None = (
+            asyncio.Semaphore(flight_limit) if self.enable_1f1b else None
+        )
 
-        self.active_requests: Dict[str, ScheduledRequest] = {}
+        self.active_requests: dict[str, ScheduledRequest] = {}
         self.ready_queue: asyncio.Queue[ScheduledRequest] = asyncio.Queue()
         self.is_running = False
-        self._worker_tasks: List[asyncio.Task] = []
+        self._worker_tasks: list[asyncio.Task] = []
 
         # Telemetry & Performance Counters
         self.start_time = time.time()
         self.total_submitted: int = 0
         self.total_completed: int = 0
         self.total_tokens_generated: int = 0
-        self.step_latencies: List[float] = []
+        self.step_latencies: list[float] = []
 
     async def start(self) -> None:
         """Start scheduler worker loop tasks and optional 1F1B reply server."""
@@ -197,7 +206,7 @@ class PipelineScheduler:
         self.is_running = True
         self.start_time = time.time()
 
-        if self.enable_1f1b:
+        if self.enable_1f1b or self.stage0_client is not None:
             try:
                 self.reply_server = BinaryTransportServer(
                     host="0.0.0.0",
@@ -215,8 +224,7 @@ class PipelineScheduler:
             self.reply_port = self.reply_server.port
 
         self._worker_tasks = [
-            asyncio.create_task(self._worker_loop(i))
-            for i in range(self.num_workers)
+            asyncio.create_task(self._worker_loop(i)) for i in range(self.num_workers)
         ]
 
     async def stop(self) -> None:
@@ -244,8 +252,8 @@ class PipelineScheduler:
     async def submit_request(
         self,
         model: str,
-        messages: List[Any],
-        max_tokens: Optional[int] = None,
+        messages: list[Any],
+        max_tokens: int | None = None,
         temperature: float = 0.7,
         stream: bool = False,
     ) -> ScheduledRequest:
@@ -253,13 +261,21 @@ class PipelineScheduler:
         await self.ensure_started()
 
         request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        prompt_text = "\n".join([f"{getattr(m, 'role', 'user')}: {getattr(m, 'content', str(m))}" for m in messages])
-        
+        prompt_text = "\n".join(
+            [
+                f"{getattr(m, 'role', 'user')}: {getattr(m, 'content', str(m))}"
+                for m in messages
+            ]
+        )
+
         if self.tokenizer is not None:
             if hasattr(self.tokenizer, "apply_chat_template") and messages:
                 try:
                     formatted = [
-                        {"role": getattr(m, "role", "user"), "content": getattr(m, "content", str(m))}
+                        {
+                            "role": getattr(m, "role", "user"),
+                            "content": getattr(m, "content", str(m)),
+                        }
                         for m in messages
                     ]
                     encoded = self.tokenizer.apply_chat_template(
@@ -274,11 +290,17 @@ class PipelineScheduler:
                     else:
                         prompt_tokens = list(encoded)
                 except Exception:
-                    prompt_tokens = self.tokenizer.encode(prompt_text, add_special_tokens=True)
+                    prompt_tokens = self.tokenizer.encode(
+                        prompt_text, add_special_tokens=True
+                    )
             else:
-                prompt_tokens = self.tokenizer.encode(prompt_text, add_special_tokens=True)
+                prompt_tokens = self.tokenizer.encode(
+                    prompt_text, add_special_tokens=True
+                )
         else:
-            prompt_tokens = [ord(c) % 32000 for c in prompt_text] if prompt_text else [1]
+            prompt_tokens = (
+                [ord(c) % 32000 for c in prompt_text] if prompt_text else [1]
+            )
 
         req = ScheduledRequest(
             request_id=request_id,
@@ -351,22 +373,27 @@ class PipelineScheduler:
             max_tokens=req.max_tokens,
         )
 
-        if self.enable_1f1b and self.stage0_client is not None:
+        if self.stage0_client is not None:
             packet.reply_to = f"{self.gateway_host}:{self.reply_port}"
             self._in_flight_times[req.request_id] = time.time()
-            if self._in_flight_sem is not None:
+            if self.enable_1f1b and self._in_flight_sem is not None:
                 await self._in_flight_sem.acquire()
             try:
                 await self.stage0_client.send_async_forward(packet)
             except Exception as e:
-                if self._in_flight_sem is not None:
+                if self.enable_1f1b and self._in_flight_sem is not None:
                     self._in_flight_sem.release()
                 raise e
             return
 
         step_start = time.time()
-        def _post_chunk() -> Dict[str, Any]:
-            resp = requests.post(f"{self.stage0_url}/forward_chunk", json=packet.model_dump(), timeout=600)
+
+        def _post_chunk() -> dict[str, Any]:
+            resp = requests.post(
+                f"{self.stage0_url}/forward_chunk",
+                json=packet.model_dump(),
+                timeout=600,
+            )
             resp.raise_for_status()
             return resp.json()
 
@@ -375,7 +402,9 @@ class PipelineScheduler:
         step_latency = (time.time() - step_start) * 1000
         await self._handle_chunk_reply(chunk_result, step_latency=step_latency)
 
-    async def _handle_chunk_reply(self, resp: ChunkGenerationResponse, step_latency: Optional[float] = None) -> None:
+    async def _handle_chunk_reply(
+        self, resp: ChunkGenerationResponse, step_latency: float | None = None
+    ) -> None:
         """Processes ChunkGenerationResponse from final stage."""
         req = self.active_requests.get(resp.request_id)
         if not req:
@@ -383,7 +412,9 @@ class PipelineScheduler:
 
         now = time.time()
         dispatch_time = self._in_flight_times.pop(req.request_id, None)
-        computed_latency = (now - dispatch_time) * 1000 if dispatch_time else (step_latency or 0.0)
+        computed_latency = (
+            (now - dispatch_time) * 1000 if dispatch_time else (step_latency or 0.0)
+        )
 
         self.step_latencies.append(computed_latency)
         if len(self.step_latencies) > 200:
@@ -399,15 +430,23 @@ class PipelineScheduler:
                 # Prefill completed!
                 req.is_prefill = False
 
-        if resp.next_token_id is not None:
-            token_id = resp.next_token_id
+        token_id = (
+            resp.next_token_id
+            if resp.next_token_id is not None
+            else getattr(resp, "token_id", None)
+        )
+        if token_id is not None:
             req.generated_tokens.append(token_id)
             self.total_tokens_generated += 1
 
             token_text = (
-                self.tokenizer.decode([token_id], skip_special_tokens=True)
-                if self.tokenizer is not None
-                else f" tok{token_id}"
+                resp.text
+                if getattr(resp, "text", None) is not None
+                else (
+                    self.tokenizer.decode([token_id], skip_special_tokens=True)
+                    if self.tokenizer is not None
+                    else f" tok{token_id}"
+                )
             )
             req.generated_chunks.append(token_text)
             req.step_latencies.append(computed_latency)
@@ -417,12 +456,19 @@ class PipelineScheduler:
                 chunk_dict = req.to_chunk_dict(token_text, finish_reason=None)
                 await req.stream_queue.put(chunk_dict)
 
-            reached_max = (req.max_tokens is not None and len(req.generated_tokens) >= req.max_tokens)
+            reached_max = (
+                req.max_tokens is not None
+                and len(req.generated_tokens) >= req.max_tokens
+            )
             if resp.is_finished or reached_max:
                 req.is_finished = True
-                req.finish_reason = resp.finish_reason or ("stop" if resp.is_finished else "length")
+                req.finish_reason = resp.finish_reason or (
+                    "stop" if resp.is_finished else "length"
+                )
                 if req.stream:
-                    finish_chunk = req.to_chunk_dict("", finish_reason=req.finish_reason)
+                    finish_chunk = req.to_chunk_dict(
+                        "", finish_reason=req.finish_reason
+                    )
                     await req.stream_queue.put(finish_chunk)
                     await req.stream_queue.put(None)
                 req.done_event.set()
@@ -439,7 +485,9 @@ class PipelineScheduler:
                 req.done_event.set()
                 self._finalize_request(req)
 
-    async def _handle_pipeline_reply(self, resp: Union[BatchedGenerationResponse, ChunkGenerationResponse]) -> None:
+    async def _handle_pipeline_reply(
+        self, resp: BatchedGenerationResponse | ChunkGenerationResponse
+    ) -> None:
         """Processes responses received directly from the final stage over persistent TCP in 1F1B mode."""
         if self._in_flight_sem is not None:
             self._in_flight_sem.release()
@@ -455,7 +503,9 @@ class PipelineScheduler:
                 continue
 
             dispatch_time = self._in_flight_times.pop(req.request_id, None)
-            step_latency = (now - dispatch_time) * 1000 if dispatch_time else gen_result.latency_ms
+            step_latency = (
+                (now - dispatch_time) * 1000 if dispatch_time else gen_result.latency_ms
+            )
 
             req.generated_tokens.append(gen_result.token_id)
             req.generated_chunks.append(gen_result.text)
@@ -474,12 +524,16 @@ class PipelineScheduler:
                 await req.stream_queue.put(chunk)
 
             # Check termination condition
-            reached_max = (req.max_tokens is not None and req.current_step >= req.max_tokens - 1)
+            reached_max = (
+                req.max_tokens is not None and req.current_step >= req.max_tokens - 1
+            )
             if gen_result.is_finished or reached_max:
                 req.is_finished = True
                 req.finish_reason = "stop" if gen_result.is_finished else "length"
                 if req.stream:
-                    finish_chunk = req.to_chunk_dict("", finish_reason=req.finish_reason)
+                    finish_chunk = req.to_chunk_dict(
+                        "", finish_reason=req.finish_reason
+                    )
                     await req.stream_queue.put(finish_chunk)
                     await req.stream_queue.put(None)
                 req.done_event.set()
@@ -512,8 +566,10 @@ class PipelineScheduler:
         )
 
         # Offload blocking HTTP call to Stage 0 so async loop remains responsive
-        def _post_forward() -> Dict[str, Any]:
-            resp = requests.post(f"{self.stage0_url}/forward", json=packet.model_dump(), timeout=600)
+        def _post_forward() -> dict[str, Any]:
+            resp = requests.post(
+                f"{self.stage0_url}/forward", json=packet.model_dump(), timeout=600
+            )
             resp.raise_for_status()
             return resp.json()
 
@@ -540,7 +596,7 @@ class PipelineScheduler:
             await req.stream_queue.put(chunk)
 
         # Check termination condition
-        reached_max = (req.current_step >= req.max_tokens - 1)
+        reached_max = req.current_step >= req.max_tokens - 1
         if gen_result.is_finished or reached_max:
             req.is_finished = True
             req.finish_reason = "stop" if gen_result.is_finished else "length"
@@ -571,20 +627,22 @@ class PipelineScheduler:
     async def _async_release_session(self, request_id: str) -> None:
         """Asynchronously notify stage 0 to release worker session KV cache."""
         if self.stage0_client is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self.stage0_client.send_release_sessions([request_id])
-            except Exception:
-                pass
         else:
+
             def _post_release():
-                try:
+                with contextlib.suppress(Exception):
                     packet = ReleaseSessionPacket(request_ids=[request_id])
-                    requests.post(f"{self.stage0_url}/release_sessions", json=packet.model_dump(), timeout=10)
-                except Exception:
-                    pass
+                    requests.post(
+                        f"{self.stage0_url}/release_sessions",
+                        json=packet.model_dump(),
+                        timeout=10,
+                    )
+
             await asyncio.to_thread(_post_release)
 
-    def get_telemetry(self) -> Dict[str, Any]:
+    def get_telemetry(self) -> dict[str, Any]:
         """Compute real-time pipeline performance and bubble metrics."""
         active_count = len(self.active_requests)
         k = self.total_stages
@@ -596,7 +654,11 @@ class PipelineScheduler:
 
         elapsed_s = max(0.001, time.time() - self.start_time)
         throughput_tok_per_sec = self.total_tokens_generated / elapsed_s
-        avg_step_ms = sum(self.step_latencies) / len(self.step_latencies) if self.step_latencies else 0.0
+        avg_step_ms = (
+            sum(self.step_latencies) / len(self.step_latencies)
+            if self.step_latencies
+            else 0.0
+        )
 
         return {
             "active_streams": active_count,

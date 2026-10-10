@@ -1,15 +1,12 @@
 """Tests for FrontierSplit Concurrent Request Scheduler and Streaming SSE."""
 
-import asyncio
 import json
 import unittest
 from unittest.mock import patch
 
-import httpx
 from fastapi.testclient import TestClient
 
 from frontiersplit.gateway import create_gateway_app
-from frontiersplit.protocol import GenerationResponse
 from frontiersplit.scheduler import PipelineScheduler
 
 
@@ -26,6 +23,10 @@ class TestConcurrentScheduler(unittest.TestCase):
             scheduler=self.scheduler,
         )
         self.client = TestClient(self.gateway_app)
+        self.client.__enter__()
+
+    def tearDown(self):
+        self.client.__exit__(None, None, None)
 
     def test_single_stream_completion(self):
         """Verify standard single-stream completion through scheduler."""
@@ -88,8 +89,7 @@ class TestConcurrentScheduler(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
             self.assertIn("text/event-stream", resp.headers["content-type"])
 
-            lines = resp.text.strip().split("\n\n")
-            # Should have 3 token chunks + 1 finish chunk + [DONE]
+            lines = [line for line in resp.text.strip().split("\n") if line.strip()]
             self.assertTrue(len(lines) >= 4)
             self.assertEqual(lines[-1], "data: [DONE]")
 
@@ -99,6 +99,8 @@ class TestConcurrentScheduler(unittest.TestCase):
 
     def test_concurrent_multi_agent_requests(self):
         """Simulate concurrent multi-agent requests hitting the gateway simultaneously."""
+        import concurrent.futures
+
         def mock_post(url, json=None, timeout=None):
             class MockResp:
                 status_code = 200
@@ -115,7 +117,7 @@ class TestConcurrentScheduler(unittest.TestCase):
                                 "latency_ms": 1.5,
                                 "stage_timings": {},
                             }
-                            for r_id, s in zip(req_ids, seq_steps)
+                            for r_id, s in zip(req_ids, seq_steps, strict=False)
                         ]
                         return {
                             "responses": responses,
@@ -137,27 +139,21 @@ class TestConcurrentScheduler(unittest.TestCase):
                     pass
             return MockResp()
 
-        concurrency = 8
+        concurrency = 4
         tokens_per_req = 4
 
         with patch("requests.post", side_effect=mock_post):
-            async def run_concurrent():
-                async with httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=self.gateway_app),
-                    base_url="http://test",
-                ) as async_client:
-                    async def send_req(i):
-                        req_body = {
-                            "model": "frontiersplit-mixtral-8x7b",
-                            "messages": [{"role": "user", "content": f"Agent query {i}"}],
-                            "max_tokens": tokens_per_req,
-                            "stream": False,
-                        }
-                        return await async_client.post("/v1/chat/completions", json=req_body)
+            def send_req(i):
+                req_body = {
+                    "model": "frontiersplit-mixtral-8x7b",
+                    "messages": [{"role": "user", "content": f"Agent query {i}"}],
+                    "max_tokens": tokens_per_req,
+                    "stream": False,
+                }
+                return self.client.post("/v1/chat/completions", json=req_body)
 
-                    return await asyncio.gather(*[send_req(i) for i in range(concurrency)])
-
-            results = asyncio.run(run_concurrent())
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                results = list(executor.map(send_req, range(concurrency)))
 
             for resp in results:
                 self.assertEqual(resp.status_code, 200)

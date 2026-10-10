@@ -488,7 +488,16 @@ class ContextClient:
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self._sync_sock: socket.socket | None = None
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
+        self._lock_loop: asyncio.AbstractEventLoop | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Returns an asyncio.Lock bound to the currently running event loop."""
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock
 
     def connect_sync(self) -> socket.socket:
         """Establishes or returns a synchronous persistent TCP socket."""
@@ -500,8 +509,20 @@ class ContextClient:
 
     async def connect(self) -> None:
         """Establishes a persistent TCP connection to the Context Server."""
-        if self.writer is not None and not self.writer.is_closing():
+        current_loop = asyncio.get_running_loop()
+        if (
+            self.writer is not None
+            and not self.writer.is_closing()
+            and getattr(self.writer, "_loop", None) is current_loop
+        ):
             return
+
+        if self.writer is not None:
+            with contextlib.suppress(Exception):
+                self.writer.close()
+            self.writer = None
+            self.reader = None
+
         self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
         sock = self.writer.get_extra_info("socket")
         if sock is not None:
@@ -528,7 +549,7 @@ class ContextClient:
         token_ids: list[int] | None = None,
     ) -> bool:
         """Registers a static prompt KV cache on the remote Context Server."""
-        async with self._lock:
+        async with self._get_lock():
             await self.connect()
             assert self.writer is not None and self.reader is not None
 
@@ -555,7 +576,7 @@ class ContextClient:
         scale: float | None = None,
     ) -> PartialAttentionChunk:
         """Queries the remote Context Server to compute partial attention over prompt."""
-        async with self._lock:
+        async with self._get_lock():
             await self.connect()
             assert self.writer is not None and self.reader is not None
 
@@ -633,7 +654,7 @@ class ContextClient:
         session_id: str | None = None,
     ) -> tuple[int, str | None]:
         """Queries the Context Server for the longest matching cached token prefix."""
-        async with self._lock:
+        async with self._get_lock():
             await self.connect()
             assert self.writer is not None and self.reader is not None
 
@@ -686,7 +707,7 @@ class ContextClient:
 
     async def release_session(self, session_id: str) -> bool:
         """Releases the prompt KV cache on the remote Context Server."""
-        async with self._lock:
+        async with self._get_lock():
             await self.connect()
             assert self.writer is not None and self.reader is not None
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator, Iterator
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -206,14 +207,14 @@ class DisaggregatedModel:
         self.set_active_session(session_id)
         return next_token, prompt_len
 
-    def generate(
+    def generate_stream(
         self,
         input_ids: torch.Tensor,
         max_new_tokens: int = 32,
         session_id: str = "default-session",
         use_prefix_cache: bool = True,
-    ) -> list[int]:
-        """Generates tokens synchronously using disaggregated attention merging.
+    ) -> Iterator[int]:
+        """Synchronously streams generated tokens one by one as they are produced.
 
         Args:
             input_ids: Prompt token tensor of shape `[1, prompt_len]`.
@@ -221,8 +222,8 @@ class DisaggregatedModel:
             session_id: Session identifier.
             use_prefix_cache: If True, checks for existing prefix cache on Context Server.
 
-        Returns:
-            List of generated token IDs (including the first generated token).
+        Yields:
+            Generated token IDs one by one (including the first generated token).
         """
         tokens = input_ids[0].tolist()
         prompt_len = len(tokens)
@@ -250,7 +251,7 @@ class DisaggregatedModel:
             # 1. Prefill and offload prompt KV
             next_tok, prompt_len = self.prefill_and_offload(input_ids, session_id)
 
-        generated_tokens = [next_tok.item()]
+        yield next_tok.item()
         cur_tok = next_tok
 
         # 2. Local volatile output cache (starts empty; never holds prompt tokens)
@@ -270,14 +271,39 @@ class DisaggregatedModel:
                         position_ids=pos_tensor,
                     )
                     cur_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                    generated_tokens.append(cur_tok.item())
+                    yield cur_tok.item()
 
         finally:
             # Clean up remote prompt KV cache
             self.context_client.release_session_sync(session_id)
             self.set_active_session(None)
 
-        return generated_tokens
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 32,
+        session_id: str = "default-session",
+        use_prefix_cache: bool = True,
+    ) -> list[int]:
+        """Generates tokens synchronously using disaggregated attention merging.
+
+        Args:
+            input_ids: Prompt token tensor of shape `[1, prompt_len]`.
+            max_new_tokens: Maximum number of new tokens to generate.
+            session_id: Session identifier.
+            use_prefix_cache: If True, checks for existing prefix cache on Context Server.
+
+        Returns:
+            List of generated token IDs (including the first generated token).
+        """
+        return list(
+            self.generate_stream(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                session_id=session_id,
+                use_prefix_cache=use_prefix_cache,
+            )
+        )
 
     async def prefill_and_offload_async(
         self,
@@ -313,14 +339,14 @@ class DisaggregatedModel:
         self.set_active_session(session_id)
         return next_token, prompt_len
 
-    async def generate_async(
+    async def generate_stream_async(
         self,
         input_ids: torch.Tensor,
         max_new_tokens: int = 32,
         session_id: str = "default-session",
         use_prefix_cache: bool = True,
-    ) -> list[int]:
-        """Asynchronously generates tokens using disaggregated attention merging.
+    ) -> AsyncIterator[int]:
+        """Asynchronously streams generated tokens one by one as they are produced.
 
         Args:
             input_ids: Prompt token tensor of shape `[1, prompt_len]`.
@@ -328,8 +354,8 @@ class DisaggregatedModel:
             session_id: Session identifier.
             use_prefix_cache: If True, checks for existing prefix cache on Context Server.
 
-        Returns:
-            List of generated token IDs (including the first generated token).
+        Yields:
+            Generated token IDs one by one (including the first generated token).
         """
         tokens = input_ids[0].tolist()
         prompt_len = len(tokens)
@@ -356,7 +382,7 @@ class DisaggregatedModel:
                 input_ids, session_id
             )
 
-        generated_tokens = [next_tok.item()]
+        yield next_tok.item()
         cur_tok = next_tok
         local_cache = DynamicCache()
 
@@ -373,13 +399,39 @@ class DisaggregatedModel:
                         position_ids=pos_tensor,
                     )
                     cur_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                    generated_tokens.append(cur_tok.item())
+                    yield cur_tok.item()
 
         finally:
             await self.context_client.release_session(session_id)
             self.set_active_session(None)
 
-        return generated_tokens
+    async def generate_async(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 32,
+        session_id: str = "default-session",
+        use_prefix_cache: bool = True,
+    ) -> list[int]:
+        """Asynchronously generates tokens using disaggregated attention merging.
+
+        Args:
+            input_ids: Prompt token tensor of shape `[1, prompt_len]`.
+            max_new_tokens: Maximum number of new tokens to generate.
+            session_id: Session identifier.
+            use_prefix_cache: If True, checks for existing prefix cache on Context Server.
+
+        Returns:
+            List of generated token IDs (including the first generated token).
+        """
+        generated: list[int] = []
+        async for tok in self.generate_stream_async(
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            session_id=session_id,
+            use_prefix_cache=use_prefix_cache,
+        ):
+            generated.append(tok)
+        return generated
 
 
 __all__ = [
