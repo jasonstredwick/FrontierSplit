@@ -73,8 +73,6 @@ In earlier architectural discussions, a candidate approach was maintaining an ar
 FrontierSplit strictly adopts a **generalized zero-threshold design**:
 1. **Elimination of Thrashing & Branching**: Dual-path logic (local vs. remote) introduces state synchronization races, cache coherence bugs, and memory fragmentation when requests cross the threshold mid-generation.
 2. **Deterministic Memory Footprint on Workers**: Because workers do not permanently retain large session KV pools in GPU VRAM, decode workers can run with minimal static memory, allowing higher micro-batch concurrency.
-3. **Universal Prefix Deduplication**: Even small 128-token system prompts (e.g., agent system instructions, tool definitions, Few-Shot exemplars) are shared across thousands of agent iterations. Retaining all KV state in the centralized Context Fabric maximizes global prefix cache reuse.
-
 ### 2.2 Generalized Request Lifecycle
 1. **Ingress & Prefix Lookup**:
    - The ingress router tokenizes the incoming message list $[t_1, t_2, \dots, t_M]$.
@@ -89,12 +87,62 @@ FrontierSplit strictly adopts a **generalized zero-threshold design**:
 4. **Session Reclamation**:
    - Once the generation completes or the client closes the SSE connection, the gateway issues `ReleaseSessionPacket` to free transient decode buffers, while the shared prefix branch remains pinned in the Radix Tree.
 
+### 2.3 Empty & Zero-Length Message Validation
+API clients or automated agent tools can occasionally submit empty message payloads (`messages: []` or `content: ""`).
+- **Strict Ingress Validation**: An empty messages array (`messages: []`) is rejected immediately at Tier 1 with HTTP 400 Bad Request (`InvalidRequestError: 'messages' cannot be empty`), adhering to standard OpenAI API specifications.
+- **Graceful Zero-Length Content Fallback**: If an agent sends an empty content string (`content: ""`) with only role markers, the router defaults to a canonical BOS (Beginning-of-Sequence) token fingerprint (`0x00000000`). This avoids division-by-zero, hash exceptions, or cluster routing thrashing.
+
 ---
 
 ## 3. Tier 1: Ingress Gateway & Prefix-Aware Intelligent Routing
 
-### 3.1 Consistent Hash Ring on Prefix Fingerprints
-To scale the Context Server fabric horizontally without a central metadata bottleneck, routers employ **Consistent Hashing with Virtual Nodes** across the cluster of Context Server shards.
+### 3.1 Dual Routing Strategy: Explicit Session Affinity vs. Prefix Fingerprinting
+Standard frontier LLM APIs (OpenAI Assistants API, Anthropic Messages API, Cohere, Fable) balance two routing modalities:
+1. **Explicit Session Affinity (`X-Session-ID` / `session_id`)**:
+   - For multi-turn conversational agents (DSPy swarms, OpenHands, SWE-bench threads), the client supplies an explicit session identifier (`X-FrontierSplit-Session-ID`).
+   - The router hashes this session ID directly to the consistent hash ring.
+   - **Guaranteed Invariant**: All subsequent turns of that conversation land on the exact same Context Server shard, guaranteeing that accumulated turn history is retained without state synchronization overhead across shards.
+2. **Implicit Prefix Fingerprint Hashing**:
+   - For stateless `/v1/chat/completions` calls where no session ID is supplied, the router extracts the leading prompt tokens (system prompts, tool definitions, Few-Shot examples) to compute a deterministic prefix fingerprint.
+   - Independent requests across different users or agent processes sharing the same prompt template land on the same Context Server shard, maximizing prefix cache hits.
+
+### 3.2 Hierarchical Prefix Hashing & Radix Tree Bucketing
+A critical architectural question is: **Why not hash the entire prompt?**
+- If an agent prompt has 20,000 tokens consisting of an 18,000-token codebase context and a 2,000-token user query, hashing the full prompt results in a totally different hash for every query, scattering them across different shards and reducing prefix cache hit rate to 0%.
+- Instead, FrontierSplit uses **Hierarchical Prefix Bucketing**:
+
+```
+                       Incoming Prompt (20,000 Tokens)
+ ┌───────────────────────────┬────────────────────────────────────────────┐
+ │ Prefix Window (Tokens 0..64)│ Suffix Tokens (Tokens 65..20,000)        │
+ └─────────────┬─────────────┴────────────────────────────────────────────┘
+               │
+               ▼ Hash Fingerprint (Murmur3 / Blake2b)
+     ┌───────────────────┐
+     │ Consistent Hash   │ ──► Maps to Shard 2 (Context Server)
+     │ Ring (Virtual)    │
+     └───────────────────┘
+               │
+               ▼ Forward Request to Shard 2
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ In-Shard Radix Tree Traversal (Fine-Grained Match)                    │
+ │   • Node 0: Tokens [0..64]     (Match: 100% Hit)                       │
+ │   • Node 1: Tokens [65..512]   (Match: 100% Hit)                       │
+ │   • Node 2: Tokens [513..18000](Match: 100% Hit - Full Codebase KV)    │
+ │   • Suffix: Tokens [18001..20000] -> Prefill needed for 2,000 tokens! │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+1. **Level 1: Coarse Shard Routing (First 64 Tokens / 512 Bytes)**:
+   - The initial 64 tokens capture the base system prompt and tool definitions.
+   - Consistent hashing on this prefix routes the request to the primary owning shard.
+2. **Level 2: Fine-Grained Radix Tree Traversal (Within Shard)**:
+   - Within the selected Context Server shard, the **Radix Tree** dynamically matches arbitrary sequence lengths ($64 \to 512 \to 4,096 \to 32,768$ tokens).
+   - Any branching between different agent prompts sharing the same root prefix is cleanly resolved in memory via node splits.
+3. **Level 3: Multi-Level Prefix Bucketing (Optional for 50+ Shards)**:
+   - For massive clusters, if a single system prompt exceeds the memory capacity of one shard, the router can hash secondary hierarchical checkpoints (e.g. token 512, token 2048) to subdivide sub-branches across shard groups.
+
+### 3.3 Consistent Hash Ring on Prefix Fingerprints
 
 ```
                   Hash Ring (SHA-256 Mod 2^32)
@@ -147,6 +195,43 @@ LLM inference has two diametrically opposed computational regimes:
 - **Architecture**: Commodity GPU nodes running 1F1B continuous micro-batch pipelining ([`frontiersplit/scheduler.py`](file:///Users/pixel/code/FrontierSplit/frontiersplit/scheduler.py)).
 - **Tile-Aligned Buffering**: Uses `WorkerKVCacheStore` with 16-token tile alignment ($\operatorname{ceil}_{16}$).
 - **Elastic Auto-Scaling**: Scaled up and down based on active stream concurrency metrics emitted via `/v1/telemetry`.
+
+### 4.3 Hardware Sizing & The Inference Roofline Model
+
+Hardware choices across Prefill, Decode, and Context Server tiers are governed by the **Inference Roofline Model** (Arithmetic Intensity vs. Memory Bandwidth vs. VRAM Capacity).
+
+#### 1. Per-Token KV Cache Memory Footprint
+For any transformer architecture using Grouped-Query Attention (GQA), the memory consumed per stored token across all layers is:
+$$\text{Bytes per Token} = 2 \times N_{\text{layers}} \times N_{\text{kv\_heads}} \times D_{\text{head}} \times B_{\text{dtype}}$$
+- Factor $2$: Key and Value matrices.
+- $N_{\text{layers}}$: Transformer depth.
+- $N_{\text{kv\_heads}}$: Grouped-Query attention heads (8 for Llama-3-8B and Mixtral 8x7B).
+- $D_{\text{head}}$: Head dimension (typically 128).
+- $B_{\text{dtype}}$: Precision bytes ($2$ for FP16/BF16, $1$ for FP8).
+
+**Concrete Calculations**:
+- **Llama-3-8B (FP16)**: $2 \times 32 \times 8 \times 128 \times 2 = 131,072 \text{ bytes} \approx 128 \text{ KB / token}$.
+- **Mixtral 8x7B (FP16)**: $2 \times 32 \times 8 \times 128 \times 2 = 131,072 \text{ bytes} \approx 128 \text{ KB / token}$.
+- **32,768-token sequence**: $32,768 \times 128 \text{ KB} = 4.19 \text{ GB}$ per sequence.
+- **16 concurrent agent streams**: $16 \times 4.19 \text{ GB} = 67.1 \text{ GB}$ of KV cache alone!
+
+In monolithic systems, this KV volume causes immediate VRAM exhaustion on commodity 16–24 GB GPUs. In FrontierSplit, this $67.1 \text{ GB}$ lives in Tier 3 Context Server host DRAM ($128 \text{ GB} \approx \$15/\text{month}$), keeping worker VRAM usage near zero!
+
+#### 2. Decode Memory Bandwidth vs. Latency
+During single-token autoregressive decoding, arithmetic intensity is $\approx 1$ FLOP per byte loaded. The theoretical step latency $T_{\text{step}}$ is bound by memory bus speed:
+$$T_{\text{step}} \ge \frac{W_{\text{active}} + B \times S \times \text{Bytes\_per\_Token}}{\text{VRAM Memory Bandwidth}}$$
+$$\text{Max Throughput (tok/sec)} \approx \frac{B}{\max\left(\frac{W_{\text{active}}}{\text{Bandwidth}}, \frac{2 \times B \times \text{FLOPs}_{\text{layer}}}{\text{Compute Peak}}\right)}$$
+
+#### 3. Cloud Accelerator Comparison & Role Assignment
+
+| Accelerator | VRAM / HBM | Memory Bandwidth | Tensor Compute | Cost / hr | Optimal FrontierSplit Role |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **NVIDIA Tesla T4** | 16 GB GDDR6 | 300 GB/s | 65 TFLOPs (FP16) | ~$0.35 | Decode Worker (Pipeline Stage) |
+| **NVIDIA L4** | 24 GB GDDR6 | 300 GB/s | 120 TFLOPs (FP16)| ~$0.65 | Decode Worker (Pipeline Stage) |
+| **NVIDIA A10G** | 24 GB GDDR6 | 600 GB/s | 125 TFLOPs (FP16)| ~$1.00 | High-Concurrency Decode Worker |
+| **Google TPU v5e** | 16 GB HBM2 | 820 GB/s | 197 TFLOPs (BF16)| ~$1.20 | Prefill Worker (Large Batch GEMM) |
+| **NVIDIA H100 SXM**| 80 GB HBM3 | 3,350 GB/s | 1,979 TFLOPs (FP8)| ~$3.50 | Prefill Pool / Central Super-Node |
+| **Cloud Host RAM** | 128–512 GB DDR5 | ~100–200 GB/s | N/A (Host CPU) | ~$0.08 | Context Server Shard (Tier 3) |
 
 ---
 
