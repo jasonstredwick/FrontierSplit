@@ -92,6 +92,47 @@ API clients or automated agent tools can occasionally submit empty message paylo
 - **Strict Ingress Validation**: An empty messages array (`messages: []`) is rejected immediately at Tier 1 with HTTP 400 Bad Request (`InvalidRequestError: 'messages' cannot be empty`), adhering to standard OpenAI API specifications.
 - **Graceful Zero-Length Content Fallback**: If an agent sends an empty content string (`content: ""`) with only role markers, the router defaults to a canonical BOS (Beginning-of-Sequence) token fingerprint (`0x00000000`). This avoids division-by-zero, hash exceptions, or cluster routing thrashing.
 
+### 2.4 Multi-Tiered Inference Caching: Exact Output vs. Probability Distribution vs. KV Prefix
+
+A key architectural insight in large-scale serving is that **not all caching belongs at the KV tensor layer**:
+When two requests are identical (or short messages like single-word greetings or standard system checks), the system evaluates caching across three tiers:
+
+```
+                  Incoming Prompt Request
+                             │
+            ┌────────────────┴────────────────┐
+            ▼                                 ▼
+   Temperature == 0.0                Temperature > 0.0
+ (Deterministic Greedy)            (Stochastic Sampling)
+            │                                 │
+     Exact Match in                    Exact Match in
+   Exact Response Cache?             Probability Cache?
+     ├── YES: Return Output (0 FLOPs)  ├── YES: Sample 1st token from
+     │        Latency: < 0.5 ms        │        precomputed top-k logits
+     └── NO:  Evaluate Prefix Cache    └── NO:  Evaluate Prefix Cache
+                    │                                 │
+                    ▼                                 ▼
+            ┌─────────────────────────────────────────────────┐
+            │ Tier 2: Radix Tree KV Prefix Cache              │
+            │   • Reuses precomputed K & V tensors over TCP   │
+            │   • Skips O(N) prefill matrix multiplications   │
+            │   • Generates fresh stochastic completion       │
+            └─────────────────────────────────────────────────┘
+```
+
+1. **Tier 0: Exact Response Cache (Deterministic Zero-Compute)**:
+   - For greedy/deterministic requests (`temperature == 0.0`), an identical prompt will mathematically generate the exact same token sequence every time.
+   - For recurring queries (e.g. "Hello", "Ping", standard test probes, benchmark evaluation prompts), computing forward passes over GPU Tensor Cores is completely redundant.
+   - The Gateway checks an in-memory LRU response cache. On hit, it immediately returns the JSON or streams the pre-generated SSE tokens in $<0.5\text{ ms}$ with **zero GPU compute**.
+2. **Tier 1: Probability Distribution / Logit Caching (Stochastic Randomization)**:
+   - When users require non-deterministic sampling (`temperature > 0.0`), returning the exact same response is undesirable.
+   - However, for an identical prompt, the **first-token logit distribution** (the output vector of vocabulary probabilities) is 100% deterministic.
+   - Instead of re-running the heavy prompt prefill GEMM just to obtain the first token distribution, the Context Server can cache the top-$k$ logits / probability distribution for the prompt.
+   - The Gateway samples the first token directly from this pre-calculated distribution, and then resumes autoregressive decoding from the pre-cached KV state.
+3. **Tier 2: Disaggregated Radix KV Prefix Cache (Partial Common Prefixes)**:
+   - For multi-turn agent threads, document reasoning, and codebases where prompts share a large common prefix (e.g. 5,000-token codebase) but end with unique questions.
+   - Skips the heavy $O(N)$ prefill computation for the shared prefix while executing standard autoregressive decoding for the novel continuation.
+
 ---
 
 ## 3. Tier 1: Ingress Gateway & Prefix-Aware Intelligent Routing
