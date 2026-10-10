@@ -11,6 +11,7 @@ from __future__ import annotations
 import bisect
 import hashlib
 import struct
+import time
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -26,10 +27,21 @@ class ContextShardNode(BaseModel):
     port: int
     weight: int = 1
     is_healthy: bool = True
+    capacity_tokens: int = 1_000_000
+    used_tokens: int = 0
+    active_sessions: int = 0
+    last_heartbeat: float = Field(default_factory=time.time)
     metadata: dict[str, Any] = Field(default_factory=dict)
     _client: ContextClient | None = None
 
     model_config = {"arbitrary_types_allowed": True}
+
+    @property
+    def load_factor(self) -> float:
+        """Returns the memory/token utilization ratio (0.0 to 1.0)."""
+        if self.capacity_tokens <= 0:
+            return 0.0
+        return min(1.0, self.used_tokens / self.capacity_tokens)
 
     def get_client(self) -> ContextClient:
         """Returns or lazily creates a persistent ContextClient for this shard."""
@@ -96,8 +108,23 @@ class ConsistentHashRing:
         if shard_id in self.shards:
             self.shards[shard_id].is_healthy = is_healthy
 
-    def get_node(self, key: str | bytes) -> ContextShardNode:
-        """Resolves the primary healthy ContextShardNode for a key."""
+    def get_least_loaded_shard(self) -> ContextShardNode:
+        """Returns the healthy shard with the lowest load factor."""
+        if not self.shards:
+            raise RuntimeError("ConsistentHashRing is empty: no shards configured")
+        healthy_shards = [s for s in self.shards.values() if s.is_healthy]
+        if not healthy_shards:
+            raise RuntimeError("All Context Server shards are marked unhealthy")
+        return min(healthy_shards, key=lambda s: s.load_factor)
+
+    def get_node(
+        self, key: str | bytes, max_load_factor: float = 0.85
+    ) -> ContextShardNode:
+        """Resolves the primary healthy ContextShardNode for a key.
+
+        If the primary shard exceeds max_load_factor, checks the replica candidate
+        along the ring (Power-of-Two load balancing) to prevent hot-shard saturation.
+        """
         if not self.shards:
             raise RuntimeError("ConsistentHashRing is empty: no shards configured")
 
@@ -105,20 +132,18 @@ class ConsistentHashRing:
         if not healthy_shards:
             raise RuntimeError("All Context Server shards are marked unhealthy")
 
-        h = hash_key_to_uint32(key)
-        # Binary search for the first virtual node >= h
-        idx = bisect.bisect_right(self._ring, (h, ""))
+        replicas = self.get_replicas(key, count=2)
+        if not replicas:
+            return healthy_shards[0]
 
-        # Search clockwise for the first healthy shard
-        n = len(self._ring)
-        for step in range(n):
-            ring_idx = (idx + step) % n
-            _, target_shard_id = self._ring[ring_idx]
-            target_shard = self.shards[target_shard_id]
-            if target_shard.is_healthy:
-                return target_shard
+        primary = replicas[0]
+        # Power-of-two load balancing: if primary is saturated, shed to replica
+        if len(replicas) > 1 and primary.load_factor >= max_load_factor:
+            candidate = replicas[1]
+            if candidate.load_factor < primary.load_factor:
+                return candidate
 
-        return healthy_shards[0]
+        return primary
 
     def get_replicas(self, key: str | bytes, count: int = 2) -> list[ContextShardNode]:
         """Resolves the primary node and successor replica nodes along the ring."""
@@ -153,15 +178,23 @@ class PrefixRouter:
         self,
         ring: ConsistentHashRing | None = None,
         prefix_window_tokens: int = 64,
+        min_prefix_tokens: int = 8,
+        max_load_factor: float = 0.85,
     ) -> None:
         """Initializes the PrefixRouter.
 
         Args:
             ring: Optional configured ConsistentHashRing instance.
             prefix_window_tokens: Leading tokens to include in the prefix fingerprint.
+            min_prefix_tokens: Minimum tokens required to activate prefix hash routing.
+                Prompts shorter than this route by least-loaded shard to avoid hotspots.
+            max_load_factor: Memory utilization threshold (0.0 - 1.0) above which
+                the router sheds traffic to backup replicas along the ring.
         """
         self.ring = ring if ring is not None else ConsistentHashRing()
         self.prefix_window_tokens = prefix_window_tokens
+        self.min_prefix_tokens = min_prefix_tokens
+        self.max_load_factor = max_load_factor
 
     def add_shard(
         self, shard_id: str, host: str, port: int, weight: int = 1
@@ -282,8 +315,26 @@ class PrefixRouter:
             fingerprint_str = " ".join(prefix_words)
             token_count = len(prefix_words)
 
+        # If the prefix is too short to be a shared prompt, route by least-loaded
+        # shard to prevent trivial 1-token collisions on a single shard
+        if token_count < self.min_prefix_tokens:
+            least_loaded = self.ring.get_least_loaded_shard()
+            replicas = self.ring.get_replicas(
+                f"least_loaded:{least_loaded.shard_id}", count=2
+            )
+            backup_replicas = [
+                r for r in replicas if r.shard_id != least_loaded.shard_id
+            ]
+            return ShardRoutingDecision(
+                shard=least_loaded,
+                replicas=backup_replicas,
+                route_type="least_loaded",
+                fingerprint=fingerprint_str,
+                token_count=token_count,
+            )
+
         prefix_key = f"prefix:{fingerprint_str}"
-        primary = self.ring.get_node(prefix_key)
+        primary = self.ring.get_node(prefix_key, max_load_factor=self.max_load_factor)
         replicas = self.ring.get_replicas(prefix_key, count=2)
         backup_replicas = [r for r in replicas if r.shard_id != primary.shard_id]
 

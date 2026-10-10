@@ -145,6 +145,56 @@ def test_prefix_router_empty_and_fallback_validation():
     assert dec.shard.shard_id == "shard-0"
 
 
+def test_prefix_router_short_prompt_least_loaded():
+    """Verify that short prompts (< min_prefix_tokens) route to the least loaded shard."""
+    router = PrefixRouter(min_prefix_tokens=8)
+    shard0 = router.add_shard("shard-0", "127.0.0.1", 50060)
+    shard1 = router.add_shard("shard-1", "127.0.0.1", 50061)
+
+    # shard-0 is 80% full, shard-1 is 10% full
+    shard0.used_tokens = 800_000
+    shard0.capacity_tokens = 1_000_000
+    shard1.used_tokens = 100_000
+    shard1.capacity_tokens = 1_000_000
+
+    # Short prompt (only 2 words)
+    dec = router.route_request([{"role": "user", "content": "Hello there"}])
+    assert dec.route_type == "least_loaded"
+    assert dec.shard.shard_id == "shard-1"
+
+
+def test_prefix_router_overloaded_shard_sheds_to_replica():
+    """Verify that an overloaded primary shard sheds prefix requests to replica."""
+    router = PrefixRouter(min_prefix_tokens=4, max_load_factor=0.85)
+    shard0 = router.add_shard("shard-0", "127.0.0.1", 50060)
+    shard1 = router.add_shard("shard-1", "127.0.0.1", 50061)
+
+    long_sys = (
+        "System: You are an autonomous coding assistant specialized in distributed"
+        " systems."
+    )
+    # Route once to see normal destination
+    dec_normal = router.route_request([{"role": "system", "content": long_sys}])
+    target_id = dec_normal.shard.shard_id
+
+    # Now saturate target_id to 95% load
+    if target_id == "shard-0":
+        shard0.used_tokens = 950_000
+        shard0.capacity_tokens = 1_000_000
+        shard1.used_tokens = 200_000
+        shard1.capacity_tokens = 1_000_000
+    else:
+        shard1.used_tokens = 950_000
+        shard1.capacity_tokens = 1_000_000
+        shard0.used_tokens = 200_000
+        shard0.capacity_tokens = 1_000_000
+
+    # Now route again with saturated primary
+    dec_shed = router.route_request([{"role": "system", "content": long_sys}])
+    assert dec_shed.shard.shard_id != target_id
+    assert dec_shed.shard.load_factor < 0.95
+
+
 @pytest.mark.anyio
 async def test_prefix_router_live_cluster_query_and_failover():
     """Verify live TCP cluster routing and automatic replica failover across ContextServers."""
