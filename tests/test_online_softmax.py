@@ -167,7 +167,7 @@ def test_grouped_query_attention_gqa():
 
 
 def test_fp16_numerical_stability():
-    """Test FP16 numerical stability (no NaN, inf, or overflow)."""
+    """Test FP16 numerical stability and FP32 intermediate accumulation."""
     torch.manual_seed(999)
     batch, num_heads, q_len, head_dim = 1, 8, 1, 64
     total_len = 512
@@ -181,11 +181,45 @@ def test_fp16_numerical_stability():
     chunk_1 = compute_partial_attention(q, k[:, :, :256, :], v[:, :, :256, :])
     chunk_2 = compute_partial_attention(q, k[:, :, 256:, :], v[:, :, 256:, :])
 
+    # Verify intermediate accumulators are held in FP32
+    assert chunk_1.accumulator.dtype == torch.float32
+    assert chunk_1.max_score.dtype == torch.float32
+    assert chunk_1.sum_exp.dtype == torch.float32
+    assert chunk_1.dtype == torch.float16
+
     merged = merge_two_partial_attentions(chunk_1, chunk_2)
+    assert merged.accumulator.dtype == torch.float32
+    assert merged.dtype == torch.float16
+
     out = finalize_attention(merged)
+    assert out.dtype == torch.float16
 
     assert not torch.isnan(out).any(), "NaN detected in FP16 merged attention"
     assert not torch.isinf(out).any(), "Inf detected in FP16 merged attention"
-    # In FP16, tolerance is slightly looser due to 10-bit mantissa
+
+    # Compare against unchunked online softmax and native FP16 attention
+    single_out = finalize_attention(compute_partial_attention(q, k, v))
+    assert (single_out - out).abs().max().item() <= 1e-3
     max_diff = (ref - out).abs().max().item()
-    assert max_diff < 1e-2, f"FP16 merged attention difference too large: {max_diff}"
+    assert max_diff < 1e-3, f"FP16 merged attention difference too large: {max_diff}"
+
+
+def test_fp16_long_context_no_overflow():
+    """Verify that 100k+ uniform-score tokens in FP16 do not overflow sum_exp (65504 limit)."""
+    batch, num_heads, q_len, head_dim = 1, 2, 1, 16
+    total_len = 80_000  # Exceeds FP16 max value of 65,504 when scores are identical
+
+    q = torch.zeros(batch, num_heads, q_len, head_dim, dtype=torch.float16)
+    k = torch.zeros(batch, num_heads, total_len, head_dim, dtype=torch.float16)
+    v = torch.ones(batch, num_heads, total_len, head_dim, dtype=torch.float16)
+
+    chunk_a = compute_partial_attention(q, k[:, :, :40_000, :], v[:, :, :40_000, :])
+    chunk_b = compute_partial_attention(q, k[:, :, 40_000:, :], v[:, :, 40_000:, :])
+
+    merged = merge_two_partial_attentions(chunk_a, chunk_b)
+    assert torch.all(merged.sum_exp == 80_000.0)  # Would be inf in FP16!
+
+    out = finalize_attention(merged)
+    assert out.dtype == torch.float16
+    assert not torch.isnan(out).any()
+    assert torch.allclose(out, torch.ones_like(out))

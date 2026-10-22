@@ -30,18 +30,28 @@ __all__ = [
 class PartialAttentionChunk:
     """Represents a partial attention calculation over a key-value chunk.
 
+    Intermediate statistics (`accumulator`, `max_score`, `sum_exp`) are maintained
+    in `torch.float32` to prevent mantissa rounding and FP16 dynamic-range overflow
+    prior to final normalization.
+
     Attributes:
         accumulator: Unnormalized weighted value accumulator of shape
-            `[batch, num_heads, q_len, head_dim]`.
+            `[batch, num_heads, q_len, head_dim]` in `torch.float32`.
         max_score: Maximum attention logit per query position of shape
-            `[batch, num_heads, q_len, 1]`.
+            `[batch, num_heads, q_len, 1]` in `torch.float32`.
         sum_exp: Sum of exponentials (denominator) of shape
-            `[batch, num_heads, q_len, 1]`.
+            `[batch, num_heads, q_len, 1]` in `torch.float32`.
+        dtype: Target output dtype to restore upon finalization (e.g. `torch.float16`).
     """
 
     accumulator: torch.Tensor
     max_score: torch.Tensor
     sum_exp: torch.Tensor
+    dtype: torch.dtype | None = None
+
+    def __post_init__(self) -> None:
+        if self.dtype is None:
+            self.dtype = self.accumulator.dtype
 
     def to(self, device: torch.device | str) -> PartialAttentionChunk:
         """Moves chunk tensors to the specified device."""
@@ -49,6 +59,7 @@ class PartialAttentionChunk:
             accumulator=self.accumulator.to(device),
             max_score=self.max_score.to(device),
             sum_exp=self.sum_exp.to(device),
+            dtype=self.dtype,
         )
 
 
@@ -94,13 +105,16 @@ def compute_partial_attention(
         k = repeat_kv(k, n_rep)
         v = repeat_kv(v, n_rep)
 
-    # Compute raw scaled dot-product scores: [batch, num_heads, q_len, kv_len]
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    orig_dtype = q.dtype
+
+    # Compute raw scaled dot-product scores and upcast to FP32 for online softmax stability:
+    # [batch, num_heads, q_len, kv_len]
+    scores = torch.matmul(q, k.transpose(-2, -1)).to(torch.float32) * scale
 
     if attention_mask is not None:
-        scores = scores + attention_mask
+        scores = scores + attention_mask.to(torch.float32)
 
-    # Numerically stable online softmax tracking
+    # Numerically stable online softmax tracking in FP32
     # 1. Local maximum per query: [batch, num_heads, q_len, 1]
     max_score = torch.max(scores, dim=-1, keepdim=True).values
 
@@ -110,13 +124,14 @@ def compute_partial_attention(
     # 3. Sum of exponentials (denominator): [batch, num_heads, q_len, 1]
     sum_exp = torch.sum(p, dim=-1, keepdim=True)
 
-    # 4. Partial accumulator (numerator): [batch, num_heads, q_len, head_dim]
-    accumulator = torch.matmul(p, v)
+    # 4. Partial accumulator (numerator) in FP32: [batch, num_heads, q_len, head_dim]
+    accumulator = torch.matmul(p, v.to(torch.float32))
 
     return PartialAttentionChunk(
         accumulator=accumulator,
         max_score=max_score,
         sum_exp=sum_exp,
+        dtype=orig_dtype,
     )
 
 
@@ -124,7 +139,7 @@ def merge_two_partial_attentions(
     chunk_a: PartialAttentionChunk,
     chunk_b: PartialAttentionChunk,
 ) -> PartialAttentionChunk:
-    """Merges two partial attention chunks using online softmax rescaling.
+    """Merges two partial attention chunks using online softmax rescaling in FP32.
 
     Mathematically identical to computing softmax over chunk_a and chunk_b
     concatenated together. Zero accuracy loss.
@@ -136,25 +151,33 @@ def merge_two_partial_attentions(
     Returns:
         Merged PartialAttentionChunk representing the combined context.
     """
+    max_a = chunk_a.max_score.to(torch.float32)
+    max_b = chunk_b.max_score.to(torch.float32)
+
     # 1. Global maximum across both chunks
-    m_global = torch.maximum(chunk_a.max_score, chunk_b.max_score)
+    m_global = torch.maximum(max_a, max_b)
 
     # 2. Rescaling factors (guaranteed <= 1.0, zero risk of numerical overflow)
-    alpha_a = torch.exp(chunk_a.max_score - m_global)
-    alpha_b = torch.exp(chunk_b.max_score - m_global)
+    alpha_a = torch.exp(max_a - m_global)
+    alpha_b = torch.exp(max_b - m_global)
 
-    # 3. Rescaled denominators
-    sum_exp_global = (chunk_a.sum_exp * alpha_a) + (chunk_b.sum_exp * alpha_b)
-
-    # 4. Rescaled numerators
-    accumulator_global = (chunk_a.accumulator * alpha_a) + (
-        chunk_b.accumulator * alpha_b
+    # 3. Rescaled denominators in FP32
+    sum_exp_global = (chunk_a.sum_exp.to(torch.float32) * alpha_a) + (
+        chunk_b.sum_exp.to(torch.float32) * alpha_b
     )
+
+    # 4. Rescaled numerators in FP32
+    accumulator_global = (chunk_a.accumulator.to(torch.float32) * alpha_a) + (
+        chunk_b.accumulator.to(torch.float32) * alpha_b
+    )
+
+    target_dtype = chunk_b.dtype if chunk_b.dtype is not None else chunk_a.dtype
 
     return PartialAttentionChunk(
         accumulator=accumulator_global,
         max_score=m_global,
         sum_exp=sum_exp_global,
+        dtype=target_dtype,
     )
 
 
@@ -173,15 +196,21 @@ def merge_partial_attentions(
     return merged
 
 
-def finalize_attention(chunk: PartialAttentionChunk) -> torch.Tensor:
-    """Normalizes the merged partial attention chunk to yield the final attention output.
+def finalize_attention(
+    chunk: PartialAttentionChunk,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Normalizes the merged partial attention chunk in FP32 and casts to target dtype.
 
     Args:
         chunk: The merged (or single) PartialAttentionChunk.
+        dtype: Optional explicit output dtype override. Defaults to `chunk.dtype`.
 
     Returns:
         Tensor of shape `[batch, num_heads, q_len, head_dim]`.
     """
-    # Add small epsilon to denominator to prevent division by zero in masked-out padding
-    denom = torch.clamp(chunk.sum_exp, min=1e-12)
-    return chunk.accumulator / denom
+    target_dtype = dtype or chunk.dtype or chunk.accumulator.dtype
+    # Perform division in FP32 with epsilon guard, then downcast at the last moment
+    denom = torch.clamp(chunk.sum_exp.to(torch.float32), min=1e-12)
+    out = chunk.accumulator.to(torch.float32) / denom
+    return out.to(target_dtype)

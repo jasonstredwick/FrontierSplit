@@ -33,7 +33,10 @@ from frontiersplit.pipeline.protocol import (
     ReleaseSessionPacket,
     ReleaseSessionResponse,
 )
-from frontiersplit.pipeline.transport import BinaryTransportClient, BinaryTransportServer
+from frontiersplit.pipeline.transport import (
+    BinaryTransportClient,
+    BinaryTransportServer,
+)
 
 # Optional PyTorch and Hugging Face imports
 try:
@@ -63,8 +66,8 @@ try:
                 x2 = x[..., x.shape[-1] // 2 :]
                 return torch.cat((-x2, x1), dim=-1)
 
-            q_embed = (q * cos) + (rotate_half(q) * sin)
-            k_embed = (k * cos) + (rotate_half(k) * sin)
+            q_embed = ((q * cos) + (rotate_half(q) * sin)).to(q.dtype)
+            k_embed = ((k * cos) + (rotate_half(k) * sin)).to(k.dtype)
             return q_embed, k_embed
 
     HAS_TORCH = True
@@ -1136,7 +1139,9 @@ def create_worker_app(
                     last_token_hidden = hidden_states[
                         :, -1, :
                     ]  # shape: [1, hidden_size]
-                    logits = lm_head(last_token_hidden)  # shape: [1, vocab_size]
+                    logits = lm_head(
+                        last_token_hidden
+                    ).float()  # shape: [1, vocab_size]
 
                     next_token_id = int(torch.argmax(logits, dim=-1).item())
                     elapsed_ms = (time.time() - start_time) * 1000
@@ -1268,8 +1273,8 @@ def create_worker_app(
                                             .to(resolved_device, non_blocking=True)
                                         )
                                         hidden_states = (
-                                            q.to(torch.float16) * packet.tensor_scale
-                                        )
+                                            q.to(torch.float32) * packet.tensor_scale
+                                        ).to(torch.float16)
                                     else:
                                         q = (
                                             torch.frombuffer(
@@ -1279,8 +1284,8 @@ def create_worker_app(
                                             .to(resolved_device, non_blocking=True)
                                         )
                                         hidden_states = (
-                                            q.to(torch.float16) * packet.tensor_scale
-                                        )
+                                            q.to(torch.float32) * packet.tensor_scale
+                                        ).to(torch.float16)
                                 else:
                                     dtype_obj = getattr(
                                         torch, packet.tensor_dtype, torch.float16
@@ -1600,7 +1605,7 @@ def create_worker_app(
                             ]  # shape: [B, hidden_size]
                             logits = lm_head(
                                 last_token_hidden
-                            )  # shape: [B, vocab_size]
+                            ).float()  # shape: [B, vocab_size]
 
                             next_token_ids = torch.argmax(logits, dim=-1).tolist()
 
@@ -1621,11 +1626,12 @@ def create_worker_app(
                         reply_to=packet.reply_to,
                     )
                     if quantize_activations:
-                        amax = hidden_states.abs().max().item()
+                        hidden_fp32 = hidden_states.float()
+                        amax = hidden_fp32.abs().max().item()
                         scale = 1.0 if amax == 0 else amax / 127.0
-                        q = torch.clamp(
-                            torch.round(hidden_states / scale), -128, 127
-                        ).to(torch.int8)
+                        q = torch.clamp(torch.round(hidden_fp32 / scale), -128, 127).to(
+                            torch.int8
+                        )
                         raw_bytes = q.contiguous().cpu().numpy().tobytes()
                         next_packet.tensor_scale = scale
                         next_packet.set_raw_tensor(
@@ -2184,7 +2190,7 @@ def create_worker_app(
                                 last_tok_idx = (valid_tokens - 1) if is_prefill else 0
                                 logits = lm_head(
                                     hidden_states[last_tok_idx : last_tok_idx + 1, :]
-                                )
+                                ).float()
                                 next_tok_id = int(torch.argmax(logits, dim=-1).item())
 
                 stage_compute_ms = (time.time() - start_time) * 1000

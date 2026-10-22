@@ -131,6 +131,7 @@ def serialize_chunk(chunk: PartialAttentionChunk) -> bytes:
             "acc": chunk.accumulator.contiguous(),
             "max": chunk.max_score.contiguous(),
             "sum": chunk.sum_exp.contiguous(),
+            "dtype": chunk.dtype,
         },
         buf,
     )
@@ -145,6 +146,7 @@ def deserialize_chunk(data: bytes) -> PartialAttentionChunk:
         accumulator=d["acc"],
         max_score=d["max"],
         sum_exp=d["sum"],
+        dtype=d.get("dtype"),
     )
 
 
@@ -329,16 +331,24 @@ class ContextServer:
 
         if token_ids is not None:
             prev = self._session_tokens.get(session_id, [])
-            self._session_tokens[session_id] = prev + token_ids
+            if len(prev) < new_len:
+                self._session_tokens[session_id] = prev + token_ids
             layers = self.store.get_session_layers(session_id)
-            if layers is not None:
+            if (
+                layers is not None
+                and len(self._session_tokens.get(session_id, [])) == new_len
+            ):
                 k_dict = {layer_i: kv[0] for layer_i, kv in layers.items()}
                 v_dict = {layer_i: kv[1] for layer_i, kv in layers.items()}
-                self.prefix_cache.insert(self._session_tokens[session_id], k_dict, v_dict)
+                self.prefix_cache.insert(
+                    self._session_tokens[session_id], k_dict, v_dict
+                )
 
         return new_len
 
-    def evict_expired_sessions(self, max_idle_seconds: float | None = None) -> list[str]:
+    def evict_expired_sessions(
+        self, max_idle_seconds: float | None = None
+    ) -> list[str]:
         """Evicts sessions whose sliding TTL has expired."""
         evicted = self.store.evict_expired(max_idle_seconds=max_idle_seconds)
         for sid in evicted:
@@ -362,6 +372,7 @@ class ContextServer:
         session_id = (
             target_session_id or f"prefix-{abs(hash(tuple(token_ids[:matched_len]))):x}"
         )
+        self._session_tokens[session_id] = list(token_ids[:matched_len])
         k_by_layer, v_by_layer = self.prefix_cache.assemble_kv(nodes)
         for layer_idx, k in k_by_layer.items():
             self.store.register_prompt(session_id, layer_idx, k, v_by_layer[layer_idx])

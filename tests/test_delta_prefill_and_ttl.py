@@ -225,8 +225,63 @@ def test_disaggregated_model_delta_prefill_e2e(
             f"Disaggregated: {turn2_tokens}"
         )
 
+        # Verify RadixPrefixCache has exact token count (no multi-layer token_ids duplication)
+        assert server.prefix_cache.total_tokens == prompt_turn2.shape[1]
+
         # With release_on_completion=True, session is cleaned up
         assert not server.store.has_session(session_id)
+
+    finally:
+        client.close_sync()
+        server.stop_thread()
+
+
+def test_disaggregated_model_fp16_delta_prefill(
+    tiny_llama: tuple[LlamaForCausalLM, torch.Tensor, torch.Tensor],
+) -> None:
+    """Verifies that FP16 models keep KV caches in FP16 while executing Delta Prefill and Online Softmax in FP32."""
+    base_model, prompt_turn1, prompt_turn2 = tiny_llama
+    fp16_model = copy.deepcopy(base_model).to(torch.float16)
+    fp16_model.eval()
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    try:
+        disagg_model = DisaggregatedModel(model=fp16_model, context_client=client)
+        session_id = "fp16-delta-session"
+
+        # Turn 1: Cold prefill in FP16
+        disagg_model.generate(
+            input_ids=prompt_turn1,
+            max_new_tokens=2,
+            session_id=session_id,
+            release_on_completion=False,
+        )
+
+        # Verify KV cache on Context Server is stored in FP16
+        kv_layer0 = server.store.get_prompt(session_id, 0)
+        assert kv_layer0 is not None
+        assert kv_layer0[0].dtype == torch.float16
+        assert kv_layer0[1].dtype == torch.float16
+
+        # Turn 2: Multi-token Delta Prefill in FP16 (tests causal mask & FP32 softmax upcast)
+        turn2_tokens = disagg_model.generate(
+            input_ids=prompt_turn2,
+            max_new_tokens=3,
+            session_id=session_id,
+            use_prefix_cache=True,
+            release_on_completion=False,
+        )
+        assert len(turn2_tokens) == 3
+
+        # Verify appended KV cache remains FP16 and exact length
+        kv_after = server.store.get_prompt(session_id, 0)
+        assert kv_after is not None
+        assert kv_after[0].dtype == torch.float16
+        assert kv_after[0].shape[-2] == prompt_turn2.shape[1]
+        assert server.prefix_cache.total_tokens == prompt_turn2.shape[1]
 
     finally:
         client.close_sync()

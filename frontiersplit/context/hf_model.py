@@ -49,8 +49,8 @@ def _apply_rotary_pos_emb(
         (-k[..., k.shape[-1] // 2 :], k[..., : k.shape[-1] // 2]), dim=-1
     )
 
-    q_embed = (q * cos) + (rotate_half_q * sin)
-    k_embed = (k * cos) + (rotate_half_k * sin)
+    q_embed = ((q * cos) + (rotate_half_q * sin)).to(q.dtype)
+    k_embed = ((k * cos) + (rotate_half_k * sin)).to(k.dtype)
     return q_embed, k_embed
 
 
@@ -131,7 +131,12 @@ class DisaggregatedAttentionPatcher:
             local_mask = attention_mask
             if q_len > 1 and local_mask is None:
                 kv_len = k.shape[-2]
-                mask = torch.full((q_len, kv_len), float("-inf"), device=q.device)
+                mask = torch.full(
+                    (q_len, kv_len),
+                    float("-inf"),
+                    device=q.device,
+                    dtype=torch.float32,
+                )
                 mask = torch.triu(mask, diagonal=1 + (kv_len - q_len))
                 local_mask = mask.view(1, 1, q_len, kv_len)
 
@@ -203,10 +208,11 @@ class DisaggregatedModel:
         with torch.no_grad():
             outputs = self.model(input_ids, use_cache=True)
             prompt_cache = outputs.past_key_values
-            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            next_token = outputs.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
 
         prompt_len = input_ids.shape[1]
         tokens = input_ids[0].tolist()
+        num_layers = len(prompt_cache.layers)
 
         # Offload each layer's static prompt KV cache to the remote Context Server
         for l_idx, layer in enumerate(prompt_cache.layers):
@@ -217,7 +223,7 @@ class DisaggregatedModel:
                 layer_idx=l_idx,
                 k=k_prompt,
                 v=v_prompt,
-                token_ids=tokens,
+                token_ids=tokens if l_idx == num_layers - 1 else None,
             )
 
         # Bind session to all patchers for subsequent decode steps
@@ -267,7 +273,9 @@ class DisaggregatedModel:
                 out_fast = self.model(
                     last_tok, position_ids=pos_tensor, use_cache=False
                 )
-                next_tok = out_fast.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                next_tok = (
+                    out_fast.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                )
         elif 0 < matched_len < prompt_len:
             # Disaggregated Delta Prefill:
             # Tokens [0..matched_len] are already warm on Context Server.
@@ -285,17 +293,20 @@ class DisaggregatedModel:
                     position_ids=suffix_pos,
                     use_cache=True,
                 )
-                next_tok = out_suffix.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                next_tok = (
+                    out_suffix.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                )
 
             # Append suffix KV activations to the Context Server
             suffix_tokens = tokens[matched_len:]
+            num_layers = len(suffix_cache.layers)
             for l_idx, layer in enumerate(suffix_cache.layers):
                 self.context_client.append_kv_sync(
                     session_id=session_id,
                     layer_idx=l_idx,
                     k_delta=layer.keys,
                     v_delta=layer.values,
-                    token_ids=suffix_tokens,
+                    token_ids=suffix_tokens if l_idx == num_layers - 1 else None,
                 )
 
             # Re-bind session with full context length for subsequent decode steps
@@ -323,7 +334,7 @@ class DisaggregatedModel:
                         use_cache=True,
                         position_ids=pos_tensor,
                     )
-                    cur_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                    cur_tok = out.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
                     yield cur_tok.item()
 
         finally:
@@ -372,10 +383,11 @@ class DisaggregatedModel:
         with torch.no_grad():
             outputs = self.model(input_ids, use_cache=True)
             prompt_cache = outputs.past_key_values
-            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            next_token = outputs.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
 
         prompt_len = input_ids.shape[1]
         tokens = input_ids[0].tolist()
+        num_layers = len(prompt_cache.layers)
 
         tasks = []
         for l_idx, layer in enumerate(prompt_cache.layers):
@@ -387,7 +399,7 @@ class DisaggregatedModel:
                     layer_idx=l_idx,
                     k=k_prompt,
                     v=v_prompt,
-                    token_ids=tokens,
+                    token_ids=tokens if l_idx == num_layers - 1 else None,
                 )
             )
         await asyncio.gather(*tasks)
@@ -435,7 +447,9 @@ class DisaggregatedModel:
                 out_fast = self.model(
                     last_tok, position_ids=pos_tensor, use_cache=False
                 )
-                next_tok = out_fast.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                next_tok = (
+                    out_fast.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                )
         elif 0 < matched_len < prompt_len:
             suffix_ids = input_ids[:, matched_len:]
             suffix_pos = torch.arange(
@@ -450,16 +464,19 @@ class DisaggregatedModel:
                     position_ids=suffix_pos,
                     use_cache=True,
                 )
-                next_tok = out_suffix.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                next_tok = (
+                    out_suffix.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                )
 
             suffix_tokens = tokens[matched_len:]
+            num_layers = len(suffix_cache.layers)
             tasks = [
                 self.context_client.append_kv(
                     session_id=session_id,
                     layer_idx=l_idx,
                     k_delta=layer.keys,
                     v_delta=layer.values,
-                    token_ids=suffix_tokens,
+                    token_ids=suffix_tokens if l_idx == num_layers - 1 else None,
                 )
                 for l_idx, layer in enumerate(suffix_cache.layers)
             ]
@@ -486,7 +503,7 @@ class DisaggregatedModel:
                         use_cache=True,
                         position_ids=pos_tensor,
                     )
-                    cur_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                    cur_tok = out.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
                     yield cur_tok.item()
 
         finally:
