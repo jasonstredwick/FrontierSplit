@@ -103,7 +103,7 @@ def test_gateway_disaggregated_non_streaming(disagg_cluster):
 
     choice = data["choices"][0]
     assert choice["index"] == 0
-    assert choice["finish_reason"] == "stop"
+    assert choice["finish_reason"] in ("stop", "length")
     assert choice["message"]["role"] == "assistant"
     assert len(choice["message"]["content"]) > 0
 
@@ -145,8 +145,8 @@ def test_gateway_disaggregated_streaming_sse(disagg_cluster):
     assert len(chunks) >= 4
     # First chunk introduces role
     assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
-    # Last chunk has finish_reason stop
-    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    # Last chunk has finish_reason stop or length
+    assert chunks[-1]["choices"][0]["finish_reason"] in ("stop", "length")
 
 
 def test_gateway_disaggregated_prefix_cache_reuse(disagg_cluster):

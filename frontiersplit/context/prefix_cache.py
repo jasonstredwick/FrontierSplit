@@ -119,7 +119,11 @@ class RadixPrefixCache:
 
         return count
 
-    def match(self, tokens: list[int] | tuple[int, ...]) -> tuple[list[RadixNode], int]:
+    def match(
+        self,
+        tokens: list[int] | tuple[int, ...],
+        required_layers: set[int] | None = None,
+    ) -> tuple[list[RadixNode], int]:
         """Finds the longest cached prefix matching the query token sequence.
 
         If a match ends midway through a node, that node is automatically split
@@ -127,6 +131,8 @@ class RadixPrefixCache:
 
         Args:
             tokens: Sequence of token IDs to match.
+            required_layers: Optional set of layer indices that a node must contain
+                to be considered a valid complete match.
 
         Returns:
             Tuple of (matched_node_chain, total_matched_tokens_length).
@@ -142,6 +148,11 @@ class RadixPrefixCache:
                 break
 
             child = curr.children[first_tok]
+            if required_layers and not (
+                required_layers.issubset(child.k_cache.keys())
+                and required_layers.issubset(child.v_cache.keys())
+            ):
+                break
             rem_tokens = seq[matched_len:]
 
             common_len = 0
@@ -279,7 +290,11 @@ class RadixPrefixCache:
         if not nodes:
             return {}, {}
 
-        layers = list(nodes[0].k_cache.keys())
+        layers = [
+            l_idx
+            for l_idx in nodes[0].k_cache
+            if all(l_idx in node.k_cache and l_idx in node.v_cache for node in nodes)
+        ]
         k_out: dict[int, torch.Tensor] = {}
         v_out: dict[int, torch.Tensor] = {}
 

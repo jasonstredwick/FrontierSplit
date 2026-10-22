@@ -154,3 +154,101 @@ def test_huggingface_disaggregated_model_prefix_cache_hit(
     finally:
         client.close_sync()
         server.stop_thread()
+
+
+def test_mistral_sliding_window_attention_equivalence() -> None:
+    """Verify MistralForCausalLM with sliding_window produces identical tokens to native HF."""
+    from transformers import MistralConfig, MistralForCausalLM
+
+    torch.manual_seed(9999)
+    cfg = MistralConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        sliding_window=3,
+    )
+    model = MistralForCausalLM(cfg).eval()
+    prompt = torch.tensor([[5, 12, 45, 99, 21]])
+    num_tokens = 5
+
+    with torch.no_grad():
+        out_prefill = model(prompt, use_cache=True)
+        mono_cache = copy.deepcopy(out_prefill.past_key_values)
+        first_tok = out_prefill.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        expected = [first_tok.item()]
+        cur = first_tok
+        for _ in range(num_tokens - 1):
+            o = model(cur, past_key_values=mono_cache, use_cache=True)
+            cur = o.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            expected.append(cur.item())
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    try:
+        disagg = DisaggregatedModel(model=model, context_client=client)
+        # 1. Cold prefill + sliding window decode
+        actual_cold = disagg.generate(
+            input_ids=prompt,
+            max_new_tokens=num_tokens,
+            session_id="mistral-sw-cold",
+        )
+        assert actual_cold == expected
+
+        # 2. 100% prefix cache hit + sliding window decode
+        actual_warm = disagg.generate(
+            input_ids=prompt,
+            max_new_tokens=num_tokens,
+            session_id="mistral-sw-warm",
+        )
+        assert actual_warm == expected
+    finally:
+        client.close_sync()
+        server.stop_thread()
+
+
+def test_eos_early_termination_and_first_token_stream_cleanup(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify stopping on EOS token and immediate cleanup when closing stream after first token."""
+    base_model, prompt, expected_tokens = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    try:
+        disagg = DisaggregatedModel(model=model, context_client=client)
+
+        # 1. Configure first emitted token as EOS -> should stop after 1 token with finish_reason="stop"
+        model.config.eos_token_id = expected_tokens[0]
+        eos_out = disagg.generate(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="eos-sess",
+        )
+        assert eos_out == [expected_tokens[0]]
+        assert disagg.get_finish_reason() == "stop"
+
+        # 2. Reset EOS and close stream after consuming only the first token -> must clean up session & patchers
+        model.config.eos_token_id = -1
+        stream = disagg.generate_stream(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="early-close-sess",
+            use_prefix_cache=False,
+        )
+        first = next(stream)
+        assert first == expected_tokens[0]
+        stream.close()
+
+        assert not server.store.has_session("early-close-sess")
+        assert all(p.active_session_id is None for p in disagg._patchers)
+    finally:
+        client.close_sync()
+        server.stop_thread()

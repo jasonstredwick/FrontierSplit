@@ -223,3 +223,44 @@ def test_fp16_long_context_no_overflow():
     assert out.dtype == torch.float16
     assert not torch.isnan(out).any()
     assert torch.allclose(out, torch.ones_like(out))
+
+
+def test_fp16_dot_product_no_overflow_before_fp32_cast():
+    """Verify FP16 Q @ K^T with entries of 32 and head_dim=128 does not overflow before scaling."""
+    batch, num_heads, q_len, kv_len, head_dim = 1, 2, 1, 4, 128
+    q = torch.full((batch, num_heads, q_len, head_dim), 32.0, dtype=torch.float16)
+    k = torch.full((batch, num_heads, kv_len, head_dim), 32.0, dtype=torch.float16)
+    v = torch.full((batch, num_heads, kv_len, head_dim), 2.5, dtype=torch.float16)
+
+    chunk = compute_partial_attention(q, k, v)
+    out = finalize_attention(chunk)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    assert not torch.isnan(out).any(), "FP16 dot product overflowed to NaN"
+    assert torch.allclose(out, ref, atol=1e-3)
+
+
+def test_all_neg_inf_masked_partition_merge():
+    """Verify that a fully masked (-inf) partition does not poison valid partitions with NaN."""
+    batch, num_heads, q_len, kv_len, head_dim = 1, 2, 1, 4, 16
+    q = torch.ones(batch, num_heads, q_len, head_dim)
+    k = torch.ones(batch, num_heads, kv_len, head_dim)
+    v_masked = torch.full((batch, num_heads, kv_len, head_dim), 999.0)
+    v_valid = torch.full((batch, num_heads, kv_len, head_dim), 2.0)
+
+    all_masked = torch.full((batch, 1, q_len, kv_len), float("-inf"))
+    chunk_masked = compute_partial_attention(q, k, v_masked, attention_mask=all_masked)
+    chunk_valid = compute_partial_attention(q, k, v_valid)
+
+    assert not torch.isnan(chunk_masked.accumulator).any()
+    assert not torch.isnan(chunk_masked.sum_exp).any()
+
+    merged_ab = merge_two_partial_attentions(chunk_masked, chunk_valid)
+    out_ab = finalize_attention(merged_ab)
+    assert not torch.isnan(out_ab).any()
+    assert torch.allclose(out_ab, torch.full_like(out_ab, 2.0))
+
+    merged_ba = merge_two_partial_attentions(chunk_valid, chunk_masked)
+    out_ba = finalize_attention(merged_ba)
+    assert not torch.isnan(out_ba).any()
+    assert torch.allclose(out_ba, torch.full_like(out_ba, 2.0))

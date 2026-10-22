@@ -8,6 +8,7 @@ them in real time via Online Softmax.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -147,27 +148,34 @@ class DisaggregatedAttention(nn.Module):
             )
         )
 
-        # 2. Concurrently append token to local output cache and compute local partial attention
-        k_local, v_local = self.kv_cache.append(
-            session_id=session_id,
-            layer_idx=self.layer_idx,
-            k_token=k_token,
-            v_token=v_token,
-        )
-        local_output_chunk = compute_partial_attention(
-            q=q,
-            k=k_local,
-            v=v_local,
-            scale=self.scale,
-        )
+        try:
+            # 2. Concurrently append token to local output cache and compute local partial attention
+            k_local, v_local = self.kv_cache.append(
+                session_id=session_id,
+                layer_idx=self.layer_idx,
+                k_token=k_token,
+                v_token=v_token,
+            )
+            local_output_chunk = compute_partial_attention(
+                q=q,
+                k=k_local.to(q.device),
+                v=v_local.to(q.device),
+                scale=self.scale,
+            )
 
-        # 3. Await the remote prompt partial attention chunk
-        remote_prompt_chunk = await remote_prompt_task
+            # 3. Await the remote prompt partial attention chunk
+            remote_prompt_chunk = await remote_prompt_task
+        except BaseException:
+            if not remote_prompt_task.done():
+                remote_prompt_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await remote_prompt_task
+            raise
 
         # 4. Merge prompt and output chunks via Online Softmax (zero accuracy loss)
         merged_chunk = merge_two_partial_attentions(
-            chunk_a=remote_prompt_chunk,
-            chunk_b=local_output_chunk,
+            chunk_a=remote_prompt_chunk.to(q.device),
+            chunk_b=local_output_chunk.to(q.device),
         )
 
         # 5. Finalize normalized attention

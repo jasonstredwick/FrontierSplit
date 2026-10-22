@@ -16,8 +16,13 @@ from frontiersplit.context.context_server import (
     ContextClient,
     ContextServer,
     ContextStore,
+    deserialize_chunk,
+    deserialize_tensor,
+    serialize_chunk,
+    serialize_tensor,
 )
 from frontiersplit.context.online_softmax import (
+    PartialAttentionChunk,
     compute_partial_attention,
     finalize_attention,
     merge_two_partial_attentions,
@@ -186,3 +191,127 @@ def test_context_server_prefix_caching_over_tcp():
     finally:
         client.close_sync()
         server.stop_thread()
+
+
+def test_raw_binary_serialization_roundtrip():
+    """Verify zero-pickle raw binary tensor and chunk serialization across dtypes."""
+    for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.int64):
+        if dtype == torch.int64:
+            t = torch.randint(-100, 100, (2, 4, 8), dtype=dtype)
+        else:
+            t = torch.randn(1, 8, 16, 64, dtype=dtype)
+        raw = serialize_tensor(t)
+        # Ensure it's compact raw binary (not a PK/ZIP archive)
+        assert not raw.startswith(b"PK")
+        rec = deserialize_tensor(raw)
+        assert rec.dtype == t.dtype
+        assert torch.equal(rec, t)
+
+    chunk = PartialAttentionChunk(
+        accumulator=torch.randn(1, 8, 1, 64, dtype=torch.float32),
+        max_score=torch.randn(1, 8, 1, 1, dtype=torch.float32),
+        sum_exp=torch.rand(1, 8, 1, 1, dtype=torch.float32),
+        dtype=torch.float16,
+    )
+    chunk_bytes = serialize_chunk(chunk)
+    assert not chunk_bytes.startswith(b"PK")
+    rec_chunk = deserialize_chunk(chunk_bytes)
+    assert rec_chunk.dtype == torch.float16
+    assert torch.equal(rec_chunk.accumulator, chunk.accumulator)
+    assert torch.equal(rec_chunk.max_score, chunk.max_score)
+    assert torch.equal(rec_chunk.sum_exp, chunk.sum_exp)
+
+
+def test_context_server_session_pinning_and_unpinning():
+    """Verify active sessions pin RadixNodes against LRU eviction and unpin on release."""
+    server = ContextServer(max_cached_tokens=10)
+    t1 = [1, 2, 3, 4, 5, 6]
+    k1 = torch.randn(1, 2, 6, 16)
+    v1 = torch.randn(1, 2, 6, 16)
+
+    # Register s1 (6 tokens) -> pinned while s1 is active
+    server.register_prompt("s1", layer_idx=0, k=k1, v=v1, token_ids=t1)
+    nodes_s1, _ = server.prefix_cache.match(t1)
+    assert nodes_s1[0].session_count == 1
+
+    # Release s1 -> unpins node in RadixPrefixCache while keeping it cached
+    server.release_session("s1")
+    assert nodes_s1[0].session_count == 0
+    assert server.prefix_cache.total_tokens == 6
+
+
+def test_incomplete_multilayer_upload_not_exposed_and_backfilled():
+    """Verify multi-layer uploads do not expose incomplete caches and backfill bound sessions."""
+    server = ContextServer(expected_num_layers=2)
+    tokens = [10, 20, 30, 40, 50]
+    k0 = torch.randn(1, 2, 5, 16)
+    v0 = torch.randn(1, 2, 5, 16)
+    k1 = torch.randn(1, 2, 5, 16)
+    v1 = torch.randn(1, 2, 5, 16)
+    q = torch.randn(1, 2, 1, 16)
+
+    # Upload only layer 0 with token_ids -> should NOT be matchable yet because layer 1 is missing
+    server.register_prompt("upload-sess", layer_idx=0, k=k0, v=v0, token_ids=tokens)
+    m_len, bound = server.match_prefix(tokens, target_session_id="reader-sess")
+    assert m_len == 0
+    assert bound is None
+
+    # Upload layer 1 -> now complete and matchable for all layers
+    server.register_prompt("upload-sess", layer_idx=1, k=k1, v=v1, token_ids=tokens)
+    m_len, bound = server.match_prefix(tokens, target_session_id="reader-sess")
+    assert m_len == 5
+    assert bound == "reader-sess"
+
+    # Querying both layer 0 and layer 1 on the bound session succeeds
+    c0 = server.query_partial_attention("reader-sess", layer_idx=0, q=q)
+    c1 = server.query_partial_attention("reader-sess", layer_idx=1, q=q)
+    assert c0.accumulator.shape == (1, 2, 1, 16)
+    assert c1.accumulator.shape == (1, 2, 1, 16)
+
+
+def test_async_rpc_cancellation_does_not_corrupt_subsequent_calls():
+    """Verify cancelling an in-flight async RPC resets the socket so the next call gets its own response."""
+
+    async def _run() -> None:
+        port = get_free_port()
+        server = ContextServer()
+        await server.start_server(host="127.0.0.1", port=port)
+        client = ContextClient(host="127.0.0.1", port=port)
+
+        try:
+            tokens_full = [1, 2, 3, 4, 5, 6, 7, 8]
+            k = torch.randn(1, 2, 8, 16)
+            v = torch.randn(1, 2, 8, 16)
+            await client.register_prompt(
+                "seed-sess", layer_idx=0, k=k, v=v, token_ids=tokens_full
+            )
+
+            # Intercept read_context_frame_async once to simulate cancellation while reply is in flight
+            orig_read = client.connect
+            await orig_read()
+            assert client.writer is not None and client.reader is not None
+
+            # Start a match_prefix request for 3 tokens ("cancelled") and cancel before reading response
+            from frontiersplit.context.context_server import (
+                MSG_MATCH_PREFIX_REQ,
+                pack_context_frame,
+            )
+
+            stale_frame = pack_context_frame(
+                MSG_MATCH_PREFIX_REQ,
+                {"token_ids": [1, 2, 3], "session_id": "cancelled"},
+                b"",
+            )
+            client.writer.write(stale_frame)
+            await client.writer.drain()
+            # Simulate task cancellation handler resetting transport
+            client._reset_async_transport()
+
+            # Subsequent match_prefix for 8 tokens ("live") must return (8, "live"), NOT (3, "cancelled")
+            matched_len, sid = await client.match_prefix(tokens_full, session_id="live")
+            assert (matched_len, sid) == (8, "live")
+        finally:
+            await client.close()
+            await server.stop_server()
+
+    asyncio.run(_run())

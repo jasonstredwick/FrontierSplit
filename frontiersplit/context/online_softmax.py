@@ -107,9 +107,32 @@ def compute_partial_attention(
 
     orig_dtype = q.dtype
 
-    # Compute raw scaled dot-product scores and upcast to FP32 for online softmax stability:
+    if kv_len == 0:
+        return PartialAttentionChunk(
+            accumulator=torch.zeros(
+                (batch_size, num_heads, q_len, head_dim),
+                dtype=torch.float32,
+                device=q.device,
+            ),
+            max_score=torch.full(
+                (batch_size, num_heads, q_len, 1),
+                float("-inf"),
+                dtype=torch.float32,
+                device=q.device,
+            ),
+            sum_exp=torch.zeros(
+                (batch_size, num_heads, q_len, 1),
+                dtype=torch.float32,
+                device=q.device,
+            ),
+            dtype=orig_dtype,
+        )
+
+    # Upcast Q and K to FP32 prior to matmul so unscaled dot products cannot overflow FP16:
     # [batch, num_heads, q_len, kv_len]
-    scores = torch.matmul(q, k.transpose(-2, -1)).to(torch.float32) * scale
+    scores = (
+        torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32)) * scale
+    )
 
     if attention_mask is not None:
         scores = scores + attention_mask.to(torch.float32)
@@ -118,14 +141,20 @@ def compute_partial_attention(
     # 1. Local maximum per query: [batch, num_heads, q_len, 1]
     max_score = torch.max(scores, dim=-1, keepdim=True).values
 
+    # Guard against (-inf) - (-inf) = NaN when an entire partition is masked out
+    safe_max = torch.where(
+        torch.isneginf(max_score), torch.zeros_like(max_score), max_score
+    )
+
     # 2. Unnormalized exponentiated probabilities: [batch, num_heads, q_len, kv_len]
-    p = torch.exp(scores - max_score)
+    p = torch.exp(scores - safe_max)
 
     # 3. Sum of exponentials (denominator): [batch, num_heads, q_len, 1]
     sum_exp = torch.sum(p, dim=-1, keepdim=True)
 
     # 4. Partial accumulator (numerator) in FP32: [batch, num_heads, q_len, head_dim]
     accumulator = torch.matmul(p, v.to(torch.float32))
+    accumulator = torch.where(sum_exp == 0, torch.zeros_like(accumulator), accumulator)
 
     return PartialAttentionChunk(
         accumulator=accumulator,
@@ -151,25 +180,36 @@ def merge_two_partial_attentions(
     Returns:
         Merged PartialAttentionChunk representing the combined context.
     """
+    target_device = chunk_b.accumulator.device
+    if chunk_a.accumulator.device != target_device:
+        chunk_a = chunk_a.to(target_device)
+
     max_a = chunk_a.max_score.to(torch.float32)
     max_b = chunk_b.max_score.to(torch.float32)
 
     # 1. Global maximum across both chunks
     m_global = torch.maximum(max_a, max_b)
-
-    # 2. Rescaling factors (guaranteed <= 1.0, zero risk of numerical overflow)
-    alpha_a = torch.exp(max_a - m_global)
-    alpha_b = torch.exp(max_b - m_global)
-
-    # 3. Rescaled denominators in FP32
-    sum_exp_global = (chunk_a.sum_exp.to(torch.float32) * alpha_a) + (
-        chunk_b.sum_exp.to(torch.float32) * alpha_b
+    safe_m_global = torch.where(
+        torch.isneginf(m_global), torch.zeros_like(m_global), m_global
     )
+
+    # 2. Rescaling factors (guaranteed <= 1.0, zero risk of numerical overflow or -inf - -inf)
+    alpha_a = torch.exp(max_a - safe_m_global)
+    alpha_b = torch.exp(max_b - safe_m_global)
+
+    # 3. Rescaled denominators in FP32 (mask out zero-weight partitions to prevent NaN * 0)
+    sum_a = chunk_a.sum_exp.to(torch.float32)
+    sum_b = chunk_b.sum_exp.to(torch.float32)
+    sum_exp_global = torch.where(
+        alpha_a == 0, torch.zeros_like(sum_a), sum_a * alpha_a
+    ) + (torch.where(alpha_b == 0, torch.zeros_like(sum_b), sum_b * alpha_b))
 
     # 4. Rescaled numerators in FP32
-    accumulator_global = (chunk_a.accumulator.to(torch.float32) * alpha_a) + (
-        chunk_b.accumulator.to(torch.float32) * alpha_b
-    )
+    acc_a = chunk_a.accumulator.to(torch.float32)
+    acc_b = chunk_b.accumulator.to(torch.float32)
+    accumulator_global = torch.where(
+        alpha_a == 0, torch.zeros_like(acc_a), acc_a * alpha_a
+    ) + torch.where(alpha_b == 0, torch.zeros_like(acc_b), acc_b * alpha_b)
 
     target_dtype = chunk_b.dtype if chunk_b.dtype is not None else chunk_a.dtype
 

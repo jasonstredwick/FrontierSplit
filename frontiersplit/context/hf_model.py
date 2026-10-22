@@ -8,7 +8,10 @@ and generate tokens using Online Softmax attention merging.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import logging
+import threading
 from collections.abc import AsyncIterator, Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -69,6 +72,11 @@ class DisaggregatedAttentionPatcher:
         self.context_client = context_client
         self.active_session_id: str | None = None
         self.active_context_len: int | None = None
+        self._session_var: contextvars.ContextVar[
+            tuple[str | None, int | None] | None
+        ] = contextvars.ContextVar(
+            f"frontiersplit_attn_session_{id(self)}", default=None
+        )
 
     def set_session(
         self, session_id: str | None, context_len: int | None = None
@@ -76,6 +84,30 @@ class DisaggregatedAttentionPatcher:
         """Sets the active session ID and optional prefix slice length."""
         self.active_session_id = session_id
         self.active_context_len = context_len
+        self._session_var.set((session_id, context_len))
+
+    def _get_active_session(self) -> tuple[str | None, int | None]:
+        """Returns the current task's (session_id, context_len) with instance fallback."""
+        ctx_val = self._session_var.get()
+        if ctx_val is not None:
+            return ctx_val
+        return self.active_session_id, self.active_context_len
+
+    def _get_sliding_window(self) -> int | None:
+        """Returns the sliding window size for this attention layer, if active."""
+        cfg = getattr(self.original_attn, "config", None)
+        if cfg is not None:
+            layer_types = getattr(cfg, "layer_types", None)
+            if (
+                isinstance(layer_types, (list, tuple))
+                and self.layer_idx < len(layer_types)
+                and "sliding" not in str(layer_types[self.layer_idx])
+            ):
+                return None
+        sw = getattr(self.original_attn, "sliding_window", None)
+        if sw is None and cfg is not None:
+            sw = getattr(cfg, "sliding_window", None)
+        return int(sw) if isinstance(sw, int) and sw > 0 else None
 
     def __call__(
         self,
@@ -85,8 +117,10 @@ class DisaggregatedAttentionPatcher:
         past_key_values: Any | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
+        session_id, context_len = self._get_active_session()
+
         # If no remote session bound (e.g. during prefill), use native HF attention forward
-        if self.active_session_id is None:
+        if session_id is None:
             return self.original_forward(
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
@@ -115,35 +149,94 @@ class DisaggregatedAttentionPatcher:
 
         # 4. Execute disaggregated attention merge over TCP
         scaling = getattr(self.original_attn, "scaling", 1.0 / (head_dim**0.5))
-
-        prompt_chunk = self.context_client.query_partial_attention_sync(
-            session_id=self.active_session_id,
-            layer_idx=self.layer_idx,
-            q=q,
-            scale=scaling,
-            context_len=self.active_context_len,
-        )
+        sliding_window = self._get_sliding_window()
 
         if past_key_values is None:
+            prompt_chunk = self.context_client.query_partial_attention_sync(
+                session_id=session_id,
+                layer_idx=self.layer_idx,
+                q=q,
+                scale=scaling,
+                context_len=context_len,
+                sliding_window=sliding_window,
+                past_local_len=0,
+            ).to(q.device)
             attn_out = finalize_attention(prompt_chunk)
         else:
             q_len = q.shape[-2]
+            kv_len = k.shape[-2]
             local_mask = attention_mask
-            if q_len > 1 and local_mask is None:
-                kv_len = k.shape[-2]
-                mask = torch.full(
-                    (q_len, kv_len),
-                    float("-inf"),
-                    device=q.device,
-                    dtype=torch.float32,
+            if q_len > 1 or (sliding_window is not None and kv_len > sliding_window):
+                q_idx = torch.arange(kv_len - q_len, kv_len, device=q.device).unsqueeze(
+                    1
                 )
-                mask = torch.triu(mask, diagonal=1 + (kv_len - q_len))
-                local_mask = mask.view(1, 1, q_len, kv_len)
+                k_idx = torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+                masked_out = k_idx > q_idx
+                if sliding_window is not None:
+                    masked_out = masked_out | (k_idx <= (q_idx - sliding_window))
+                if masked_out.any():
+                    built_mask = torch.where(
+                        masked_out,
+                        torch.full(
+                            (q_len, kv_len),
+                            float("-inf"),
+                            device=q.device,
+                            dtype=torch.float32,
+                        ),
+                        torch.zeros(
+                            (q_len, kv_len),
+                            device=q.device,
+                            dtype=torch.float32,
+                        ),
+                    ).view(1, 1, q_len, kv_len)
+                    local_mask = (
+                        built_mask
+                        if local_mask is None
+                        else local_mask.to(torch.float32) + built_mask
+                    )
 
-            # Compute local partial attention on volatile output tokens
-            local_chunk = compute_partial_attention(
-                q, k, v, scale=scaling, attention_mask=local_mask
+            # Overlap remote TCP query with local partial attention compute
+            sync_lock = getattr(
+                self.context_client, "_sync_lock", contextlib.nullcontext()
             )
+            if hasattr(self.context_client, "send_query_partial_sync") and hasattr(
+                self.context_client, "recv_query_partial_sync"
+            ):
+                with sync_lock:
+                    try:
+                        self.context_client.send_query_partial_sync(
+                            session_id=session_id,
+                            layer_idx=self.layer_idx,
+                            q=q,
+                            scale=scaling,
+                            context_len=context_len,
+                            sliding_window=sliding_window,
+                            past_local_len=kv_len,
+                        )
+                        # Compute local partial attention while Context Server computes remote chunk
+                        local_chunk = compute_partial_attention(
+                            q, k, v, scale=scaling, attention_mask=local_mask
+                        )
+                        prompt_chunk = self.context_client.recv_query_partial_sync(
+                            device=q.device
+                        )
+                    except BaseException:
+                        if hasattr(self.context_client, "close_sync"):
+                            self.context_client.close_sync()
+                        raise
+            else:
+                prompt_chunk = self.context_client.query_partial_attention_sync(
+                    session_id=session_id,
+                    layer_idx=self.layer_idx,
+                    q=q,
+                    scale=scaling,
+                    context_len=context_len,
+                    sliding_window=sliding_window,
+                    past_local_len=kv_len,
+                ).to(q.device)
+                local_chunk = compute_partial_attention(
+                    q, k, v, scale=scaling, attention_mask=local_mask
+                )
 
             # Merge via Online Softmax
             merged = merge_two_partial_attentions(prompt_chunk, local_chunk)
@@ -165,8 +258,38 @@ class DisaggregatedModel:
         self.model = model
         self.context_client = context_client
         self._patchers: list[DisaggregatedAttentionPatcher] = []
+        self._forward_lock = threading.RLock()
+        self.last_finish_reason: str = "stop"
+        self._finish_reason_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+            f"frontiersplit_finish_reason_{id(self)}", default="stop"
+        )
         self._patched = False
         self._patch_layers()
+
+    def _set_finish_reason(self, reason: str) -> None:
+        """Records the finish reason ('stop' or 'length') for the current generation."""
+        self.last_finish_reason = reason
+        self._finish_reason_var.set(reason)
+
+    def get_finish_reason(self) -> str:
+        """Returns the finish reason ('stop' or 'length') of the most recent generation."""
+        return self._finish_reason_var.get()
+
+    def _get_eos_token_ids(self) -> set[int]:
+        """Extracts configured EOS token IDs from model config and generation_config."""
+        eos_ids: set[int] = set()
+        for cfg in (
+            getattr(self.model, "config", None),
+            getattr(self.model, "generation_config", None),
+        ):
+            if cfg is None:
+                continue
+            val = getattr(cfg, "eos_token_id", None)
+            if isinstance(val, int):
+                eos_ids.add(val)
+            elif isinstance(val, (list, tuple, set)):
+                eos_ids.update(int(x) for x in val if x is not None)
+        return eos_ids
 
     def _patch_layers(self) -> None:
         """Installs disaggregated attention patchers across all model layers."""
@@ -202,11 +325,12 @@ class DisaggregatedModel:
         Returns:
             Tuple of (first_generated_token_id, prompt_length).
         """
-        # Disable disaggregation during prefill so standard full attention computes KV cache
-        self.set_active_session(None)
-
-        with torch.no_grad():
-            outputs = self.model(input_ids, use_cache=True)
+        prompt_cache = DynamicCache()
+        with self._forward_lock, torch.no_grad():
+            self.set_active_session(None)
+            outputs = self.model(
+                input_ids, past_key_values=prompt_cache, use_cache=True
+            )
             prompt_cache = outputs.past_key_values
             next_token = outputs.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
 
@@ -224,6 +348,7 @@ class DisaggregatedModel:
                 k=k_prompt,
                 v=v_prompt,
                 token_ids=tokens if l_idx == num_layers - 1 else None,
+                num_layers=num_layers,
             )
 
         # Bind session to all patchers for subsequent decode steps
@@ -251,83 +376,97 @@ class DisaggregatedModel:
         Yields:
             Generated token IDs one by one (including the first generated token).
         """
+        if max_new_tokens <= 0:
+            self._set_finish_reason("length")
+            return
+
         tokens = input_ids[0].tolist()
         prompt_len = len(tokens)
+        eos_ids = self._get_eos_token_ids()
+        self._set_finish_reason("length")
 
-        # Check for warm prefix cache hit on Context Server
-        cache_hit = False
-        matched_len = 0
-        if use_prefix_cache:
-            matched_len, _ = self.context_client.match_prefix_sync(
-                tokens, session_id=session_id
-            )
-            if matched_len == prompt_len:
-                cache_hit = True
-
-        if cache_hit:
-            # 100% prefix cache hit: skip full prefill compute
-            self.set_active_session(session_id)
-            last_tok = input_ids[:, -1:]
-            pos_tensor = torch.tensor([[prompt_len - 1]], device=input_ids.device)
-            with torch.no_grad():
-                out_fast = self.model(
-                    last_tok, position_ids=pos_tensor, use_cache=False
-                )
-                next_tok = (
-                    out_fast.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
-                )
-        elif 0 < matched_len < prompt_len:
-            # Disaggregated Delta Prefill:
-            # Tokens [0..matched_len] are already warm on Context Server.
-            # Suffix tokens [matched_len..prompt_len] run forward pass with disaggregated attention.
-            suffix_ids = input_ids[:, matched_len:]
-            suffix_pos = torch.arange(
-                matched_len, prompt_len, device=input_ids.device
-            ).unsqueeze(0)
-            self.set_active_session(session_id, context_len=matched_len)
-            suffix_cache = DynamicCache()
-            with torch.no_grad():
-                out_suffix = self.model(
-                    suffix_ids,
-                    past_key_values=suffix_cache,
-                    position_ids=suffix_pos,
-                    use_cache=True,
-                )
-                next_tok = (
-                    out_suffix.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
-                )
-
-            # Append suffix KV activations to the Context Server
-            suffix_tokens = tokens[matched_len:]
-            num_layers = len(suffix_cache.layers)
-            for l_idx, layer in enumerate(suffix_cache.layers):
-                self.context_client.append_kv_sync(
-                    session_id=session_id,
-                    layer_idx=l_idx,
-                    k_delta=layer.keys,
-                    v_delta=layer.values,
-                    token_ids=suffix_tokens if l_idx == num_layers - 1 else None,
-                )
-
-            # Re-bind session with full context length for subsequent decode steps
-            self.set_active_session(session_id, context_len=None)
-        else:
-            # 1. Prefill and offload prompt KV
-            next_tok, prompt_len = self.prefill_and_offload(input_ids, session_id)
-
-        yield next_tok.item()
-        cur_tok = next_tok
-
-        # 2. Local volatile output cache (starts empty; never holds prompt tokens)
-        local_cache = DynamicCache()
-
-        # 3. Autoregressive decode loop
         try:
+            # Check for warm prefix cache hit on Context Server
+            cache_hit = False
+            matched_len = 0
+            if use_prefix_cache:
+                matched_len, _ = self.context_client.match_prefix_sync(
+                    tokens, session_id=session_id
+                )
+                if matched_len == prompt_len:
+                    cache_hit = True
+
+            if cache_hit:
+                # 100% prefix cache hit: skip full prefill compute
+                last_tok = input_ids[:, -1:]
+                pos_tensor = torch.tensor([[prompt_len - 1]], device=input_ids.device)
+                with self._forward_lock, torch.no_grad():
+                    self.set_active_session(session_id)
+                    out_fast = self.model(
+                        last_tok, position_ids=pos_tensor, use_cache=False
+                    )
+                    next_tok = (
+                        out_fast.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                    )
+            elif 0 < matched_len < prompt_len:
+                # Disaggregated Delta Prefill:
+                # Tokens [0..matched_len] are already warm on Context Server.
+                # Suffix tokens [matched_len..prompt_len] run forward pass with disaggregated attention.
+                suffix_ids = input_ids[:, matched_len:]
+                suffix_pos = torch.arange(
+                    matched_len, prompt_len, device=input_ids.device
+                ).unsqueeze(0)
+                suffix_cache = DynamicCache()
+                with self._forward_lock, torch.no_grad():
+                    self.set_active_session(session_id, context_len=matched_len)
+                    out_suffix = self.model(
+                        suffix_ids,
+                        past_key_values=suffix_cache,
+                        position_ids=suffix_pos,
+                        use_cache=True,
+                    )
+                    next_tok = (
+                        out_suffix.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                    )
+
+                # Append suffix KV activations to the Context Server
+                suffix_tokens = tokens[matched_len:]
+                num_layers = len(suffix_cache.layers)
+                for l_idx, layer in enumerate(suffix_cache.layers):
+                    self.context_client.append_kv_sync(
+                        session_id=session_id,
+                        layer_idx=l_idx,
+                        k_delta=layer.keys,
+                        v_delta=layer.values,
+                        token_ids=suffix_tokens if l_idx == num_layers - 1 else None,
+                        num_layers=num_layers,
+                    )
+
+                # Re-bind session with full context length for subsequent decode steps
+                self.set_active_session(session_id, context_len=None)
+            else:
+                # 1. Prefill and offload prompt KV
+                next_tok, prompt_len = self.prefill_and_offload(input_ids, session_id)
+
+            first_tok_id = int(next_tok.item())
+            if first_tok_id in eos_ids:
+                self._set_finish_reason("stop")
+                yield first_tok_id
+                return
+
+            yield first_tok_id
+            cur_tok = next_tok
+
+            # 2. Local volatile output cache (starts empty; never holds prompt tokens)
+            local_cache = DynamicCache()
+
+            # 3. Autoregressive decode loop
             for step in range(1, max_new_tokens):
                 position = prompt_len + step - 1
                 pos_tensor = torch.tensor([[position]], device=input_ids.device)
 
-                with torch.no_grad():
+                with self._forward_lock, torch.no_grad():
+                    self.set_active_session(session_id, context_len=None)
                     out = self.model(
                         cur_tok,
                         past_key_values=local_cache,
@@ -335,11 +474,17 @@ class DisaggregatedModel:
                         position_ids=pos_tensor,
                     )
                     cur_tok = out.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
-                    yield cur_tok.item()
+                tok_id = int(cur_tok.item())
+                if tok_id in eos_ids:
+                    self._set_finish_reason("stop")
+                    yield tok_id
+                    return
+                yield tok_id
 
         finally:
             if release_on_completion:
-                self.context_client.release_session_sync(session_id)
+                with contextlib.suppress(Exception):
+                    self.context_client.release_session_sync(session_id)
             self.set_active_session(None)
 
     def generate(
@@ -378,10 +523,12 @@ class DisaggregatedModel:
         session_id: str,
     ) -> tuple[torch.Tensor, int]:
         """Asynchronously runs prefill on the prompt and offloads KV caches."""
-        self.set_active_session(None)
-
-        with torch.no_grad():
-            outputs = self.model(input_ids, use_cache=True)
+        prompt_cache = DynamicCache()
+        with self._forward_lock, torch.no_grad():
+            self.set_active_session(None)
+            outputs = self.model(
+                input_ids, past_key_values=prompt_cache, use_cache=True
+            )
             prompt_cache = outputs.past_key_values
             next_token = outputs.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
 
@@ -400,6 +547,7 @@ class DisaggregatedModel:
                     k=k_prompt,
                     v=v_prompt,
                     token_ids=tokens if l_idx == num_layers - 1 else None,
+                    num_layers=num_layers,
                 )
             )
         await asyncio.gather(*tasks)
@@ -427,76 +575,90 @@ class DisaggregatedModel:
         Yields:
             Generated token IDs one by one (including the first generated token).
         """
+        if max_new_tokens <= 0:
+            self._set_finish_reason("length")
+            return
+
         tokens = input_ids[0].tolist()
         prompt_len = len(tokens)
-
-        cache_hit = False
-        matched_len = 0
-        if use_prefix_cache:
-            matched_len, _ = await self.context_client.match_prefix(
-                tokens, session_id=session_id
-            )
-            if matched_len == prompt_len:
-                cache_hit = True
-
-        if cache_hit:
-            self.set_active_session(session_id)
-            last_tok = input_ids[:, -1:]
-            pos_tensor = torch.tensor([[prompt_len - 1]], device=input_ids.device)
-            with torch.no_grad():
-                out_fast = self.model(
-                    last_tok, position_ids=pos_tensor, use_cache=False
-                )
-                next_tok = (
-                    out_fast.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
-                )
-        elif 0 < matched_len < prompt_len:
-            suffix_ids = input_ids[:, matched_len:]
-            suffix_pos = torch.arange(
-                matched_len, prompt_len, device=input_ids.device
-            ).unsqueeze(0)
-            self.set_active_session(session_id, context_len=matched_len)
-            suffix_cache = DynamicCache()
-            with torch.no_grad():
-                out_suffix = self.model(
-                    suffix_ids,
-                    past_key_values=suffix_cache,
-                    position_ids=suffix_pos,
-                    use_cache=True,
-                )
-                next_tok = (
-                    out_suffix.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
-                )
-
-            suffix_tokens = tokens[matched_len:]
-            num_layers = len(suffix_cache.layers)
-            tasks = [
-                self.context_client.append_kv(
-                    session_id=session_id,
-                    layer_idx=l_idx,
-                    k_delta=layer.keys,
-                    v_delta=layer.values,
-                    token_ids=suffix_tokens if l_idx == num_layers - 1 else None,
-                )
-                for l_idx, layer in enumerate(suffix_cache.layers)
-            ]
-            await asyncio.gather(*tasks)
-            self.set_active_session(session_id, context_len=None)
-        else:
-            next_tok, prompt_len = await self.prefill_and_offload_async(
-                input_ids, session_id
-            )
-
-        yield next_tok.item()
-        cur_tok = next_tok
-        local_cache = DynamicCache()
+        eos_ids = self._get_eos_token_ids()
+        self._set_finish_reason("length")
 
         try:
+            cache_hit = False
+            matched_len = 0
+            if use_prefix_cache:
+                matched_len, _ = await self.context_client.match_prefix(
+                    tokens, session_id=session_id
+                )
+                if matched_len == prompt_len:
+                    cache_hit = True
+
+            if cache_hit:
+                last_tok = input_ids[:, -1:]
+                pos_tensor = torch.tensor([[prompt_len - 1]], device=input_ids.device)
+                with self._forward_lock, torch.no_grad():
+                    self.set_active_session(session_id)
+                    out_fast = self.model(
+                        last_tok, position_ids=pos_tensor, use_cache=False
+                    )
+                    next_tok = (
+                        out_fast.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                    )
+            elif 0 < matched_len < prompt_len:
+                suffix_ids = input_ids[:, matched_len:]
+                suffix_pos = torch.arange(
+                    matched_len, prompt_len, device=input_ids.device
+                ).unsqueeze(0)
+                suffix_cache = DynamicCache()
+                with self._forward_lock, torch.no_grad():
+                    self.set_active_session(session_id, context_len=matched_len)
+                    out_suffix = self.model(
+                        suffix_ids,
+                        past_key_values=suffix_cache,
+                        position_ids=suffix_pos,
+                        use_cache=True,
+                    )
+                    next_tok = (
+                        out_suffix.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                    )
+
+                suffix_tokens = tokens[matched_len:]
+                num_layers = len(suffix_cache.layers)
+                tasks = [
+                    self.context_client.append_kv(
+                        session_id=session_id,
+                        layer_idx=l_idx,
+                        k_delta=layer.keys,
+                        v_delta=layer.values,
+                        token_ids=suffix_tokens if l_idx == num_layers - 1 else None,
+                        num_layers=num_layers,
+                    )
+                    for l_idx, layer in enumerate(suffix_cache.layers)
+                ]
+                await asyncio.gather(*tasks)
+                self.set_active_session(session_id, context_len=None)
+            else:
+                next_tok, prompt_len = await self.prefill_and_offload_async(
+                    input_ids, session_id
+                )
+
+            first_tok_id = int(next_tok.item())
+            if first_tok_id in eos_ids:
+                self._set_finish_reason("stop")
+                yield first_tok_id
+                return
+
+            yield first_tok_id
+            cur_tok = next_tok
+            local_cache = DynamicCache()
+
             for step in range(1, max_new_tokens):
                 position = prompt_len + step - 1
                 pos_tensor = torch.tensor([[position]], device=input_ids.device)
 
-                with torch.no_grad():
+                with self._forward_lock, torch.no_grad():
+                    self.set_active_session(session_id, context_len=None)
                     out = self.model(
                         cur_tok,
                         past_key_values=local_cache,
@@ -504,11 +666,17 @@ class DisaggregatedModel:
                         position_ids=pos_tensor,
                     )
                     cur_tok = out.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
-                    yield cur_tok.item()
+                tok_id = int(cur_tok.item())
+                if tok_id in eos_ids:
+                    self._set_finish_reason("stop")
+                    yield tok_id
+                    return
+                yield tok_id
 
         finally:
             if release_on_completion:
-                await self.context_client.release_session(session_id)
+                with contextlib.suppress(Exception):
+                    await self.context_client.release_session(session_id)
             self.set_active_session(None)
 
     async def generate_async(

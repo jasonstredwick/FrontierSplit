@@ -307,6 +307,11 @@ def create_gateway_app(
                         yield f"data: {json.dumps(chunk)}\n\n"
 
                     # Final finish reason chunk
+                    finish_reason = (
+                        disagg.get_finish_reason()
+                        if hasattr(disagg, "get_finish_reason")
+                        else "stop"
+                    )
                     final_chunk = {
                         "id": req_id,
                         "object": "chat.completion.chunk",
@@ -316,7 +321,7 @@ def create_gateway_app(
                             {
                                 "index": 0,
                                 "delta": {},
-                                "finish_reason": "stop",
+                                "finish_reason": finish_reason,
                             }
                         ],
                     }
@@ -341,6 +346,11 @@ def create_gateway_app(
             )
             prompt_count = len(token_ids)
             comp_count = len(generated_token_ids)
+            finish_reason = (
+                disagg.get_finish_reason()
+                if hasattr(disagg, "get_finish_reason")
+                else "stop"
+            )
 
             response_payload = {
                 "id": req_id,
@@ -351,7 +361,7 @@ def create_gateway_app(
                     {
                         "index": 0,
                         "message": {"role": "assistant", "content": content},
-                        "finish_reason": "stop",
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": {
