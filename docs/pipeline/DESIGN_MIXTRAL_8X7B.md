@@ -70,7 +70,7 @@ $$\text{Total Network Latency per Decode Step} = 7 \times 0.4\text{ ms} \approx 
 This represents $< 1.5\%$ of the total step latency budget ($\sim 250\text{ ms}$), proving that scaling pipeline depth to 8 stages incurs virtually zero network tax.
 
 ### 3.3 Sparse MoE Feed-Forward Layer Handling
-In `frontiersplit/worker.py`, the feed-forward step automatically checks for the MoE block:
+In [`frontiersplit/pipeline/worker.py`](file:///Users/pixel/code/FrontierSplit/frontiersplit/pipeline/worker.py), the feed-forward step automatically checks for the MoE block:
 ```python
 # Normed hidden states: [B, 1, 4096]
 normed = layer.post_attention_layernorm(hidden_states)

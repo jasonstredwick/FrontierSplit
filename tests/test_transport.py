@@ -6,7 +6,7 @@ import socket
 import unittest
 import numpy as np
 
-from frontiersplit.protocol import (
+from frontiersplit.pipeline.protocol import (
     HEADER_SIZE,
     MAGIC,
     MSG_FORWARD_BATCHED_REQ,
@@ -19,7 +19,7 @@ from frontiersplit.protocol import (
     pack_header,
     unpack_header,
 )
-from frontiersplit.transport import BinaryTransportClient, BinaryTransportServer
+from frontiersplit.pipeline.transport import BinaryTransportClient, BinaryTransportServer
 
 
 def get_free_port() -> int:

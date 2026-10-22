@@ -2,7 +2,7 @@
 
 import unittest
 from unittest.mock import MagicMock
-from frontiersplit.worker import WorkerKVCacheStore
+from frontiersplit.pipeline.worker import WorkerKVCacheStore
 
 
 class TestStaticCache(unittest.TestCase):

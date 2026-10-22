@@ -22,9 +22,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from frontiersplit.context_server import ContextClient
-from frontiersplit.hf_model import DisaggregatedModel
-from frontiersplit.scheduler import PipelineScheduler
+from frontiersplit.context.context_server import ContextClient
+from frontiersplit.context.hf_model import DisaggregatedModel
+from frontiersplit.pipeline.scheduler import PipelineScheduler
 
 try:
     from transformers import AutoTokenizer

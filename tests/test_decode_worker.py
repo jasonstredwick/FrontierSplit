@@ -12,9 +12,12 @@ import socket
 
 import torch
 
-from frontiersplit.context_server import ContextClient, ContextServer
-from frontiersplit.decode_worker import DecodeWorker, LocalOutputKVCache
-from frontiersplit.online_softmax import compute_partial_attention, finalize_attention
+from frontiersplit.context.context_server import ContextClient, ContextServer
+from frontiersplit.context.decode_worker import DecodeWorker, LocalOutputKVCache
+from frontiersplit.context.online_softmax import (
+    compute_partial_attention,
+    finalize_attention,
+)
 
 
 def get_free_port() -> int:

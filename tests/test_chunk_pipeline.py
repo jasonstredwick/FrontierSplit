@@ -2,13 +2,13 @@
 
 import unittest
 import numpy as np
-from frontiersplit.protocol import (
+from frontiersplit.pipeline.protocol import (
     ChunkActivationPacket,
     ChunkGenerationResponse,
     MSG_FORWARD_CHUNK_REQ,
     MSG_FORWARD_CHUNK_RESP,
 )
-from frontiersplit.scheduler import ScheduledRequest
+from frontiersplit.pipeline.scheduler import ScheduledRequest
 
 
 class TestChunkPipeline(unittest.TestCase):
@@ -93,7 +93,7 @@ class TestChunkPipeline(unittest.TestCase):
         frame = resp.encode_binary()
 
         # Unpack header + meta
-        from frontiersplit.protocol import unpack_header, HEADER_SIZE
+        from frontiersplit.pipeline.protocol import unpack_header, HEADER_SIZE
         import json
         hdr = unpack_header(frame[:HEADER_SIZE])
         self.assertEqual(hdr["msg_type"], MSG_FORWARD_CHUNK_RESP)

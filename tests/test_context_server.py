@@ -12,12 +12,12 @@ import socket
 import pytest
 import torch
 
-from frontiersplit.context_server import (
+from frontiersplit.context.context_server import (
     ContextClient,
     ContextServer,
     ContextStore,
 )
-from frontiersplit.online_softmax import (
+from frontiersplit.context.online_softmax import (
     compute_partial_attention,
     finalize_attention,
     merge_two_partial_attentions,

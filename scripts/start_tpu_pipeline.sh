@@ -64,7 +64,7 @@ BIN_FLAG=\"$([ \"\$USE_BIN\" = \"0\" ] && echo \"--disable-binary\")\"
 
 # Launch all 8 TPU worker stages cleanly across the 8 TPU cores
 echo \"Starting 8-stage TPU worker processes via xmp.spawn...\"
-nohup python3 -m frontiersplit.tpu_runner \
+nohup python3 -m frontiersplit.pipeline.tpu_runner \
   --total-stages=8 \
   --model-name=\$MODEL \
   \$BIN_FLAG \

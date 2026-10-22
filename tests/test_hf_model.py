@@ -14,8 +14,8 @@ import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from frontiersplit.context_server import ContextClient, ContextServer
-from frontiersplit.hf_model import DisaggregatedModel
+from frontiersplit.context.context_server import ContextClient, ContextServer
+from frontiersplit.context.hf_model import DisaggregatedModel
 
 
 @pytest.fixture

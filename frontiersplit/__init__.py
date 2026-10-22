@@ -1,14 +1,32 @@
-"""FrontierSplit: Disaggregated Long-Context Inference Engine using Online Softmax."""
+"""FrontierSplit: Distributed LLM Inference Engine.
 
-from frontiersplit.context_server import (
+Subpackages:
+- `frontiersplit.context`: Disaggregated Long-Context Serving using Online Softmax RPCs.
+- `frontiersplit.pipeline`: 1F1B Distributed Pipeline Parallel Slicing (TPU / multi-GPU).
+- `frontiersplit.gateway`: Unified OpenAI-compatible API Ingress.
+"""
+
+from frontiersplit.context import (
+    ConsistentHashRing,
     ContextClient,
     ContextServer,
+    ContextShardNode,
     ContextStore,
-)
-from frontiersplit.decode_worker import (
     DecodeWorker,
     DisaggregatedAttention,
+    DisaggregatedAttentionPatcher,
+    DisaggregatedModel,
     LocalOutputKVCache,
+    PartialAttentionChunk,
+    PrefixRouter,
+    RadixNode,
+    RadixPrefixCache,
+    ShardRoutingDecision,
+    compute_partial_attention,
+    finalize_attention,
+    merge_partial_attentions,
+    merge_two_partial_attentions,
+    repeat_kv,
 )
 from frontiersplit.gateway import (
     ChatCompletionRequest,
@@ -16,35 +34,26 @@ from frontiersplit.gateway import (
     ChatMessage,
     create_gateway_app,
 )
-from frontiersplit.hf_model import (
-    DisaggregatedAttentionPatcher,
-    DisaggregatedModel,
-)
-from frontiersplit.online_softmax import (
-    PartialAttentionChunk,
-    compute_partial_attention,
-    finalize_attention,
-    merge_partial_attentions,
-    merge_two_partial_attentions,
-    repeat_kv,
-)
-from frontiersplit.prefix_cache import (
-    RadixNode,
-    RadixPrefixCache,
-)
-from frontiersplit.routing import (
-    ConsistentHashRing,
-    ContextShardNode,
-    PrefixRouter,
-    ShardRoutingDecision,
+from frontiersplit.pipeline import (
+    ActivationPacket,
+    BatchedActivationPacket,
+    BinaryTransportClient,
+    BinaryTransportServer,
+    ModelSlicer,
+    ModelSpec,
+    PipelineScheduler,
+    ReleaseSessionPacket,
+    ScheduledRequest,
+    ShardPlanner,
+    WorkerKVCacheStore,
+    create_worker_app,
+    resolve_model_spec,
 )
 
 __version__ = "0.2.0.dev0"
 
 __all__ = [
-    "ChatCompletionRequest",
-    "ChatCompletionResponse",
-    "ChatMessage",
+    # Context Engine
     "ConsistentHashRing",
     "ContextClient",
     "ContextServer",
@@ -61,9 +70,27 @@ __all__ = [
     "RadixPrefixCache",
     "ShardRoutingDecision",
     "compute_partial_attention",
-    "create_gateway_app",
     "finalize_attention",
     "merge_partial_attentions",
     "merge_two_partial_attentions",
     "repeat_kv",
+    # Gateway
+    "ChatCompletionRequest",
+    "ChatCompletionResponse",
+    "ChatMessage",
+    "create_gateway_app",
+    # Pipeline Engine
+    "ActivationPacket",
+    "BatchedActivationPacket",
+    "BinaryTransportClient",
+    "BinaryTransportServer",
+    "ModelSlicer",
+    "ModelSpec",
+    "PipelineScheduler",
+    "ReleaseSessionPacket",
+    "ScheduledRequest",
+    "ShardPlanner",
+    "WorkerKVCacheStore",
+    "create_worker_app",
+    "resolve_model_spec",
 ]

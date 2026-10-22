@@ -7,7 +7,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from frontiersplit.gateway import create_gateway_app
-from frontiersplit.scheduler import PipelineScheduler
+from frontiersplit.pipeline.scheduler import PipelineScheduler
 
 
 class TestConcurrentScheduler(unittest.TestCase):

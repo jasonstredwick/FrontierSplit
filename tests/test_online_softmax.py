@@ -9,7 +9,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from frontiersplit.online_softmax import (
+from frontiersplit.context.online_softmax import (
     compute_partial_attention,
     finalize_attention,
     merge_partial_attentions,

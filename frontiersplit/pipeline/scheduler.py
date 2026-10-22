@@ -14,8 +14,8 @@ from typing import Any
 
 import requests
 
-from frontiersplit.models import resolve_model_spec
-from frontiersplit.protocol import (
+from frontiersplit.pipeline.models import resolve_model_spec
+from frontiersplit.pipeline.protocol import (
     ActivationPacket,
     BatchedGenerationResponse,
     ChunkActivationPacket,
@@ -23,7 +23,7 @@ from frontiersplit.protocol import (
     GenerationResponse,
     ReleaseSessionPacket,
 )
-from frontiersplit.transport import BinaryTransportClient, BinaryTransportServer
+from frontiersplit.pipeline.transport import BinaryTransportClient, BinaryTransportServer
 
 
 class ScheduledRequest:

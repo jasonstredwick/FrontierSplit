@@ -5,14 +5,14 @@ import socket
 import unittest
 import numpy as np
 
-from frontiersplit.protocol import (
+from frontiersplit.pipeline.protocol import (
     BatchedActivationPacket,
     FLAG_QUANTIZED,
     HEADER_SIZE,
     unpack_header,
 )
-from frontiersplit.scheduler import PipelineScheduler
-from frontiersplit.worker import create_worker_app
+from frontiersplit.pipeline.scheduler import PipelineScheduler
+from frontiersplit.pipeline.worker import create_worker_app
 
 
 def get_free_port() -> int:

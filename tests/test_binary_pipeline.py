@@ -6,10 +6,10 @@ import unittest
 import numpy as np
 
 from frontiersplit.gateway import create_gateway_app
-from frontiersplit.protocol import BatchedActivationPacket, ReleaseSessionPacket
-from frontiersplit.scheduler import PipelineScheduler, ScheduledRequest
-from frontiersplit.transport import BinaryTransportClient
-from frontiersplit.worker import create_worker_app
+from frontiersplit.pipeline.protocol import BatchedActivationPacket, ReleaseSessionPacket
+from frontiersplit.pipeline.scheduler import PipelineScheduler, ScheduledRequest
+from frontiersplit.pipeline.transport import BinaryTransportClient
+from frontiersplit.pipeline.worker import create_worker_app
 
 
 def get_free_port() -> int:

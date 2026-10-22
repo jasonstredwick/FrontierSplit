@@ -14,15 +14,16 @@ import logging
 import socket
 import struct
 import threading
+import time
 from typing import Any
 
 import torch
 
-from frontiersplit.online_softmax import (
+from frontiersplit.context.online_softmax import (
     PartialAttentionChunk,
     compute_partial_attention,
 )
-from frontiersplit.prefix_cache import RadixPrefixCache
+from frontiersplit.context.prefix_cache import RadixPrefixCache
 
 logger = logging.getLogger("frontiersplit.context_server")
 
@@ -35,6 +36,8 @@ MSG_RELEASE_SESSION_REQ = 0x24
 MSG_RELEASE_SESSION_RESP = 0x25
 MSG_MATCH_PREFIX_REQ = 0x26
 MSG_MATCH_PREFIX_RESP = 0x27
+MSG_APPEND_KV_REQ = 0x28
+MSG_APPEND_KV_RESP = 0x29
 
 # 16-byte fixed binary header: MAGIC (2B), msg_type (1B), flags (1B), meta_len (4B), payload_len (8B)
 CONTEXT_HEADER_FORMAT = "<2sBB I Q"
@@ -148,9 +151,19 @@ def deserialize_chunk(data: bytes) -> PartialAttentionChunk:
 class ContextStore:
     """Thread-safe in-memory storage for static prompt Key-Value tensors."""
 
-    def __init__(self) -> None:
+    def __init__(self, ttl_seconds: float = 600.0) -> None:
         # Structure: {session_id: {layer_idx: (k_prompt, v_prompt)}}
         self._store: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        self._session_last_access: dict[str, float] = {}
+        self.ttl_seconds = ttl_seconds
+
+    def touch_session(self, session_id: str) -> None:
+        """Refreshes the sliding TTL timestamp for a session."""
+        self._session_last_access[session_id] = time.time()
+
+    def get_last_access(self, session_id: str) -> float | None:
+        """Returns the timestamp of last access for a session."""
+        return self._session_last_access.get(session_id)
 
     def register_prompt(
         self,
@@ -163,6 +176,33 @@ class ContextStore:
         if session_id not in self._store:
             self._store[session_id] = {}
         self._store[session_id][layer_idx] = (k.detach(), v.detach())
+        self.touch_session(session_id)
+
+    def append_kv(
+        self,
+        session_id: str,
+        layer_idx: int,
+        k_delta: torch.Tensor,
+        v_delta: torch.Tensor,
+    ) -> int:
+        """Appends a delta Key-Value tensor slice to an existing session cache.
+
+        Returns:
+            The new cumulative sequence length along the sequence dimension (-2).
+        """
+        if session_id not in self._store:
+            self._store[session_id] = {}
+
+        if layer_idx not in self._store[session_id]:
+            self._store[session_id][layer_idx] = (k_delta.detach(), v_delta.detach())
+        else:
+            k_prev, v_prev = self._store[session_id][layer_idx]
+            k_new = torch.cat([k_prev, k_delta.detach().to(k_prev.device)], dim=-2)
+            v_new = torch.cat([v_prev, v_delta.detach().to(v_prev.device)], dim=-2)
+            self._store[session_id][layer_idx] = (k_new, v_new)
+
+        self.touch_session(session_id)
+        return self._store[session_id][layer_idx][0].shape[-2]
 
     def get_prompt(
         self,
@@ -173,6 +213,7 @@ class ContextStore:
         session = self._store.get(session_id)
         if session is None:
             return None
+        self.touch_session(session_id)
         return session.get(layer_idx)
 
     def has_session(self, session_id: str) -> bool:
@@ -181,10 +222,31 @@ class ContextStore:
 
     def release_session(self, session_id: str) -> bool:
         """Evicts the prompt KV cache for a completed session."""
+        self._session_last_access.pop(session_id, None)
         if session_id in self._store:
             del self._store[session_id]
             return True
         return False
+
+    def evict_expired(self, max_idle_seconds: float | None = None) -> list[str]:
+        """Evicts all sessions that have exceeded their sliding TTL window.
+
+        Args:
+            max_idle_seconds: Custom idle threshold in seconds, or self.ttl_seconds.
+
+        Returns:
+            List of evicted session IDs.
+        """
+        limit = max_idle_seconds if max_idle_seconds is not None else self.ttl_seconds
+        now = time.time()
+        expired = [
+            sid
+            for sid, last_t in list(self._session_last_access.items())
+            if (now - last_t) > limit
+        ]
+        for sid in expired:
+            self.release_session(sid)
+        return expired
 
     def get_session_layers(
         self, session_id: str
@@ -200,14 +262,20 @@ class ContextStore:
     def clear(self) -> None:
         """Clears all stored sessions."""
         self._store.clear()
+        self._session_last_access.clear()
 
 
 class ContextServer:
     """Server that computes partial attention against stored prompt KV caches."""
 
-    def __init__(self, device: str = "cpu", max_cached_tokens: int = 1_000_000) -> None:
+    def __init__(
+        self,
+        device: str = "cpu",
+        max_cached_tokens: int = 1_000_000,
+        session_ttl_seconds: float = 600.0,
+    ) -> None:
         self.device = torch.device(device)
-        self.store = ContextStore()
+        self.store = ContextStore(ttl_seconds=session_ttl_seconds)
         self.prefix_cache = RadixPrefixCache(max_cached_tokens=max_cached_tokens)
         self._session_tokens: dict[str, list[int]] = {}
         self._server: asyncio.Server | None = None
@@ -243,6 +311,40 @@ class ContextServer:
                 v_dict = {layer_i: kv[1] for layer_i, kv in layers.items()}
                 self.prefix_cache.insert(toks, k_dict, v_dict)
 
+    def append_kv(
+        self,
+        session_id: str,
+        layer_idx: int,
+        k_delta: torch.Tensor,
+        v_delta: torch.Tensor,
+        token_ids: list[int] | None = None,
+    ) -> int:
+        """Appends a delta KV tensor slice to an active session cache."""
+        new_len = self.store.append_kv(
+            session_id=session_id,
+            layer_idx=layer_idx,
+            k_delta=k_delta.to(self.device),
+            v_delta=v_delta.to(self.device),
+        )
+
+        if token_ids is not None:
+            prev = self._session_tokens.get(session_id, [])
+            self._session_tokens[session_id] = prev + token_ids
+            layers = self.store.get_session_layers(session_id)
+            if layers is not None:
+                k_dict = {layer_i: kv[0] for layer_i, kv in layers.items()}
+                v_dict = {layer_i: kv[1] for layer_i, kv in layers.items()}
+                self.prefix_cache.insert(self._session_tokens[session_id], k_dict, v_dict)
+
+        return new_len
+
+    def evict_expired_sessions(self, max_idle_seconds: float | None = None) -> list[str]:
+        """Evicts sessions whose sliding TTL has expired."""
+        evicted = self.store.evict_expired(max_idle_seconds=max_idle_seconds)
+        for sid in evicted:
+            self._session_tokens.pop(sid, None)
+        return evicted
+
     def match_prefix(
         self,
         token_ids: list[int],
@@ -272,14 +374,27 @@ class ContextServer:
         layer_idx: int,
         q: torch.Tensor,
         scale: float | None = None,
+        context_len: int | None = None,
     ) -> PartialAttentionChunk:
-        """Computes partial attention for a given query against the stored prompt."""
+        """Computes partial attention for a given query against stored prompt KV.
+
+        Args:
+            session_id: Unique session identifier.
+            layer_idx: Transformer layer index.
+            q: Query tensor of shape `[batch, num_heads, q_len, head_dim]`.
+            scale: Softmax temperature scale factor.
+            context_len: Optional prefix slice length for zero-copy subset sharing.
+        """
         kv = self.store.get_prompt(session_id, layer_idx)
         if kv is None:
             raise KeyError(
                 f"No prompt KV cache found for session '{session_id}', layer {layer_idx}"
             )
         k, v = kv
+        if context_len is not None and context_len < k.shape[-2]:
+            k = k[:, :, :context_len, :]
+            v = v[:, :, :context_len, :]
+
         q_dev = q.to(self.device)
         return compute_partial_attention(q_dev, k, v, scale=scale)
 
@@ -313,11 +428,16 @@ class ContextServer:
                     session_id = meta["session_id"]
                     layer_idx = meta["layer_idx"]
                     scale = meta.get("scale")
+                    context_len = meta.get("context_len")
                     q = deserialize_tensor(payload)
 
                     try:
                         chunk = self.query_partial_attention(
-                            session_id, layer_idx, q, scale=scale
+                            session_id,
+                            layer_idx,
+                            q,
+                            scale=scale,
+                            context_len=context_len,
                         )
                         chunk_bytes = serialize_chunk(chunk)
                         resp = pack_context_frame(
@@ -335,6 +455,31 @@ class ContextServer:
                             {"status": "error", "error": str(e)},
                             b"",
                         )
+                    writer.write(resp)
+                    await writer.drain()
+
+                elif msg_type == MSG_APPEND_KV_REQ:
+                    session_id = meta["session_id"]
+                    layer_idx = meta["layer_idx"]
+                    token_ids = meta.get("token_ids")
+                    tensors = torch.load(io.BytesIO(payload), weights_only=True)
+                    new_len = self.append_kv(
+                        session_id=session_id,
+                        layer_idx=layer_idx,
+                        k_delta=tensors["k"],
+                        v_delta=tensors["v"],
+                        token_ids=token_ids,
+                    )
+                    resp = pack_context_frame(
+                        MSG_APPEND_KV_RESP,
+                        {
+                            "status": "ok",
+                            "session_id": session_id,
+                            "layer_idx": layer_idx,
+                            "new_len": new_len,
+                        },
+                        b"",
+                    )
                     writer.write(resp)
                     await writer.drain()
 
@@ -574,6 +719,7 @@ class ContextClient:
         layer_idx: int,
         q: torch.Tensor,
         scale: float | None = None,
+        context_len: int | None = None,
     ) -> PartialAttentionChunk:
         """Queries the remote Context Server to compute partial attention over prompt."""
         async with self._get_lock():
@@ -581,11 +727,15 @@ class ContextClient:
             assert self.writer is not None and self.reader is not None
 
             payload = serialize_tensor(q)
-            frame = pack_context_frame(
-                MSG_QUERY_PARTIAL_REQ,
-                {"session_id": session_id, "layer_idx": layer_idx, "scale": scale},
-                payload,
-            )
+            meta: dict[str, Any] = {
+                "session_id": session_id,
+                "layer_idx": layer_idx,
+                "scale": scale,
+            }
+            if context_len is not None:
+                meta["context_len"] = context_len
+
+            frame = pack_context_frame(MSG_QUERY_PARTIAL_REQ, meta, payload)
             self.writer.write(frame)
             await self.writer.drain()
 
@@ -602,15 +752,20 @@ class ContextClient:
         layer_idx: int,
         q: torch.Tensor,
         scale: float | None = None,
+        context_len: int | None = None,
     ) -> PartialAttentionChunk:
         """Queries the remote Context Server synchronously over raw TCP socket."""
         sock = self.connect_sync()
         payload = serialize_tensor(q)
-        frame = pack_context_frame(
-            MSG_QUERY_PARTIAL_REQ,
-            {"session_id": session_id, "layer_idx": layer_idx, "scale": scale},
-            payload,
-        )
+        meta: dict[str, Any] = {
+            "session_id": session_id,
+            "layer_idx": layer_idx,
+            "scale": scale,
+        }
+        if context_len is not None:
+            meta["context_len"] = context_len
+
+        frame = pack_context_frame(MSG_QUERY_PARTIAL_REQ, meta, payload)
         sock.sendall(frame)
         msg_type, meta, resp_payload = read_context_frame_sync(sock)
         if meta.get("status") != "ok":
@@ -618,6 +773,65 @@ class ContextClient:
                 f"Context Server error: {meta.get('error', 'unknown error')}"
             )
         return deserialize_chunk(resp_payload)
+
+    async def append_kv(
+        self,
+        session_id: str,
+        layer_idx: int,
+        k_delta: torch.Tensor,
+        v_delta: torch.Tensor,
+        token_ids: list[int] | None = None,
+    ) -> int:
+        """Appends delta KV tensors to an active session cache on the Context Server."""
+        async with self._get_lock():
+            await self.connect()
+            assert self.writer is not None and self.reader is not None
+
+            buf = io.BytesIO()
+            torch.save({"k": k_delta.contiguous(), "v": v_delta.contiguous()}, buf)
+            payload = buf.getvalue()
+
+            meta: dict[str, Any] = {"session_id": session_id, "layer_idx": layer_idx}
+            if token_ids is not None:
+                meta["token_ids"] = token_ids
+
+            frame = pack_context_frame(MSG_APPEND_KV_REQ, meta, payload)
+            self.writer.write(frame)
+            await self.writer.drain()
+
+            msg_type, resp_meta, _ = await read_context_frame_async(self.reader)
+            if resp_meta.get("status") != "ok":
+                raise RuntimeError(
+                    f"Context Server error: {resp_meta.get('error', 'unknown error')}"
+                )
+            return int(resp_meta.get("new_len", 0))
+
+    def append_kv_sync(
+        self,
+        session_id: str,
+        layer_idx: int,
+        k_delta: torch.Tensor,
+        v_delta: torch.Tensor,
+        token_ids: list[int] | None = None,
+    ) -> int:
+        """Synchronously appends delta KV tensors over TCP."""
+        sock = self.connect_sync()
+        buf = io.BytesIO()
+        torch.save({"k": k_delta.contiguous(), "v": v_delta.contiguous()}, buf)
+        payload = buf.getvalue()
+
+        meta: dict[str, Any] = {"session_id": session_id, "layer_idx": layer_idx}
+        if token_ids is not None:
+            meta["token_ids"] = token_ids
+
+        frame = pack_context_frame(MSG_APPEND_KV_REQ, meta, payload)
+        sock.sendall(frame)
+        msg_type, resp_meta, _ = read_context_frame_sync(sock)
+        if resp_meta.get("status") != "ok":
+            raise RuntimeError(
+                f"Context Server error: {resp_meta.get('error', 'unknown error')}"
+            )
+        return int(resp_meta.get("new_len", 0))
 
     def close_sync(self) -> None:
         """Synchronously closes the persistent TCP socket."""

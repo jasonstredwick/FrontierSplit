@@ -3,13 +3,13 @@
 import unittest
 from fastapi.testclient import TestClient
 
-from frontiersplit.protocol import (
+from frontiersplit.pipeline.protocol import (
     ActivationPacket,
     BatchedActivationPacket,
     ReleaseSessionPacket,
     ReleaseSessionResponse,
 )
-from frontiersplit.worker import WorkerKVCacheStore, create_worker_app
+from frontiersplit.pipeline.worker import WorkerKVCacheStore, create_worker_app
 
 
 class TestWorkerKVCacheStore(unittest.TestCase):

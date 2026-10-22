@@ -73,19 +73,41 @@ In earlier architectural discussions, a candidate approach was maintaining an ar
 FrontierSplit strictly adopts a **generalized zero-threshold design**:
 1. **Elimination of Thrashing & Branching**: Dual-path logic (local vs. remote) introduces state synchronization races, cache coherence bugs, and memory fragmentation when requests cross the threshold mid-generation.
 2. **Deterministic Memory Footprint on Workers**: Because workers do not permanently retain large session KV pools in GPU VRAM, decode workers can run with minimal static memory, allowing higher micro-batch concurrency.
-### 2.2 Generalized Request Lifecycle
-1. **Ingress & Prefix Lookup**:
-   - The ingress router tokenizes the incoming message list $[t_1, t_2, \dots, t_M]$.
-   - The router queries the designated Context Server shard for the longest matching prefix $[t_1, \dots, t_K]$ ($K \le M$).
-2. **Prefill Phase (If $K < M$)**:
-   - If $K < M$, the suffix tokens $[t_{K+1}, \dots, t_M]$ are dispatched to an available **Prefill Worker**.
-   - The prefill worker computes the forward pass over the suffix, generating new Key-Value activations.
-   - The prefill worker streams the computed KV tensors directly to the target Context Server shard over persistent TCP (`MSG_STORE_KV`), updating the Radix Tree.
-3. **Autoregressive Decode Phase**:
-   - The first token is dispatched to a **Decode Worker**.
-   - For each generation step, the decode worker updates the session KV state via the Context Fabric or maintains a lightweight sliding-window local buffer with periodic chunk commits.
-4. **Session Reclamation**:
-   - Once the generation completes or the client closes the SSE connection, the gateway issues `ReleaseSessionPacket` to free transient decode buffers, while the shared prefix branch remains pinned in the Radix Tree.
+### 2.2 Generalized Request Lifecycle & Multi-Turn Continuation
+
+FrontierSplit eliminates the need to shuttle gigabytes of KV caches between workers or re-prefill entire conversational histories:
+
+```
+Turn 1: Initial Prompt (e.g. 500k tokens)
+   Worker Prefill ──► Registers 500k KV on Context Machine (Sliding TTL: 10m)
+   Worker Decode  ──► Streams 8 KB queries per layer, merges via Online Softmax
+
+Turn 2: Follow-up Message (e.g. 100 new tokens)
+   Worker Prefill ──► Streams Q_new (800 KB) layer-by-layer to Context Machine
+   Context Machine──► Returns (A_p, m_p, l_p) partial attention
+   Worker Merge   ──► Merges via Online Softmax, executes MLP, repeats for L layers
+   Commit Delta   ──► Appends only the 100 new (K, V) tokens to Context Machine
+   Worker Decode  ──► Resumes single-token generation stream (8 KB payloads)
+```
+
+1. **Turn 1 (Initial Long Context Prefill)**:
+   - The Compute Worker runs prefill on the initial prompt (e.g., 100k–500k tokens of documentation or code).
+   - The computed Key-Value activations are stored directly on the **Weightless Context Server** (`MSG_STORE_KV`), initializing a sliding Time-To-Live (TTL).
+   - The Decode Worker begins autoregressive generation, sending $8\text{ KB}$ query vectors per layer and merging partial attention via Online Softmax.
+2. **Turn 2 (Disaggregated Delta Prefill)**:
+   - When a follow-up turn arrives sharing the existing prefix, the system **does not move the 500k KV cache** back to the worker.
+   - For the $M$ new tokens (e.g., 100 tokens), the Compute Worker computes queries $Q_{\text{new}}$ layer-by-layer:
+     - Worker transmits $Q_{\text{new}}$ ($M \times 8\text{ KB}$) to the Context Server.
+     - Context Server computes partial attention against the stationary 500k KV cache and returns $(A_p, m_p, \ell_p)$.
+     - Worker merges with local self-attention over the new tokens via Online Softmax, executes the layer MLP, and advances to the next layer.
+   - Once all layers complete, the worker appends only the new $M$-token $(K, V)$ slice to the Context Server (`MSG_APPEND_KV`).
+3. **Zero-Copy Prefix Slicing (Branching & Subset Sharing)**:
+   - Because transformer self-attention is causal, token activations for indices $0 \dots K$ are completely invariant to whatever tokens follow them.
+   - If a new request shares only a subset $[0 \dots K]$ of an existing $N$-token cache ($K \le N$), the Context Server executes attention against a slice: `K[:K]` and `V[:K]`.
+   - **Zero memory duplication**: Multiple agent branches or speculative threads share the exact same stationary tensor slab in memory without copying data.
+4. **Output Token Commit Policy**:
+   - **Short Outputs ($< 500$ tokens)**: Discarded from the Context Server on stream completion. On Turn 2, the worker folds these output tokens into the Disaggregated Delta Prefill alongside the new user prompt, avoiding distributed sync overhead during exit.
+   - **Long Reasoning Outputs ($> 4{,}000$ tokens)**: Flushed and committed to the Context Server on stream completion, avoiding recomputing heavy chain-of-thought or multi-file generation on subsequent turns.
 
 ### 2.3 Empty & Zero-Length Message Validation
 API clients or automated agent tools can occasionally submit empty message payloads (`messages: []` or `content: ""`).
@@ -229,11 +251,11 @@ LLM inference has two diametrically opposed computational regimes:
 
 ### 4.1 Prefill Worker Pool
 - **Architecture**: Contiguous pipeline stages or unified data-parallel nodes running on compute-heavy accelerators.
-- **Batching Strategy**: Static chunking with Online Softmax normalization ([`frontiersplit/online_softmax.py`](file:///Users/pixel/code/FrontierSplit/frontiersplit/online_softmax.py)).
+- **Batching Strategy**: Static chunking with Online Softmax normalization ([`frontiersplit/context/online_softmax.py`](file:///Users/pixel/code/FrontierSplit/frontiersplit/context/online_softmax.py)).
 - **Interconnect**: Connects directly to the Context Fabric over high-speed datacenter VPC (10–100 Gbps). When prefill completes, activations are offloaded without occupying local VRAM.
 
 ### 4.2 Decode Worker Pool
-- **Architecture**: Commodity GPU nodes running 1F1B continuous micro-batch pipelining ([`frontiersplit/scheduler.py`](file:///Users/pixel/code/FrontierSplit/frontiersplit/scheduler.py)).
+- **Architecture**: Commodity GPU nodes running 1F1B continuous micro-batch pipelining ([`frontiersplit/pipeline/scheduler.py`](file:///Users/pixel/code/FrontierSplit/frontiersplit/pipeline/scheduler.py)).
 - **Tile-Aligned Buffering**: Uses `WorkerKVCacheStore` with 16-token tile alignment ($\operatorname{ceil}_{16}$).
 - **Elastic Auto-Scaling**: Scaled up and down based on active stream concurrency metrics emitted via `/v1/telemetry`.
 
@@ -276,40 +298,55 @@ $$\text{Max Throughput (tok/sec)} \approx \frac{B}{\max\left(\frac{W_{\text{acti
 
 ---
 
-## 5. Tier 3: Distributed Context Memory Fabric
+## 5. Tier 3: Distributed Context Memory Fabric (Weightless Context Machines)
 
-### 5.1 Architecture of a Context Server Shard
-Each Context Server shard runs as a dedicated high-memory daemon (e.g., `n2-standard-32` with 128 GB RAM or `r6i.4xlarge`):
-1. **Radix Prefix Tree Index**:
-   - Manages token hierarchies in memory.
-   - Pointers reference precomputed FP16/FP8 Key and Value tensor slabs.
-2. **Slab Memory Allocator**:
-   - Pre-allocates pinned memory slabs in host DRAM (or GPU VRAM if equipped with a dedicated memory-tier GPU).
-   - Prevents memory fragmentation and OS memory page faults during high-throughput tensor read/writes.
+### 5.1 The Weightless Context Machine
+The defining architectural breakthrough of FrontierSplit is that **the Context Machine loads zero model weights**:
+
+```
+┌──────────────────────────────────────┐          ┌──────────────────────────────────────┐
+│        Compute Worker (GPU)          │          │        Context Machine (RAM/VRAM)    │
+├──────────────────────────────────────┤          ├──────────────────────────────────────┤
+│ • Holds ALL Model Weights (70B, etc.)│          │ • Holds ZERO Model Weights           │
+│ • Runs RMSNorm, MLPs, Vocabulary     │          │ • Holds 100% KV Caches (Long Context)│
+│ • Small local VRAM (holds 1-100 tok) │  ◄8 KB►  │ • Runs pure Q * K^T + Softmax kicker │
+│ • 100% Ephemeral & Stateless         │          │ • Stationary with Session TTL        │
+└──────────────────────────────────────┘          └──────────────────────────────────────┘
+```
+
+1. **Zero Weight Overhead**:
+   - In standard serving, 16 GB to 140 GB of VRAM is permanently consumed just loading model parameters ($W_q, W_k, W_v, W_o$, MLP gate/up/down weights, vocabulary embeddings) before a single token of context can be stored.
+   - On the FrontierSplit Context Machine, **100% of memory is dedicated to KV caches**. Every gigabyte is pure context capacity.
+2. **Specialized Mathematical Profile**:
+   - The Context Machine only computes three mathematical operations per layer:
+     1. Dot product: $S_p = Q K_p^T / \sqrt{d_k}$
+     2. Online Softmax scaling: $m_p = \max(S_p)$, $\ell_p = \sum \exp(S_p - m_p)$
+     3. Value accumulation: $A_p = \exp(S_p - m_p) V_p$
+   - It **never** executes RMSNorm, MLP/SwiGLU feedforward blocks ($\approx 65\%$ of model FLOPs), or vocabulary logit projections.
+3. **Hardware Sweet Spots**:
+   - **Unified Memory Superchips**: NVIDIA Grace Hopper (GH200 with 480 GB unified LPDDR5X at 900 GB/s) or AMD MI300A (128 GB unified HBM3).
+   - **High-Memory CPU Nodes**: Dual AMD EPYC / Intel Xeon with 1.5 TB of DDR5 RAM across 24 memory channels (~460 GB/s bandwidth) serving millions of cached tokens at 1/10th the cost of GPUs.
+   - **Dense Mid-Tier GPUs**: Quad RTX 3090/4090s (96 GB) or dual L40S (96 GB) where 100% of the VRAM is available for KV cache.
+
+### 5.2 Session Lifecycle, Sliding TTL & Memory Reclamation
+The Context Machine maintains stationary session caches to keep multi-turn TTFT under 10 ms:
+
+1. **Sliding Time-To-Live (TTL)**:
+   - When a session is registered (e.g. 500k tokens), it is assigned a sliding TTL (default: **10 minutes**).
+   - Each follow-up request (Turn 2, Turn 3) matching that session resets the TTL countdown.
+   - If an agent thread goes idle past the TTL, the session is cleanly evicted.
+2. **Zero-Copy Prefix Slicing**:
+   - When handling requests that branch or only share a subset $[0 \dots K]$ of an existing $N$-token cache, the Context Server slices its attention calculation (`K[:K]`, `V[:K]`) in-place without memory duplication.
 3. **Multi-Tiered Hierarchical Storage**:
-   - **L1 (DRAM)**: Sub-millisecond retrieval for hot system prompts and active conversation sessions.
-   - **L2 (Local NVMe SSD)**: Memory-mapped files (mmap) for warm sessions inactive for > 5 minutes.
+   - **L1 (Host DRAM / VRAM)**: Sub-millisecond partial attention for hot sessions within active TTL.
+   - **L2 (Local NVMe SSD)**: Memory-mapped files (mmap) for warm sessions inactive for > 10 minutes.
    - **L3 (Object Storage / Cloud Storage)**: Cold persistent agent checkpoints stored asynchronously as compressed zstandard shards.
 
-```
-                    Context Server Memory Hierarchy
-┌──────────────────────────────────────────────────────────────────┐
-│ L1: Host DRAM (Pinned Tensors)     - Latency: < 0.2 ms           │
-│     • Active agent prefixes & hot Radix tree nodes               │
-├──────────────────────────────────────────────────────────────────┤
-│ L2: Local NVMe SSD (mmap Store)    - Latency: < 2.0 ms           │
-│     • Warm sessions, intermediate agent reasoning traces         │
-├──────────────────────────────────────────────────────────────────┤
-│ L3: Cloud Object Storage (S3/GCS)  - Latency: < 50 ms            │
-│     • Cold checkpointed agent conversations, long-term memory     │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### 5.2 Wire Protocol & Tensor Serialization
+### 5.3 Wire Protocol & Tensor Serialization
 Data transfer between workers and Context Servers uses FrontierSplit's native persistent binary protocol:
 - **Header**: 16-byte fixed framing header (`MAGIC=0x4653`, `MSG_TYPE`, `PAYLOAD_LEN`, `FLAGS`).
-- **Zero-Copy Serialization**: High-speed numpy/torch buffer extraction directly into socket buffers using `memoryview` and `asyncio.StreamWriter`.
-- **Activation Quantization (Optional FP8 / INT8)**: Uses dynamic vector-scale quantization to reduce network bandwidth consumption by 50% with zero degradation in generation accuracy.
+- **Query & Accumulator Payloads**: Restricted to $8\text{ KB}$ Query vectors ($Q$) and $\approx 8.25\text{ KB}$ Online Softmax accumulators ($(A_p, m_p, \ell_p)$).
+- **Delta KV Commits**: Micro-payloads transmitting only the newly generated or prefilled token slices ($K_{\text{new}}, V_{\text{new}}$).
 
 ---
 

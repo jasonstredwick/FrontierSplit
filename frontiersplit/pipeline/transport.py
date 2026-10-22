@@ -14,7 +14,7 @@ import socket
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
-from frontiersplit.protocol import (
+from frontiersplit.pipeline.protocol import (
     HEADER_SIZE,
     MAGIC,
     MSG_FORWARD_BATCHED_REQ,

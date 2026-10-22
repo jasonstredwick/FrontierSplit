@@ -16,7 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from frontiersplit.context_server import ContextClient
+from frontiersplit.context.context_server import ContextClient
 
 
 class ContextShardNode(BaseModel):

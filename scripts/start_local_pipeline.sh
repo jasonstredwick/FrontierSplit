@@ -19,7 +19,7 @@ TCP_FLAGS_3=""
 if [ "${USE_BINARY_TRANSPORT}" = "1" ]; then
   TCP_FLAGS_3="--tcp-port=50154"
 fi
-${PYTHON} -m frontiersplit.worker --stage-id=3 --total-stages=4 --port=50054 --host=127.0.0.1 ${TCP_FLAGS_3} > /tmp/fs_stage3.log 2>&1 &
+${PYTHON} -m frontiersplit.pipeline.worker --stage-id=3 --total-stages=4 --port=50054 --host=127.0.0.1 ${TCP_FLAGS_3} > /tmp/fs_stage3.log 2>&1 &
 echo $! >> "${PID_FILE}"
 
 # Stage 2 (Intermediate)
@@ -28,7 +28,7 @@ TCP_FLAGS_2=""
 if [ "${USE_BINARY_TRANSPORT}" = "1" ]; then
   TCP_FLAGS_2="--tcp-port=50153 --downstream-tcp=127.0.0.1:50154"
 fi
-${PYTHON} -m frontiersplit.worker --stage-id=2 --total-stages=4 --port=50053 --host=127.0.0.1 --downstream-url=http://127.0.0.1:50054 ${TCP_FLAGS_2} > /tmp/fs_stage2.log 2>&1 &
+${PYTHON} -m frontiersplit.pipeline.worker --stage-id=2 --total-stages=4 --port=50053 --host=127.0.0.1 --downstream-url=http://127.0.0.1:50054 ${TCP_FLAGS_2} > /tmp/fs_stage2.log 2>&1 &
 echo $! >> "${PID_FILE}"
 
 # Stage 1 (Intermediate)
@@ -37,7 +37,7 @@ TCP_FLAGS_1=""
 if [ "${USE_BINARY_TRANSPORT}" = "1" ]; then
   TCP_FLAGS_1="--tcp-port=50152 --downstream-tcp=127.0.0.1:50153"
 fi
-${PYTHON} -m frontiersplit.worker --stage-id=1 --total-stages=4 --port=50052 --host=127.0.0.1 --downstream-url=http://127.0.0.1:50053 ${TCP_FLAGS_1} > /tmp/fs_stage1.log 2>&1 &
+${PYTHON} -m frontiersplit.pipeline.worker --stage-id=1 --total-stages=4 --port=50052 --host=127.0.0.1 --downstream-url=http://127.0.0.1:50053 ${TCP_FLAGS_1} > /tmp/fs_stage1.log 2>&1 &
 echo $! >> "${PID_FILE}"
 
 # Stage 0 (Embeddings + Layers)
@@ -46,7 +46,7 @@ TCP_FLAGS_0=""
 if [ "${USE_BINARY_TRANSPORT}" = "1" ]; then
   TCP_FLAGS_0="--tcp-port=50151 --downstream-tcp=127.0.0.1:50152"
 fi
-${PYTHON} -m frontiersplit.worker --stage-id=0 --total-stages=4 --port=50051 --host=127.0.0.1 --downstream-url=http://127.0.0.1:50052 ${TCP_FLAGS_0} > /tmp/fs_stage0.log 2>&1 &
+${PYTHON} -m frontiersplit.pipeline.worker --stage-id=0 --total-stages=4 --port=50051 --host=127.0.0.1 --downstream-url=http://127.0.0.1:50052 ${TCP_FLAGS_0} > /tmp/fs_stage0.log 2>&1 &
 echo $! >> "${PID_FILE}"
 
 # Ingress Gateway

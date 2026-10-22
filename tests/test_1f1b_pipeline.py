@@ -4,10 +4,10 @@ import asyncio
 import socket
 import unittest
 
-from frontiersplit.protocol import BatchedActivationPacket
-from frontiersplit.scheduler import PipelineScheduler
-from frontiersplit.transport import BinaryTransportClient
-from frontiersplit.worker import create_worker_app
+from frontiersplit.pipeline.protocol import BatchedActivationPacket
+from frontiersplit.pipeline.scheduler import PipelineScheduler
+from frontiersplit.pipeline.transport import BinaryTransportClient
+from frontiersplit.pipeline.worker import create_worker_app
 
 
 def get_free_port() -> int:

@@ -12,7 +12,7 @@ import sys
 import uvicorn
 import torch_xla.distributed.xla_multiprocessing as xmp
 
-from frontiersplit.worker import create_worker_app
+from frontiersplit.pipeline.worker import create_worker_app
 
 
 def _stage_worker_entry(index: int, total_stages: int, model_name: str, use_binary: bool, quantize_activations: bool, use_static_cache: bool = True):

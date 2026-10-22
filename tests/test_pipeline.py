@@ -7,8 +7,8 @@ import numpy as np
 from fastapi.testclient import TestClient
 
 from frontiersplit.gateway import create_gateway_app
-from frontiersplit.protocol import ActivationPacket
-from frontiersplit.worker import create_worker_app
+from frontiersplit.pipeline.protocol import ActivationPacket
+from frontiersplit.pipeline.worker import create_worker_app
 
 
 class TestPipelineFlow(unittest.TestCase):

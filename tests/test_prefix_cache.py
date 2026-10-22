@@ -10,7 +10,7 @@ import time
 
 import torch
 
-from frontiersplit.prefix_cache import RadixPrefixCache
+from frontiersplit.context.prefix_cache import RadixPrefixCache
 
 
 def test_exact_prefix_match():

@@ -176,20 +176,41 @@ ruff format --check frontiersplit tests examples
 FrontierSplit/
 ├── pyproject.toml                         # Packaging, dependencies, and Ruff configuration
 ├── README.md                              # Project overview, math formulation, and guides
+├── ARCHITECTURE.md                        # Master system architecture & design traceability
+├── docs/                                  # Architectural specifications & design documents
+│   ├── README.md                          # Design-to-Implementation Traceability Matrix
+│   ├── context/                           # Disaggregated Context Engine design specifications
+│   │   └── DESIGN_CLOUD_ARCHITECTURE.md   # Cloud scaling, Online Softmax, Delta Prefill, Sharding
+│   └── pipeline/                          # Pipeline Parallel Engine design specifications
+│       ├── DESIGN_MIXTRAL_8X7B.md         # 8-node MoE pipeline parallel slicing & layer distribution
+│       └── DESIGN_KV_CACHE.md             # Worker-level KV cache store & 1F1B scheduling
 ├── frontiersplit/
-│   ├── __init__.py                        # Public package exports
-│   ├── online_softmax.py                  # Pure PyTorch Online Softmax merging kernel
-│   ├── context_server.py                  # Context Server and persistent TCP client
-│   ├── decode_worker.py                   # Decode Worker with DisaggregatedAttention module
-│   └── hf_model.py                        # HuggingFace DisaggregatedModel wrapper & patcher
-├── examples/
-│   ├── disaggregated_demo.py              # Quickstart: 10k-token offload with 8 KB payloads
-│   └── hf_disaggregated_demo.py          # End-to-end HuggingFace causal LM generation demo
-├── tests/
-│   ├── test_online_softmax.py             # Online Softmax mathematical equivalence tests
-│   ├── test_context_server.py             # TCP socket lifecycle & partial query tests
-│   ├── test_decode_worker.py              # Multi-step autoregressive decode simulation
-│   └── test_hf_model.py                   # HuggingFace sync/async bit-for-bit generation tests
+│   ├── __init__.py                        # Top-level public package exports
+│   ├── gateway.py                         # OpenAI-compatible REST & SSE Ingress Gateway
+│   ├── context/                           # Disaggregated Context & Online Softmax Engine
+│   │   ├── __init__.py                    # Context package exports
+│   │   ├── online_softmax.py              # Pure PyTorch Online Softmax merging kernel
+│   │   ├── context_server.py              # Weightless Context Server & TCP protocol (sliding TTL)
+│   │   ├── decode_worker.py               # Decode Worker with DisaggregatedAttention module
+│   │   ├── hf_model.py                    # HuggingFace DisaggregatedModel patcher & Delta Prefill
+│   │   ├── prefix_cache.py                # Radix tree prefix caching
+│   │   └── routing.py                     # Consistent hash ring & prefix router
+│   └── pipeline/                          # 1F1B Pipeline Parallel Slicing Engine
+│       ├── __init__.py                    # Pipeline package exports
+│       ├── worker.py                      # Pipeline stage forward worker & local KV store
+│       ├── scheduler.py                   # 1F1B micro-batch continuous pipeline scheduler
+│       ├── protocol.py                    # Activation packet schemas & binary framing
+│       ├── transport.py                   # Persistent binary TCP client/server
+│       ├── slicer.py                      # Model weight slicer & memory profiler
+│       ├── shard_planner.py               # Stage layer partitioning
+│       ├── tpu_runner.py                  # Cloud TPU v5e multi-core runner
+│       └── models.py                      # Model architecture specifications
+├── examples/                              # Runnable end-to-end demonstrations
+│   ├── disaggregated_demo.py              # 10k-token offload with 8 KB payloads
+│   ├── hf_disaggregated_demo.py          # HuggingFace causal LM generation with remote context
+│   ├── gateway_demo.py                    # Live OpenAI REST API streaming demo
+│   └── prefix_caching_demo.py             # Multi-tenant radix prefix cache demo
+├── tests/                                 # 91 unit and integration tests (100% passing)
 └── experiments/                           # Historical empirical benchmarks (8-Node Mixtral FP16)
 ```
 

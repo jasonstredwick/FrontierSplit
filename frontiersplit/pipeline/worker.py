@@ -22,8 +22,8 @@ import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
-from frontiersplit.models import resolve_model_spec
-from frontiersplit.protocol import (
+from frontiersplit.pipeline.models import resolve_model_spec
+from frontiersplit.pipeline.protocol import (
     ActivationPacket,
     BatchedActivationPacket,
     BatchedGenerationResponse,
@@ -33,7 +33,7 @@ from frontiersplit.protocol import (
     ReleaseSessionPacket,
     ReleaseSessionResponse,
 )
-from frontiersplit.transport import BinaryTransportClient, BinaryTransportServer
+from frontiersplit.pipeline.transport import BinaryTransportClient, BinaryTransportServer
 
 # Optional PyTorch and Hugging Face imports
 try:

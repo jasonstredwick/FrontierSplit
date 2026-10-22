@@ -14,14 +14,14 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from frontiersplit.online_softmax import (
+from frontiersplit.context.online_softmax import (
     compute_partial_attention,
     finalize_attention,
     merge_two_partial_attentions,
 )
 
 if TYPE_CHECKING:
-    from frontiersplit.context_server import ContextClient
+    from frontiersplit.context.context_server import ContextClient
 
 logger = logging.getLogger("frontiersplit.decode_worker")
 
@@ -122,6 +122,7 @@ class DisaggregatedAttention(nn.Module):
         q: torch.Tensor,
         k_token: torch.Tensor,
         v_token: torch.Tensor,
+        context_len: int | None = None,
     ) -> torch.Tensor:
         """Performs a single decode step with disaggregated context merging.
 
@@ -130,6 +131,7 @@ class DisaggregatedAttention(nn.Module):
             q: Query tensor for the new token: `[batch, num_heads, 1, head_dim]`.
             k_token: Key tensor for the new token: `[batch, num_kv_heads, 1, head_dim]`.
             v_token: Value tensor for the new token: `[batch, num_kv_heads, 1, head_dim]`.
+            context_len: Optional prefix slice length for zero-copy subset sharing.
 
         Returns:
             Attention output tensor of shape `[batch, num_heads, 1, head_dim]`.
@@ -141,6 +143,7 @@ class DisaggregatedAttention(nn.Module):
                 layer_idx=self.layer_idx,
                 q=q,
                 scale=self.scale,
+                context_len=context_len,
             )
         )
 
@@ -201,10 +204,13 @@ class DecodeWorker:
         q: torch.Tensor,
         k_token: torch.Tensor,
         v_token: torch.Tensor,
+        context_len: int | None = None,
     ) -> torch.Tensor:
         """Executes a single layer's disaggregated attention."""
         layer = self.layers[layer_idx]
-        return await layer.forward_decode_step(session_id, q, k_token, v_token)
+        return await layer.forward_decode_step(
+            session_id, q, k_token, v_token, context_len=context_len
+        )
 
     async def end_session(self, session_id: str) -> None:
         """Releases session KV caches both locally and on the remote Context Server."""

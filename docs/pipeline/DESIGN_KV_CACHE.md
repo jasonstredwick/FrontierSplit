@@ -151,7 +151,7 @@ In FrontierSplit, the model is split across nodes by layer slices:
 
 ## 6. Implementation Architecture
 
-### 6.1 Worker State Structure (`frontiersplit/worker.py`)
+### 6.1 Worker State Structure ([`frontiersplit/pipeline/worker.py`](file:///Users/pixel/code/FrontierSplit/frontiersplit/pipeline/worker.py))
 ```python
 class SessionKVCache:
     def __init__(self, capacity: int, num_layers: int, num_kv_heads: int, head_dim: int, device: torch.device):
@@ -168,6 +168,6 @@ class SessionKVCache:
         ...
 ```
 
-### 6.2 Scheduler Session Protocol (`frontiersplit/protocol.py`)
+### 6.2 Scheduler Session Protocol ([`frontiersplit/pipeline/protocol.py`](file:///Users/pixel/code/FrontierSplit/frontiersplit/pipeline/protocol.py))
 * Update `BatchedActivationPacket` to carry `request_ids: List[str]` and a `is_prefill: bool` flag.
 * Add an explicit `ReleaseSessionPacket` sent when requests conclude.

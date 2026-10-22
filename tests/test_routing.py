@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from frontiersplit.routing import (
+from frontiersplit.context.routing import (
     ConsistentHashRing,
     ContextShardNode,
     PrefixRouter,
@@ -200,7 +200,7 @@ async def test_prefix_router_live_cluster_query_and_failover():
     """Verify live TCP cluster routing and automatic replica failover across ContextServers."""
     import torch
 
-    from frontiersplit.context_server import ContextServer
+    from frontiersplit.context.context_server import ContextServer
 
     server_a = ContextServer()
     port_a = server_a.start_in_thread(host="127.0.0.1", port=0)

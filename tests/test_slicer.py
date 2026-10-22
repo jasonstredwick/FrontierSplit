@@ -1,7 +1,7 @@
 """Unit tests for ModelSlicer."""
 
 import unittest
-from frontiersplit.slicer import ModelSlicer
+from frontiersplit.pipeline.slicer import ModelSlicer
 
 
 class TestModelSlicer(unittest.TestCase):

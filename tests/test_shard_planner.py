@@ -2,7 +2,7 @@
 
 import unittest
 from unittest.mock import patch
-from frontiersplit.shard_planner import ShardPlanner
+from frontiersplit.pipeline.shard_planner import ShardPlanner
 
 
 class TestShardPlanner(unittest.TestCase):

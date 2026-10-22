@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 from transformers.cache_utils import DynamicCache
 
-from frontiersplit.online_softmax import (
+from frontiersplit.context.online_softmax import (
     compute_partial_attention,
     finalize_attention,
     merge_two_partial_attentions,
@@ -25,7 +25,7 @@ from frontiersplit.online_softmax import (
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
 
-    from frontiersplit.context_server import ContextClient
+    from frontiersplit.context.context_server import ContextClient
 
 logger = logging.getLogger("frontiersplit.hf_model")
 
@@ -68,10 +68,14 @@ class DisaggregatedAttentionPatcher:
         self.layer_idx = layer_idx
         self.context_client = context_client
         self.active_session_id: str | None = None
+        self.active_context_len: int | None = None
 
-    def set_session(self, session_id: str | None) -> None:
-        """Sets the active session ID for routing queries to the Context Server."""
+    def set_session(
+        self, session_id: str | None, context_len: int | None = None
+    ) -> None:
+        """Sets the active session ID and optional prefix slice length."""
         self.active_session_id = session_id
+        self.active_context_len = context_len
 
     def __call__(
         self,
@@ -117,13 +121,24 @@ class DisaggregatedAttentionPatcher:
             layer_idx=self.layer_idx,
             q=q,
             scale=scaling,
+            context_len=self.active_context_len,
         )
 
         if past_key_values is None:
             attn_out = finalize_attention(prompt_chunk)
         else:
+            q_len = q.shape[-2]
+            local_mask = attention_mask
+            if q_len > 1 and local_mask is None:
+                kv_len = k.shape[-2]
+                mask = torch.full((q_len, kv_len), float("-inf"), device=q.device)
+                mask = torch.triu(mask, diagonal=1 + (kv_len - q_len))
+                local_mask = mask.view(1, 1, q_len, kv_len)
+
             # Compute local partial attention on volatile output tokens
-            local_chunk = compute_partial_attention(q, k, v, scale=scaling)
+            local_chunk = compute_partial_attention(
+                q, k, v, scale=scaling, attention_mask=local_mask
+            )
 
             # Merge via Online Softmax
             merged = merge_two_partial_attentions(prompt_chunk, local_chunk)
@@ -161,10 +176,12 @@ class DisaggregatedModel:
             self._patchers.append(patcher)
         self._patched = True
 
-    def set_active_session(self, session_id: str | None) -> None:
-        """Sets the active session ID for all patched attention layers."""
+    def set_active_session(
+        self, session_id: str | None, context_len: int | None = None
+    ) -> None:
+        """Sets the active session ID and optional prefix slice for all patched layers."""
         for p in self._patchers:
-            p.set_session(session_id)
+            p.set_session(session_id, context_len=context_len)
 
     def prefill_and_offload(
         self,
@@ -213,6 +230,7 @@ class DisaggregatedModel:
         max_new_tokens: int = 32,
         session_id: str = "default-session",
         use_prefix_cache: bool = True,
+        release_on_completion: bool = True,
     ) -> Iterator[int]:
         """Synchronously streams generated tokens one by one as they are produced.
 
@@ -221,6 +239,8 @@ class DisaggregatedModel:
             max_new_tokens: Maximum number of new tokens to generate.
             session_id: Session identifier.
             use_prefix_cache: If True, checks for existing prefix cache on Context Server.
+            release_on_completion: If True, evicts session KV cache on completion.
+                Set to False for multi-turn sessions with sliding TTL.
 
         Yields:
             Generated token IDs one by one (including the first generated token).
@@ -230,6 +250,7 @@ class DisaggregatedModel:
 
         # Check for warm prefix cache hit on Context Server
         cache_hit = False
+        matched_len = 0
         if use_prefix_cache:
             matched_len, _ = self.context_client.match_prefix_sync(
                 tokens, session_id=session_id
@@ -247,6 +268,38 @@ class DisaggregatedModel:
                     last_tok, position_ids=pos_tensor, use_cache=False
                 )
                 next_tok = out_fast.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        elif 0 < matched_len < prompt_len:
+            # Disaggregated Delta Prefill:
+            # Tokens [0..matched_len] are already warm on Context Server.
+            # Suffix tokens [matched_len..prompt_len] run forward pass with disaggregated attention.
+            suffix_ids = input_ids[:, matched_len:]
+            suffix_pos = torch.arange(
+                matched_len, prompt_len, device=input_ids.device
+            ).unsqueeze(0)
+            self.set_active_session(session_id, context_len=matched_len)
+            suffix_cache = DynamicCache()
+            with torch.no_grad():
+                out_suffix = self.model(
+                    suffix_ids,
+                    past_key_values=suffix_cache,
+                    position_ids=suffix_pos,
+                    use_cache=True,
+                )
+                next_tok = out_suffix.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+            # Append suffix KV activations to the Context Server
+            suffix_tokens = tokens[matched_len:]
+            for l_idx, layer in enumerate(suffix_cache.layers):
+                self.context_client.append_kv_sync(
+                    session_id=session_id,
+                    layer_idx=l_idx,
+                    k_delta=layer.keys,
+                    v_delta=layer.values,
+                    token_ids=suffix_tokens,
+                )
+
+            # Re-bind session with full context length for subsequent decode steps
+            self.set_active_session(session_id, context_len=None)
         else:
             # 1. Prefill and offload prompt KV
             next_tok, prompt_len = self.prefill_and_offload(input_ids, session_id)
@@ -274,8 +327,8 @@ class DisaggregatedModel:
                     yield cur_tok.item()
 
         finally:
-            # Clean up remote prompt KV cache
-            self.context_client.release_session_sync(session_id)
+            if release_on_completion:
+                self.context_client.release_session_sync(session_id)
             self.set_active_session(None)
 
     def generate(
@@ -284,6 +337,7 @@ class DisaggregatedModel:
         max_new_tokens: int = 32,
         session_id: str = "default-session",
         use_prefix_cache: bool = True,
+        release_on_completion: bool = True,
     ) -> list[int]:
         """Generates tokens synchronously using disaggregated attention merging.
 
@@ -292,6 +346,7 @@ class DisaggregatedModel:
             max_new_tokens: Maximum number of new tokens to generate.
             session_id: Session identifier.
             use_prefix_cache: If True, checks for existing prefix cache on Context Server.
+            release_on_completion: If True, releases session KV cache on completion.
 
         Returns:
             List of generated token IDs (including the first generated token).
@@ -302,6 +357,7 @@ class DisaggregatedModel:
                 max_new_tokens=max_new_tokens,
                 session_id=session_id,
                 use_prefix_cache=use_prefix_cache,
+                release_on_completion=release_on_completion,
             )
         )
 
@@ -345,6 +401,7 @@ class DisaggregatedModel:
         max_new_tokens: int = 32,
         session_id: str = "default-session",
         use_prefix_cache: bool = True,
+        release_on_completion: bool = True,
     ) -> AsyncIterator[int]:
         """Asynchronously streams generated tokens one by one as they are produced.
 
@@ -353,6 +410,7 @@ class DisaggregatedModel:
             max_new_tokens: Maximum number of new tokens to generate.
             session_id: Session identifier.
             use_prefix_cache: If True, checks for existing prefix cache on Context Server.
+            release_on_completion: If True, evicts session KV cache on completion.
 
         Yields:
             Generated token IDs one by one (including the first generated token).
@@ -361,6 +419,7 @@ class DisaggregatedModel:
         prompt_len = len(tokens)
 
         cache_hit = False
+        matched_len = 0
         if use_prefix_cache:
             matched_len, _ = await self.context_client.match_prefix(
                 tokens, session_id=session_id
@@ -377,6 +436,35 @@ class DisaggregatedModel:
                     last_tok, position_ids=pos_tensor, use_cache=False
                 )
                 next_tok = out_fast.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        elif 0 < matched_len < prompt_len:
+            suffix_ids = input_ids[:, matched_len:]
+            suffix_pos = torch.arange(
+                matched_len, prompt_len, device=input_ids.device
+            ).unsqueeze(0)
+            self.set_active_session(session_id, context_len=matched_len)
+            suffix_cache = DynamicCache()
+            with torch.no_grad():
+                out_suffix = self.model(
+                    suffix_ids,
+                    past_key_values=suffix_cache,
+                    position_ids=suffix_pos,
+                    use_cache=True,
+                )
+                next_tok = out_suffix.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+            suffix_tokens = tokens[matched_len:]
+            tasks = [
+                self.context_client.append_kv(
+                    session_id=session_id,
+                    layer_idx=l_idx,
+                    k_delta=layer.keys,
+                    v_delta=layer.values,
+                    token_ids=suffix_tokens,
+                )
+                for l_idx, layer in enumerate(suffix_cache.layers)
+            ]
+            await asyncio.gather(*tasks)
+            self.set_active_session(session_id, context_len=None)
         else:
             next_tok, prompt_len = await self.prefill_and_offload_async(
                 input_ids, session_id
@@ -402,7 +490,8 @@ class DisaggregatedModel:
                     yield cur_tok.item()
 
         finally:
-            await self.context_client.release_session(session_id)
+            if release_on_completion:
+                await self.context_client.release_session(session_id)
             self.set_active_session(None)
 
     async def generate_async(
@@ -411,6 +500,7 @@ class DisaggregatedModel:
         max_new_tokens: int = 32,
         session_id: str = "default-session",
         use_prefix_cache: bool = True,
+        release_on_completion: bool = True,
     ) -> list[int]:
         """Asynchronously generates tokens using disaggregated attention merging.
 
@@ -419,6 +509,7 @@ class DisaggregatedModel:
             max_new_tokens: Maximum number of new tokens to generate.
             session_id: Session identifier.
             use_prefix_cache: If True, checks for existing prefix cache on Context Server.
+            release_on_completion: If True, releases session KV cache on completion.
 
         Returns:
             List of generated token IDs (including the first generated token).
@@ -429,6 +520,7 @@ class DisaggregatedModel:
             max_new_tokens=max_new_tokens,
             session_id=session_id,
             use_prefix_cache=use_prefix_cache,
+            release_on_completion=release_on_completion,
         ):
             generated.append(tok)
         return generated

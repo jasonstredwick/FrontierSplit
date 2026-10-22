@@ -15,7 +15,7 @@ if [[ -f "${PID_FILE}" ]]; then
 fi
 
 # Fallback cleanup on standard ports
-pkill -f "frontiersplit.worker" 2>/dev/null || true
+pkill -f "frontiersplit.*worker" 2>/dev/null || true
 pkill -f "frontiersplit.gateway" 2>/dev/null || true
 
 echo "=== FrontierSplit Local Pipeline Stopped ==="
