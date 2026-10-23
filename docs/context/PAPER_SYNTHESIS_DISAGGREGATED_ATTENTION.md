@@ -266,10 +266,20 @@ $$\left(1 - \frac{1}{P}\right) K \times T_{\text{cycle}} > T_{\text{network}}$$
 - Massive contexts ($> 500\text{k}$ tokens): Memory streaming time dominates $\to$ shard across $P$ nodes to reduce single-stream decode latency by nearly $P\times$.
 - *(Current prototype implementation: The Gateway routes each request to a single target shard selected via `PrefixRouter` consistent hashing).*
 
-### 6.4 Layer Stacking & Deterministic Temporal Interleaving [Architectural Model]
-For a single conversational stream, transformer layers are evaluated strictly sequentially ($L_0 \to \text{MLP}_0 \to L_1 \to \dots$).
-- **Layer Stacking**: A user session's KV caches for all $L$ layers are co-located on the same Context Server.
-- **Temporal Interleaving**: During the feed-forward MLP computation ($T_{\text{MLP}}$) on the compute worker, the Context Server interleaves queries from other staggered streams, achieving high memory bus saturation without multi-batch synchronization stalls.
+### 6.4 Spatial Saturation vs. Temporal Residency: Layer Stacking & Deterministic Interleaving [Architectural Model]
+
+A critical operational principle of the distributed context fabric is the distinction between **Instantaneous Spatial Saturation** and **Temporal VRAM Residency**:
+
+1. **Instantaneous Spatial Saturation (Clock-Tick Execution)**:
+   - Dictated by the compute unit fabric: $K_{\text{sat}} = T_{\text{line}} \times R_{\text{unit}} \times U_{\text{compute}}$.
+   - Answers: *At tick $t$, are all physical ALUs/MXUs on the machine engaged in active arithmetic?*
+   - If an individual message's prompt is smaller than $K_{\text{sat}}$, multiple messages or multiple attention heads are co-scheduled across the compute units simultaneously to prevent ALU starvation.
+
+2. **Temporal VRAM Residency (Time-Sliced Capacity)**:
+   - Dictated by total VRAM capacity across sequential execution intervals.
+   - Answers: *How many mutually exclusive KV cache structures can reside in memory without contending for compute at the same instant?*
+   - **Intra-Message Layer Serialization**: In autoregressive transformers, layers are evaluated strictly sequentially ($L_0 \to \text{MLP}_0 \to L_1 \to \dots \to L_{L-1}$). While layer $i$ is computing, the remaining $L-1$ layer caches sit completely dormant in VRAM. Co-locating all $L$ layer caches for a session on the same Context Server consumes memory capacity but introduces **zero instantaneous compute contention**.
+   - **Temporal Interleaving Across MLP Cycles**: During the compute worker's feed-forward MLP computation ($T_{\text{MLP}}$) and inter-stage activation transfers, the message's KV cache is idle. During this execution window, the Context Server interleaves attention queries from staggered message streams, achieving near-100% duty cycle of both the HBM memory bus and the systolic compute fabric.
 
 ### 6.5 Multi-User Allocation: Compute Unit Saturation ($K_{\text{sat}}$) and Machine Sizing [Architectural Model]
 
