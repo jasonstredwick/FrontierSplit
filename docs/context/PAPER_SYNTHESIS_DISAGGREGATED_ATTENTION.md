@@ -311,7 +311,7 @@ While single-wave saturation thresholds serve as empirical heuristics, the **byt
 For a 32-layer transformer with GQA ($H_{\text{kv}} = 8$, $d = 128$, FP16 format = 4 KB per token across all layers):
 - A nominal $65{,}536$-token context block consumes:
   $$65{,}536 \text{ tokens} \times 4{,}096\text{ bytes/token} = \mathbf{268.4\text{ MB per layer}} \times 32\text{ layers} \approx \mathbf{8.59\text{ GB}}$$
-- On a 32 GB HBM/VRAM Context Server, the node cleanly provisions **3 full $65\text{k}$-token blocks** ($\sim 25.8\text{ GB}$), leaving $\sim 6.2\text{ GB}$ of high-speed memory for operating system buffers, prefix trie lookup tables, and dynamic reasoning trace delta allocations.
+- On a 32 GB HBM/VRAM Context Server, the node cleanly provisions **3 full $65\text{k}$-token blocks** ($\sim 25.8\text{ GB}$), leaving $\sim 6.2\text{ GB}$ of high-speed memory for operating system buffers, prefix trie lookup tables, and dynamic reasoning trace delta allocations. Active sessions and the prefix cache share canonical immutable KV tensor storage pointers (zero-copy chunk binding), avoiding redundant per-session memory duplication.
 - **Sizing Spectrum**:
   1. **Under-Saturation ($< K_{\text{sat}}$ tokens per machine)**: Leaves compute units underutilized unless head parallelism or multi-tenant interleaving fills vacant execution slots.
   2. **Saturated Allocation ($K_{\text{sat}}$ chunks per machine) — [Target Architecture]**: Context allocated in integer multiples of the tuning threshold to balance parallel efficiency and minimize network RPC fan-out.

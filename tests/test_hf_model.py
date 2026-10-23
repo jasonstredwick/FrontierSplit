@@ -703,10 +703,19 @@ def test_async_generation_cancellation_safety_and_cache_consistency(
         with server.store._lock:
             sess = server.store._store.get("cancel-sess")
             assert sess is not None, "Session should exist on server"
+            assert len(sess) == model.config.num_hidden_layers, (
+                f"Expected all {model.config.num_hidden_layers} layers to be present, got {len(sess)}"
+            )
             layer_lens = [
                 sum(k.shape[-2] for k, _ in chunks)
                 for layer_idx, chunks in sess.items()
             ]
+            assert len(set(layer_lens)) == 1, (
+                f"KV layer lengths must be identical across layers, got {layer_lens}"
+            )
+            assert layer_lens[0] >= prompt.shape[1], (
+                f"Layer length must at least contain the base prompt tokens, got {layer_lens[0]}"
+            )
     try:
         asyncio.run(_run())
     finally:
@@ -845,6 +854,135 @@ def test_staged_append_retry_idempotency_prevents_duplicate_tokens() -> None:
         )
         assert res0 == 7
         assert server.store.get_seq_len("idemp-sess", 0) == 7
+    finally:
+        client.close_sync()
+        server.stop_thread()
+
+
+def test_multi_turn_commit_retention(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify that commit IDs do not collide across turns, retaining new KV cache."""
+    base_model, prompt, _ = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+    disagg = DisaggregatedModel(model=model, context_client=client)
+
+    async def _run() -> None:
+        session_id = "multiturn-commit-sess"
+        # Turn 1: 5-token prompt, generates 3 tokens (2 decode steps) with threshold 2 -> commits 2 tokens to server
+        tokens_t1 = []
+        async for tok in disagg.generate_stream_async(
+            input_ids=prompt,
+            max_new_tokens=3,
+            session_id=session_id,
+            release_on_completion=False,
+            reasoning_commit_threshold=2,
+        ):
+            tokens_t1.append(tok)
+        assert len(tokens_t1) == 3
+
+        await asyncio.sleep(0.02)
+        base_len_after_t1 = server.store.get_seq_len(session_id, 0)
+        assert base_len_after_t1 == prompt.shape[1] + 2
+
+        # Turn 2: prompt extended with turn 1 tokens (5 + 3 = 8 tokens).
+        # Suffix delta (1 token) is uploaded, then 3 tokens generated (2 decode steps committed)
+        extended_prompt = torch.cat(
+            [prompt, torch.tensor([tokens_t1], device=prompt.device)], dim=1
+        )
+        tokens_t2 = []
+        async for tok in disagg.generate_stream_async(
+            input_ids=extended_prompt,
+            max_new_tokens=3,
+            session_id=session_id,
+            release_on_completion=False,
+            reasoning_commit_threshold=2,
+        ):
+            tokens_t2.append(tok)
+        assert len(tokens_t2) == 3
+
+        await asyncio.sleep(0.02)
+        base_len_after_t2 = server.store.get_seq_len(session_id, 0)
+        # In turn 2, the commit must NOT be discarded as a retry collision of commit-session-0-2!
+        assert base_len_after_t2 == base_len_after_t1 + 1 + 2
+
+    try:
+        asyncio.run(_run())
+    finally:
+        client.close_sync()
+        server.stop_thread()
+
+
+def test_cancellation_drain_worker_thread_does_not_block_event_loop(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify that draining a worker thread on cancellation does not block the event loop synchronously."""
+    base_model, prompt, _ = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+    disagg = DisaggregatedModel(model=model, context_client=client)
+
+    original_query = server.query_partial_attention
+
+    def delayed_query(session_id, layer_idx, *args, **kwargs):
+        import time
+
+        if layer_idx == 0:
+            time.sleep(0.04)  # 40ms in worker thread
+        return original_query(session_id, layer_idx, *args, **kwargs)
+
+    server.query_partial_attention = delayed_query
+
+    async def _run() -> None:
+        heartbeat_delays: list[float] = []
+        stop_hb = asyncio.Event()
+
+        async def heartbeat():
+            import time
+
+            while not stop_hb.is_set():
+                t0 = time.monotonic()
+                await asyncio.sleep(0.005)
+                dt = time.monotonic() - t0
+                heartbeat_delays.append(dt)
+
+        hb_task = asyncio.create_task(heartbeat())
+
+        async def worker():
+            async for _ in disagg.generate_stream_async(
+                input_ids=prompt,
+                max_new_tokens=5,
+                session_id="cancel-block-sess",
+                release_on_completion=True,
+            ):
+                pass
+
+        w_task = asyncio.create_task(worker())
+        # Let worker start first decode step
+        await asyncio.sleep(0.02)
+        w_task.cancel()
+        try:
+            await w_task
+        except asyncio.CancelledError:
+            pass
+
+        stop_hb.set()
+        await hb_task
+
+        # If .result() blocked the event loop thread synchronously for 40ms,
+        # max heartbeat delay would exceed 40ms.
+        max_hb = max(heartbeat_delays) if heartbeat_delays else 0.0
+        assert max_hb < 0.04, f"Event loop was blocked during cancellation: max heartbeat was {max_hb * 1000:.1f}ms"
+
+    try:
+        asyncio.run(_run())
     finally:
         client.close_sync()
         server.stop_thread()

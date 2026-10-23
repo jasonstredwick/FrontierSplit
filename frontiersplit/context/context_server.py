@@ -431,7 +431,7 @@ class ContextStore:
 class _StagedUpload:
     """Tracks an in-progress multi-layer upload transaction for a session."""
 
-    upload_id: str
+    upload_id: str | None
     op: str  # "register" or "append"
     seq_len: int
     layers: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
@@ -520,30 +520,16 @@ class ContextServer:
         return required
 
     def _try_publish_staged_upload(self, session_id: str, state: _StagedUpload) -> None:
-        """Atomically publishes a staged upload to RadixPrefixCache once all expected layers and token_ids are present."""
-        if state.token_ids is None or not state.token_ids:
-            return
+        """Atomically publishes a staged upload once all expected layers are present."""
         if not state.layers:
             return
 
-        if state.op == "register":
-            full_tokens = list(state.token_ids)
-            target_len = len(full_tokens)
-            ready_layers = {
-                l_i: kv
-                for l_i, kv in state.layers.items()
-                if kv[0].shape[-2] == target_len and kv[1].shape[-2] == target_len
-            }
-        else:
-            if state.base_tokens is None:
-                return
-            full_tokens = list(state.base_tokens) + list(state.token_ids)
-            delta_len = len(state.token_ids)
-            ready_layers = {
-                l_i: kv
-                for l_i, kv in state.layers.items()
-                if kv[0].shape[-2] == delta_len and kv[1].shape[-2] == delta_len
-            }
+        target_len = state.seq_len
+        ready_layers = {
+            l_i: kv
+            for l_i, kv in state.layers.items()
+            if kv[0].shape[-2] == target_len and kv[1].shape[-2] == target_len
+        }
 
         required = self._required_layers_for_session(session_id, state.layers)
         if state.expected_layers is not None and state.expected_layers > 0:
@@ -551,20 +537,68 @@ class ContextServer:
         if not required or not required.issubset(ready_layers.keys()):
             return
 
-        self._session_tokens[session_id] = full_tokens
-        if state.op == "register":
-            k_dict = {l_i: kv[0].clone() for l_i, kv in ready_layers.items()}
-            v_dict = {l_i: kv[1].clone() for l_i, kv in ready_layers.items()}
-            self.prefix_cache.insert(full_tokens, k_dict, v_dict)
-        else:
-            assert state.base_tokens is not None
-            # Atomically commit staged layers to ContextStore
+        # 1. Mutate cache store:
+        # If this is an append operation, commit all ready layers to ContextStore
+        if state.op == "append":
             for l_i in sorted(ready_layers.keys()):
                 k_l, v_l = ready_layers[l_i]
                 self.store.append_kv(session_id, l_i, k_l, v_l)
 
-            k_dict = {l_i: kv[0].clone() for l_i, kv in ready_layers.items()}
-            v_dict = {l_i: kv[1].clone() for l_i, kv in ready_layers.items()}
+        # Record idempotent transaction identity only if an explicit upload_id was provided
+        if state.upload_id is not None:
+            self._committed_uploads.setdefault(session_id, set()).add(state.upload_id)
+        self._staged_uploads.pop(session_id, None)
+
+        # 2. Optional Prefix Cache Publication (requires token_ids)
+        if state.token_ids is None or not state.token_ids:
+            return
+
+        k_dict = {l_i: kv[0] for l_i, kv in ready_layers.items()}
+        v_dict = {l_i: kv[1] for l_i, kv in ready_layers.items()}
+
+        if state.op == "register":
+            full_tokens = list(state.token_ids)
+            self._session_tokens[session_id] = full_tokens
+            nodes = self.prefix_cache.insert(full_tokens, k_dict, v_dict)
+            self._set_session_pin(session_id, full_tokens)
+
+            # Rebind session store to canonical Radix nodes to eliminate duplicate allocations
+            for l_i in ready_layers:
+                canonical_chunks = [
+                    (node.k_cache[l_i], node.v_cache[l_i])
+                    for node in nodes
+                    if l_i in node.k_cache
+                ]
+                if canonical_chunks:
+                    self.store.register_chunks(session_id, l_i, canonical_chunks)
+
+            # Backfill any active prefix-bound sessions that matched a prefix of `full_tokens`
+            # before later layers were discovered (applicable during register).
+            for other_sid, other_toks in list(self._session_tokens.items()):
+                if other_sid == session_id or not self.store.has_session(other_sid):
+                    continue
+                other_len = len(other_toks)
+                if (
+                    0 < other_len <= target_len
+                    and other_toks == full_tokens[:other_len]
+                ):
+                    other_layers = self.store.get_session_layer_chunks(other_sid) or {}
+                    for l_i in ready_layers:
+                        if l_i not in other_layers:
+                            matched_nodes, m_len = self.prefix_cache.match(other_toks)
+                            if m_len == other_len:
+                                c_chunks = [
+                                    (n.k_cache[l_i], n.v_cache[l_i])
+                                    for n in matched_nodes
+                                    if l_i in n.k_cache
+                                ]
+                                if c_chunks:
+                                    self.store.register_chunks(other_sid, l_i, c_chunks)
+        else:
+            assert state.base_tokens is not None
+            full_tokens = list(state.base_tokens) + list(state.token_ids)
+            self._session_tokens[session_id] = full_tokens
+
             inserted = self.prefix_cache.insert_delta(
                 base_tokens=state.base_tokens,
                 suffix_tokens=state.token_ids,
@@ -582,42 +616,34 @@ class ContextServer:
                     for l_i in ready_layers:
                         res = self.store.get_prompt(session_id, l_i)
                         if res is not None:
-                            full_k[l_i] = res[0].clone()
-                            full_v[l_i] = res[1].clone()
+                            full_k[l_i] = res[0]
+                            full_v[l_i] = res[1]
                         else:
                             can_reconstruct = False
                             break
                     if can_reconstruct:
-                        self.prefix_cache.insert(full_tokens, full_k, full_v)
+                        nodes = self.prefix_cache.insert(full_tokens, full_k, full_v)
+                        for l_i in ready_layers:
+                            c_chunks = [
+                                (n.k_cache[l_i], n.v_cache[l_i])
+                                for n in nodes
+                                if l_i in n.k_cache
+                            ]
+                            if c_chunks:
+                                self.store.register_chunks(session_id, l_i, c_chunks)
+            else:
+                nodes, m_len = self.prefix_cache.match(full_tokens)
+                if m_len == len(full_tokens):
+                    for l_i in ready_layers:
+                        c_chunks = [
+                            (n.k_cache[l_i], n.v_cache[l_i])
+                            for n in nodes
+                            if l_i in n.k_cache
+                        ]
+                        if c_chunks:
+                            self.store.register_chunks(session_id, l_i, c_chunks)
 
-            self._committed_uploads.setdefault(session_id, set()).add(state.upload_id)
-            self._staged_uploads.pop(session_id, None)
-        self._set_session_pin(session_id, full_tokens)
-
-        # Backfill any active prefix-bound sessions that matched a prefix of `full_tokens`
-        # before later layers were discovered (applicable during register).
-        if state.op == "register":
-            for other_sid, other_toks in list(self._session_tokens.items()):
-                if other_sid == session_id or not self.store.has_session(other_sid):
-                    continue
-                other_len = len(other_toks)
-                if (
-                    0 < other_len <= target_len
-                    and other_toks == full_tokens[:other_len]
-                ):
-                    other_layers = self.store.get_session_layer_chunks(other_sid) or {}
-                    for l_i, (k_full, v_full) in ready_layers.items():
-                        if l_i not in other_layers:
-                            self.store.register_chunks(
-                                other_sid,
-                                l_i,
-                                [
-                                    (
-                                        k_full[:, :, :other_len, :],
-                                        v_full[:, :, :other_len, :],
-                                    )
-                                ],
-                            )
+            self._set_session_pin(session_id, full_tokens)
 
     def register_prompt(
         self,
@@ -639,13 +665,16 @@ class ContextServer:
         v_dev = v.to(self.device)
         seq_len = int(k_dev.shape[-2])
 
+        if upload_id is not None and upload_id in self._committed_uploads.get(session_id, set()):
+            return
+
         state = self._staged_uploads.get(session_id)
-        eff_upload_id = upload_id or "__implicit__"
         is_new_upload = (
             state is None
             or state.op != "register"
-            or state.upload_id != eff_upload_id
-            or layer_idx in state.layers
+            or (upload_id is not None and state.upload_id != upload_id)
+            or (upload_id is None and state.upload_id is not None)
+            or (upload_id is None and layer_idx in state.layers)
             or state.seq_len != seq_len
             or (
                 token_ids is not None
@@ -658,7 +687,7 @@ class ContextServer:
             self._session_tokens.pop(session_id, None)
             self.store.release_session(session_id)
             state = _StagedUpload(
-                upload_id=eff_upload_id,
+                upload_id=upload_id,
                 op="register",
                 seq_len=seq_len,
                 expected_layers=num_layers,
@@ -701,8 +730,7 @@ class ContextServer:
         v_dev = v_delta.to(self.device)
         delta_len = int(k_dev.shape[-2])
 
-        eff_upload_id = upload_id or "__implicit__"
-        if eff_upload_id in self._committed_uploads.get(session_id, set()):
+        if upload_id is not None and upload_id in self._committed_uploads.get(session_id, set()):
             # Already committed idempotently: return current total length
             return self.store.get_seq_len(session_id, layer_idx)
 
@@ -710,8 +738,9 @@ class ContextServer:
         is_new_upload = (
             state is None
             or state.op != "append"
-            or state.upload_id != eff_upload_id
-            or layer_idx in state.layers
+            or (upload_id is not None and state.upload_id != upload_id)
+            or (upload_id is None and state.upload_id is not None)
+            or (upload_id is None and layer_idx in state.layers)
             or state.seq_len != delta_len
             or (
                 token_ids is not None
@@ -726,7 +755,7 @@ class ContextServer:
                 else None
             )
             state = _StagedUpload(
-                upload_id=eff_upload_id,
+                upload_id=upload_id,
                 op="append",
                 seq_len=delta_len,
                 base_tokens=base_toks,
@@ -743,10 +772,11 @@ class ContextServer:
 
         self._try_publish_staged_upload(session_id, state)
 
-        base_len = self.store.get_seq_len(session_id, layer_idx)
-        if eff_upload_id in self._committed_uploads.get(session_id, set()):
-            return base_len
-        return base_len + delta_len
+        current_len = self.store.get_seq_len(session_id, layer_idx)
+        if session_id in self._staged_uploads:
+            # Staged upload is still pending remaining layers
+            return current_len + delta_len
+        return current_len
 
     def evict_expired_sessions(
         self, max_idle_seconds: float | None = None
@@ -758,6 +788,8 @@ class ContextServer:
             self._staged_uploads.pop(sid, None)
             self._session_tokens.pop(sid, None)
             self._session_expected_layers.pop(sid, None)
+            self._committed_uploads.pop(sid, None)
+            self._session_leases.pop(sid, None)
         return evicted
 
     def match_prefix(
@@ -1391,7 +1423,7 @@ class ContextClient:
         self._reset_async_transport()
 
         try:
-            async with asyncio.timeout(self.timeout):
+            async with _async_timeout(self.timeout):
                 self.reader, self.writer = await asyncio.open_connection(
                     self.host, self.port
                 )

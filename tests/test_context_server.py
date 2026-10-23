@@ -486,3 +486,45 @@ def test_context_server_delta_eviction_does_not_publish_orphan_prefix():
     orphan_len, _ = server.match_prefix([9])
     assert orphan_len == 0
 
+
+def test_append_without_tokens_and_omitted_upload_id():
+    """Verify that append_kv without token metadata correctly commits to ContextStore and does not discard successive appends."""
+    server = ContextServer()
+    k5 = torch.randn(1, 2, 5, 16)
+    v5 = torch.randn(1, 2, 5, 16)
+    server.register_prompt("sess-defaults", 0, k5, v5)
+    assert server.store.get_seq_len("sess-defaults", 0) == 5
+
+    k2 = torch.randn(1, 2, 2, 16)
+    v2 = torch.randn(1, 2, 2, 16)
+    ret1 = server.append_kv("sess-defaults", 0, k2, v2)
+    assert ret1 == 7
+    assert server.store.get_seq_len("sess-defaults", 0) == 7
+
+    k2_second = torch.randn(1, 2, 2, 16)
+    v2_second = torch.randn(1, 2, 2, 16)
+    ret2 = server.append_kv("sess-defaults", 0, k2_second, v2_second)
+    assert ret2 == 9
+    assert server.store.get_seq_len("sess-defaults", 0) == 9
+
+
+def test_canonical_radix_storage_sharing():
+    """Verify zero-copy canonical storage sharing between session store and prefix cache."""
+    server = ContextServer()
+    tokens = [10, 20, 30, 40]
+    k = torch.randn(1, 2, 4, 16)
+    v = torch.randn(1, 2, 4, 16)
+    server.register_prompt("sess-shared", 0, k, v, token_ids=tokens, num_layers=1)
+
+    nodes, matched = server.prefix_cache.match(tokens)
+    assert matched == 4
+    assert len(nodes) == 1
+    radix_k = nodes[0].k_cache[0]
+
+    chunks = server.store.get_chunks("sess-shared", 0)
+    assert chunks is not None and len(chunks) == 1
+    store_k, _ = chunks[0]
+
+    # Verify identical underlying storage (zero memory duplicate)
+    assert store_k.data_ptr() == radix_k.data_ptr()
+

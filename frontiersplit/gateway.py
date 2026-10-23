@@ -32,18 +32,73 @@ from frontiersplit.pipeline.scheduler import PipelineScheduler
 
 logger = logging.getLogger("frontiersplit.gateway")
 
-_session_locks: dict[str, asyncio.Lock] = {}
+class _SessionLockEntry:
+    """Entry holding an asyncio.Lock and a reference counter for a session."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.ref_count = 0
+
+
+class _SessionLockHolder:
+    """Manages the lifecycle of an acquired session lock and cleans up registry entries."""
+
+    def __init__(self, session_id: str, entry: _SessionLockEntry) -> None:
+        self.session_id = session_id
+        self.entry = entry
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            self.entry.lock.release()
+        except RuntimeError:
+            pass
+        with _session_locks_guard:
+            self.entry.ref_count -= 1
+            if self.entry.ref_count <= 0:
+                _session_locks.pop(self.session_id, None)
+
+
+_session_locks: dict[str, _SessionLockEntry] = {}
 _session_locks_guard = threading.Lock()
 
 
-async def _acquire_session_lock(session_id: str) -> asyncio.Lock:
+async def _acquire_session_lock(session_id: str) -> _SessionLockHolder:
     """Acquires a per-session lock to serialize concurrent requests targeting the same session ID."""
     with _session_locks_guard:
         if session_id not in _session_locks:
-            _session_locks[session_id] = asyncio.Lock()
-        lock = _session_locks[session_id]
-    await lock.acquire()
-    return lock
+            _session_locks[session_id] = _SessionLockEntry()
+        entry = _session_locks[session_id]
+        entry.ref_count += 1
+    try:
+        await entry.lock.acquire()
+    except BaseException:
+        with _session_locks_guard:
+            entry.ref_count -= 1
+            if entry.ref_count <= 0:
+                _session_locks.pop(session_id, None)
+        raise
+    return _SessionLockHolder(session_id, entry)
+
+
+class LockedStreamingResponse(StreamingResponse):
+    """StreamingResponse that guarantees releasing a session lock holder on completion or early disconnect."""
+
+    def __init__(
+        self, *args, lock_holder: _SessionLockHolder | None = None, **kwargs
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._lock_holder = lock_holder
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self._lock_holder is not None:
+                self._lock_holder.release()
 
 try:
     from transformers import AutoTokenizer
@@ -515,10 +570,11 @@ def create_gateway_app(
                         finally:
                             session_lock.release()
 
-                    return StreamingResponse(
+                    return LockedStreamingResponse(
                         event_generator(),
                         media_type="text/event-stream",
                         headers=resp_headers,
+                        lock_holder=session_lock,
                     )
 
                 # Non-streaming mode

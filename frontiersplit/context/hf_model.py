@@ -421,7 +421,8 @@ class DisaggregatedModel:
         prompt_len = input_ids.shape[1]
         tokens = input_ids[0].tolist()
         num_layers = len(prompt_cache.layers)
-        upload_id = f"prefill-{session_id}-0-{prompt_len}"
+        turn_id = uuid.uuid4().hex[:8]
+        upload_id = f"prefill-{session_id}-{turn_id}-0-{prompt_len}"
 
         # Offload each layer's static prompt KV cache to the remote Context Server
         for l_idx, layer in enumerate(prompt_cache.layers):
@@ -492,6 +493,7 @@ class DisaggregatedModel:
             self._active_sessions.add(session_id)
 
         # Initialize lifecycle state BEFORE try: so finally block is always safe
+        turn_id = uuid.uuid4().hex[:8]
         generated_tokens: list[int] = []
         local_cache: DynamicCache | None = None
         last_committed_idx = 0
@@ -551,7 +553,7 @@ class DisaggregatedModel:
                 # Append suffix KV activations to the Context Server
                 suffix_tokens = tokens[matched_len:]
                 num_layers = len(suffix_cache.layers)
-                upload_id = f"delta-{session_id}-{matched_len}-{base_prompt_len}"
+                upload_id = f"delta-{session_id}-{turn_id}-{matched_len}-{base_prompt_len}"
                 for l_idx, layer in enumerate(suffix_cache.layers):
                     target_client.append_kv_sync(
                         session_id=session_id,
@@ -621,7 +623,7 @@ class DisaggregatedModel:
                         last_committed_idx : last_committed_idx + local_len
                     ]
                     num_layers = len(local_cache.layers)
-                    upload_id = f"commit-{session_id}-{last_committed_idx}-{last_committed_idx + local_len}"
+                    upload_id = f"commit-{session_id}-{turn_id}-{last_committed_idx}-{last_committed_idx + local_len}"
                     for l_idx, layer in enumerate(local_cache.layers):
                         target_client.append_kv_sync(
                             session_id=session_id,
@@ -660,7 +662,7 @@ class DisaggregatedModel:
                             last_committed_idx : last_committed_idx + rem_len
                         ]
                         num_layers = len(local_cache.layers)
-                        upload_id = f"commit-{session_id}-{last_committed_idx}-{last_committed_idx + rem_len}"
+                        upload_id = f"commit-{session_id}-{turn_id}-{last_committed_idx}-{last_committed_idx + rem_len}"
                         for l_idx, layer in enumerate(local_cache.layers):
                             target_client.append_kv_sync(
                                 session_id=session_id,
@@ -758,13 +760,37 @@ class DisaggregatedModel:
             prompt_cache, next_token = await asyncio.wrap_future(active_prefill_fut)
         finally:
             if not active_prefill_fut.done():
-                with contextlib.suppress(BaseException):
-                    active_prefill_fut.result()
+                curr_task = asyncio.current_task()
+                cancelling_count = 0
+                if curr_task is not None and hasattr(curr_task, "uncancel"):
+                    while curr_task.cancelling() > 0:
+                        curr_task.uncancel()
+                        cancelling_count += 1
+                try:
+                    shield_ctx = (
+                        anyio.CancelScope(shield=True)
+                        if anyio is not None
+                        else contextlib.nullcontext()
+                    )
+                    with shield_ctx:
+                        with contextlib.suppress(BaseException):
+                            fut = asyncio.wrap_future(active_prefill_fut)
+                            try:
+                                await fut
+                            except asyncio.CancelledError:
+                                await asyncio.get_running_loop().run_in_executor(
+                                    None, active_prefill_fut.result
+                                )
+                finally:
+                    if curr_task is not None and hasattr(curr_task, "cancelling"):
+                        for _ in range(cancelling_count):
+                            curr_task.cancel()
 
         prompt_len = input_ids.shape[1]
         tokens = input_ids[0].tolist()
         num_layers = len(prompt_cache.layers)
-        upload_id = f"prefill-{session_id}-0-{prompt_len}"
+        turn_id = uuid.uuid4().hex[:8]
+        upload_id = f"prefill-{session_id}-{turn_id}-0-{prompt_len}"
 
         tasks = []
         for l_idx, layer in enumerate(prompt_cache.layers):
@@ -835,6 +861,7 @@ class DisaggregatedModel:
             self._active_sessions.add(session_id)
 
         # Initialize lifecycle state BEFORE try: so finally block is always safe
+        turn_id = uuid.uuid4().hex[:8]
         generated_tokens: list[int] = []
         local_cache: DynamicCache | None = None
         last_committed_idx = 0
@@ -909,7 +936,7 @@ class DisaggregatedModel:
 
                 suffix_tokens = tokens[matched_len:]
                 num_layers = len(suffix_cache.layers)
-                upload_id = f"delta-{session_id}-{matched_len}-{base_prompt_len}"
+                upload_id = f"delta-{session_id}-{turn_id}-{matched_len}-{base_prompt_len}"
                 tasks = [
                     target_client.append_kv(
                         session_id=session_id,
@@ -987,7 +1014,7 @@ class DisaggregatedModel:
                         last_committed_idx : last_committed_idx + local_len
                     ]
                     num_layers = len(local_cache.layers)
-                    upload_id = f"commit-{session_id}-{last_committed_idx}-{last_committed_idx + local_len}"
+                    upload_id = f"commit-{session_id}-{turn_id}-{last_committed_idx}-{last_committed_idx + local_len}"
                     tasks = [
                         target_client.append_kv(
                             session_id=session_id,
@@ -1015,15 +1042,7 @@ class DisaggregatedModel:
 
         finally:
             try:
-                # 1. Drain worker thread synchronously so it finishes before any cleanup
-                if (
-                    active_forward_future is not None
-                    and not active_forward_future.done()
-                ):
-                    with contextlib.suppress(BaseException):
-                        active_forward_future.result()
-
-                # 2. Shield async cleanup against AnyIO / Starlette cancel scopes (e.g. client disconnect)
+                # Shield async cleanup against AnyIO / Starlette cancel scopes (e.g. client disconnect)
                 curr_task = asyncio.current_task()
                 cancelling_count = 0
                 if curr_task is not None and hasattr(curr_task, "uncancel"):
@@ -1038,6 +1057,19 @@ class DisaggregatedModel:
                         else contextlib.nullcontext()
                     )
                     with shield_ctx:
+                        # 1. Drain worker thread asynchronously without blocking the event loop
+                        if (
+                            active_forward_future is not None
+                            and not active_forward_future.done()
+                        ):
+                            with contextlib.suppress(BaseException):
+                                fut = asyncio.wrap_future(active_forward_future)
+                                try:
+                                    await fut
+                                except asyncio.CancelledError:
+                                    await asyncio.get_running_loop().run_in_executor(
+                                        None, active_forward_future.result
+                                    )
                         # 2a. Consistent cache commit for retained sessions
                         if not release_on_completion:
                             total_generated = len(generated_tokens)
@@ -1058,7 +1090,7 @@ class DisaggregatedModel:
                                         last_committed_idx : last_committed_idx + valid_len
                                     ]
                                     num_layers = len(local_cache.layers)
-                                    upload_id = f"commit-{session_id}-{last_committed_idx}-{last_committed_idx + valid_len}"
+                                    upload_id = f"commit-{session_id}-{turn_id}-{last_committed_idx}-{last_committed_idx + valid_len}"
                                     tasks = [
                                         target_client.append_kv(
                                             session_id=session_id,

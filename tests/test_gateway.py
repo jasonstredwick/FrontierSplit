@@ -647,3 +647,76 @@ def test_gateway_disconnect_anyio_scope_releases_session(disagg_cluster) -> None
     assert not server.store.has_session("disconnect-sess")
 
 
+def test_gateway_early_disconnect_and_registry_cleanup(disagg_cluster) -> None:
+    """Verify that early disconnect before reading chunks releases the lock and cleans up registry without leaks."""
+    from frontiersplit.gateway import _session_locks
+
+    test_client, _, server = disagg_cluster
+    sess_id = "early-dc-sess"
+
+    # Immediately close the stream without reading anything
+    with test_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={
+            "X-FrontierSplit-Session-ID": sess_id,
+        },
+        json={
+            "model": "test-disagg-llama",
+            "messages": [{"role": "user", "content": "1 2 3"}],
+            "max_tokens": 5,
+            "stream": True,
+        },
+    ):
+        pass
+
+    # The registry must not leak the lock entry
+    assert sess_id not in _session_locks
+
+    # Subsequent request using the same session must succeed without being blocked
+    resp = test_client.post(
+        "/v1/chat/completions",
+        headers={"X-FrontierSplit-Session-ID": sess_id},
+        json={
+            "model": "test-disagg-llama",
+            "messages": [{"role": "user", "content": "1 2 3"}],
+            "max_tokens": 3,
+            "stream": False,
+        },
+    )
+    assert resp.status_code == 200
+    assert sess_id not in _session_locks
+
+
+def test_gateway_non_streaming_error_no_double_release(disagg_cluster) -> None:
+    """Verify that exceptions during non-streaming generation do not cause double-release crashes."""
+    from unittest.mock import patch
+    from frontiersplit.gateway import _session_locks
+
+    test_client, client, server = disagg_cluster
+    sess_id = "error-sess"
+
+    disagg = test_client.app.state.disaggregated_model
+
+    async def _failing_generate(*args, **kwargs):
+        raise ValueError("Simulated model forward failure")
+
+    with patch.object(disagg, "generate_async", side_effect=_failing_generate):
+        try:
+            test_client.post(
+                "/v1/chat/completions",
+                headers={"X-FrontierSplit-Session-ID": sess_id},
+                json={
+                    "model": "test-disagg-llama",
+                    "messages": [{"role": "user", "content": "1 2 3"}],
+                    "max_tokens": 3,
+                    "stream": False,
+                },
+            )
+        except ValueError:
+            pass
+
+    # Registry must be cleaned up and lock must not be held
+    assert sess_id not in _session_locks
+
+
