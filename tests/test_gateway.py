@@ -279,3 +279,113 @@ def test_gateway_streaming_multitoken_utf8_and_sampling():
     finally:
         client.close_sync()
         server.stop_thread()
+
+
+def test_gateway_session_persistence_headers(disagg_cluster):
+    """Verify X-FrontierSplit-Session-ID header persists session across conversational turns."""
+    test_client, client, server = disagg_cluster
+    session_id = "agent-session-persist-42"
+    prompt_tokens = "1 2 3 4 5"
+
+    headers = {
+        "X-FrontierSplit-Session-ID": session_id,
+    }
+
+    # Turn 1: Non-streaming with explicit session ID
+    resp1 = test_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-disagg-llama",
+            "messages": [{"role": "user", "content": prompt_tokens}],
+            "max_tokens": 3,
+            "temperature": 0.0,
+            "stream": False,
+        },
+        headers=headers,
+    )
+    assert resp1.status_code == 200
+    assert resp1.headers.get("X-FrontierSplit-Session-ID") == session_id
+
+    # Verify session is retained in ContextStore (release_on_completion was False)
+    assert server.store.has_session(session_id)
+
+    # Turn 2: Streaming with same session ID header
+    resp2 = test_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-disagg-llama",
+            "messages": [{"role": "user", "content": prompt_tokens}],
+            "max_tokens": 3,
+            "temperature": 0.0,
+            "stream": True,
+        },
+        headers=headers,
+    )
+    assert resp2.status_code == 200
+    assert resp2.headers.get("X-FrontierSplit-Session-ID") == session_id
+
+    # Clean up session by releasing
+    client.release_session_sync(session_id)
+    assert not server.store.has_session(session_id)
+
+
+def test_gateway_multi_shard_prefix_routing():
+    """Verify PrefixRouter routes requests to the correct shard and stamps X-FrontierSplit-Shard-ID."""
+    from frontiersplit.context.routing import PrefixRouter
+
+    torch.manual_seed(42)
+    cfg = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+    )
+    model = LlamaForCausalLM(cfg)
+    model.eval()
+
+    server_a = ContextServer()
+    port_a = server_a.start_in_thread(host="127.0.0.1", port=0)
+    server_b = ContextServer()
+    port_b = server_b.start_in_thread(host="127.0.0.1", port=0)
+
+    router = PrefixRouter()
+    node_a = router.add_shard("shard-alpha", "127.0.0.1", port_a)
+    node_b = router.add_shard("shard-beta", "127.0.0.1", port_b)
+
+    disagg = DisaggregatedModel(model=model, context_client=node_a.get_client())
+
+    app = create_gateway_app(
+        model_name="test-routed-llama",
+        disaggregated_model=disagg,
+        context_client=node_a.get_client(),
+        prefix_router=router,
+    )
+    test_client = TestClient(app)
+
+    try:
+        # Telemetry reports both shards
+        telem = test_client.get("/v1/telemetry").json()
+        assert telem["multi_shard_routing"] is True
+        assert set(telem["shards"]) == {"shard-alpha", "shard-beta"}
+
+        # Route request
+        resp = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-routed-llama",
+                "messages": [{"role": "user", "content": "10 20 30 40"}],
+                "max_tokens": 2,
+                "temperature": 0.0,
+            },
+        )
+        assert resp.status_code == 200
+        routed_shard = resp.headers.get("X-FrontierSplit-Shard-ID")
+        assert routed_shard in ("shard-alpha", "shard-beta")
+        assert resp.headers.get("X-FrontierSplit-Session-ID") is not None
+    finally:
+        node_a.close()
+        node_b.close()
+        server_a.stop_thread()
+        server_b.stop_thread()

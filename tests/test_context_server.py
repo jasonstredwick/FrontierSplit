@@ -353,3 +353,104 @@ def test_context_client_sync_and_async_timeout():
         for s in accepted_socks:
             s.close()
         stalled_server.close()
+
+
+def test_context_store_zero_copy_chunks_registration():
+    """Verify that ContextStore stores and appends chunks without memory copies."""
+    store = ContextStore()
+    k1 = torch.randn(1, 4, 16, 32)
+    v1 = torch.randn(1, 4, 16, 32)
+    k2 = torch.randn(1, 4, 32, 32)
+    v2 = torch.randn(1, 4, 32, 32)
+
+    store.register_chunks("sess-zc", 0, [(k1, v1), (k2, v2)])
+    chunks = store.get_chunks("sess-zc", 0)
+    assert chunks is not None
+    assert len(chunks) == 2
+
+    # Zero-copy verification: memory address pointers must match exactly
+    assert chunks[0][0].data_ptr() == k1.data_ptr()
+    assert chunks[0][1].data_ptr() == v1.data_ptr()
+    assert chunks[1][0].data_ptr() == k2.data_ptr()
+    assert chunks[1][1].data_ptr() == v2.data_ptr()
+
+    # O(1) list append delta: must not reallocate existing chunks
+    k3 = torch.randn(1, 4, 8, 32)
+    v3 = torch.randn(1, 4, 8, 32)
+    new_len = store.append_kv("sess-zc", 0, k3, v3)
+    assert new_len == 16 + 32 + 8
+
+    updated_chunks = store.get_chunks("sess-zc", 0)
+    assert updated_chunks is not None
+    assert len(updated_chunks) == 3
+    assert updated_chunks[0][0].data_ptr() == k1.data_ptr()
+    assert updated_chunks[1][0].data_ptr() == k2.data_ptr()
+    assert updated_chunks[2][0].data_ptr() == k3.data_ptr()
+
+    # Concatenated prompt fallback
+    prompt = store.get_prompt("sess-zc", 0)
+    assert prompt is not None
+    assert prompt[0].shape[-2] == 56
+
+
+def test_context_server_zero_copy_radix_match_and_chunk_attention():
+    """Verify that match_prefix shares RadixNode memory zero-copy and chunk attention is bit-exact."""
+    server = ContextServer()
+    tokens1 = [10, 20, 30]
+    tokens2 = [10, 20, 30, 40, 50]
+
+    k_prompt = torch.randn(1, 4, 5, 32)
+    v_prompt = torch.randn(1, 4, 5, 32)
+
+    # Insert prefix tree with two branching nodes
+    server.register_prompt(
+        "sess-base",
+        0,
+        k_prompt[:, :, :3, :],
+        v_prompt[:, :, :3, :],
+        token_ids=tokens1,
+        num_layers=1,
+    )
+    server.register_prompt(
+        "sess-ext", 0, k_prompt, v_prompt, token_ids=tokens2, num_layers=1
+    )
+
+    # Match full prefix of 5 tokens: should span 2 nodes in the Radix tree
+    matched_len, session_id = server.match_prefix(tokens2)
+    assert matched_len == 5
+    assert session_id is not None
+
+    chunks = server.store.get_chunks(session_id, 0)
+    assert chunks is not None
+    assert len(chunks) == 2
+    assert chunks[0][0].shape[-2] == 3
+    assert chunks[1][0].shape[-2] == 2
+
+    # Query chunk attention with single decode query (q_len=1)
+    q = torch.randn(1, 4, 1, 32)
+    chunk_res = server.query_partial_attention(session_id, 0, q=q)
+    expected_res = compute_partial_attention(q, k_prompt, v_prompt)
+
+    assert torch.allclose(chunk_res.accumulator, expected_res.accumulator, atol=1e-5)
+    assert torch.allclose(chunk_res.max_score, expected_res.max_score, atol=1e-5)
+    assert torch.allclose(chunk_res.sum_exp, expected_res.sum_exp, atol=1e-5)
+
+    # Query with context_len slicing across chunk boundary (e.g., context_len=4)
+    sliced_res = server.query_partial_attention(session_id, 0, q=q, context_len=4)
+    expected_sliced = compute_partial_attention(
+        q, k_prompt[:, :, :4, :], v_prompt[:, :, :4, :]
+    )
+    assert torch.allclose(
+        sliced_res.accumulator, expected_sliced.accumulator, atol=1e-5
+    )
+    assert torch.allclose(sliced_res.max_score, expected_sliced.max_score, atol=1e-5)
+    assert torch.allclose(sliced_res.sum_exp, expected_sliced.sum_exp, atol=1e-5)
+
+    # Query with sliding window across chunks (e.g. sliding_window=3 -> tokens [2, 3, 4])
+    sw_res = server.query_partial_attention(session_id, 0, q=q, sliding_window=3)
+    expected_sw = compute_partial_attention(
+        q, k_prompt[:, :, 2:, :], v_prompt[:, :, 2:, :]
+    )
+    assert torch.allclose(sw_res.accumulator, expected_sw.accumulator, atol=1e-5)
+    assert torch.allclose(sw_res.max_score, expected_sw.max_score, atol=1e-5)
+    assert torch.allclose(sw_res.sum_exp, expected_sw.sum_exp, atol=1e-5)

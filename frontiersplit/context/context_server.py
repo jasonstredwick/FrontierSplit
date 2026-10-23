@@ -23,6 +23,7 @@ import torch
 from frontiersplit.context.online_softmax import (
     PartialAttentionChunk,
     compute_partial_attention,
+    merge_partial_attentions,
 )
 from frontiersplit.context.prefix_cache import RadixPrefixCache
 
@@ -211,11 +212,11 @@ def _deserialize_kv_pair(data: bytes) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 class ContextStore:
-    """Thread-safe in-memory storage for static prompt Key-Value tensors."""
+    """Thread-safe in-memory storage for static prompt Key-Value tensors and chunks."""
 
     def __init__(self, ttl_seconds: float = 600.0) -> None:
-        # Structure: {session_id: {layer_idx: (k_prompt, v_prompt)}}
-        self._store: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        # Structure: {session_id: {layer_idx: list[tuple[torch.Tensor, torch.Tensor]]}}
+        self._store: dict[str, dict[int, list[tuple[torch.Tensor, torch.Tensor]]]] = {}
         self._session_last_access: dict[str, float] = {}
         self._lock = threading.RLock()
         self.ttl_seconds = ttl_seconds
@@ -237,11 +238,26 @@ class ContextStore:
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> None:
-        """Stores static prompt keys and values for a given session and layer."""
+        """Stores static prompt keys and values for a given session and layer as a single chunk."""
         with self._lock:
             if session_id not in self._store:
                 self._store[session_id] = {}
-            self._store[session_id][layer_idx] = (k.detach(), v.detach())
+            self._store[session_id][layer_idx] = [(k.detach(), v.detach())]
+            self.touch_session(session_id)
+
+    def register_chunks(
+        self,
+        session_id: str,
+        layer_idx: int,
+        chunks: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Stores static prompt key-value chunks for a given session and layer without copying."""
+        with self._lock:
+            if session_id not in self._store:
+                self._store[session_id] = {}
+            self._store[session_id][layer_idx] = [
+                (k.detach(), v.detach()) for k, v in chunks if k.shape[-2] > 0
+            ]
             self.touch_session(session_id)
 
     def append_kv(
@@ -251,7 +267,7 @@ class ContextStore:
         k_delta: torch.Tensor,
         v_delta: torch.Tensor,
     ) -> int:
-        """Appends a delta Key-Value tensor slice to an existing session cache.
+        """Appends a delta Key-Value tensor slice to an existing session cache without reallocating.
 
         Returns:
             The new cumulative sequence length along the sequence dimension (-2).
@@ -261,31 +277,49 @@ class ContextStore:
                 self._store[session_id] = {}
 
             if layer_idx not in self._store[session_id]:
-                self._store[session_id][layer_idx] = (
-                    k_delta.detach(),
-                    v_delta.detach(),
-                )
+                self._store[session_id][layer_idx] = [
+                    (k_delta.detach(), v_delta.detach())
+                ]
             else:
-                k_prev, v_prev = self._store[session_id][layer_idx]
-                k_new = torch.cat([k_prev, k_delta.detach().to(k_prev.device)], dim=-2)
-                v_new = torch.cat([v_prev, v_delta.detach().to(v_prev.device)], dim=-2)
-                self._store[session_id][layer_idx] = (k_new, v_new)
+                self._store[session_id][layer_idx].append(
+                    (k_delta.detach(), v_delta.detach())
+                )
 
             self.touch_session(session_id)
-            return self._store[session_id][layer_idx][0].shape[-2]
+            return sum(k.shape[-2] for k, _ in self._store[session_id][layer_idx])
+
+    def get_chunks(
+        self,
+        session_id: str,
+        layer_idx: int,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
+        """Retrieves stored prompt key-value chunks, or None if not found."""
+        with self._lock:
+            session = self._store.get(session_id)
+            if session is None:
+                return None
+            chunks = session.get(layer_idx)
+            if chunks is None:
+                return None
+            self.touch_session(session_id)
+            return list(chunks)
 
     def get_prompt(
         self,
         session_id: str,
         layer_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Retrieves stored prompt keys and values, or None if not found."""
+        """Retrieves stored prompt keys and values (concatenating chunks if multiple exist), or None."""
         with self._lock:
-            session = self._store.get(session_id)
-            if session is None:
+            chunks = self.get_chunks(session_id, layer_idx)
+            if chunks is None or len(chunks) == 0:
                 return None
-            self.touch_session(session_id)
-            return session.get(layer_idx)
+            if len(chunks) == 1:
+                return chunks[0]
+            # Multiple chunks: concatenate along sequence dimension for backward compatibility
+            k_cat = torch.cat([c[0] for c in chunks], dim=-2)
+            v_cat = torch.cat([c[1] for c in chunks], dim=-2)
+            return (k_cat, v_cat)
 
     def has_session(self, session_id: str) -> bool:
         """Returns True if the session has registered prompt caches."""
@@ -330,7 +364,24 @@ class ContextStore:
         """Retrieves all layer KV caches for a given session."""
         with self._lock:
             session = self._store.get(session_id)
-            return dict(session) if session is not None else None
+            if session is None:
+                return None
+            res: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            for l_idx in session:
+                prompt = self.get_prompt(session_id, l_idx)
+                if prompt is not None:
+                    res[l_idx] = prompt
+            return res
+
+    def get_session_layer_chunks(
+        self, session_id: str
+    ) -> dict[int, list[tuple[torch.Tensor, torch.Tensor]]] | None:
+        """Retrieves all layer chunk KV lists for a given session."""
+        with self._lock:
+            session = self._store.get(session_id)
+            if session is None:
+                return None
+            return {l_idx: list(chunks) for l_idx, chunks in session.items()}
 
     @property
     def num_sessions(self) -> int:
@@ -474,14 +525,18 @@ class ContextServer:
                 continue
             other_len = len(other_toks)
             if 0 < other_len <= target_len and other_toks == full_tokens[:other_len]:
-                other_layers = self.store.get_session_layers(other_sid) or {}
+                other_layers = self.store.get_session_layer_chunks(other_sid) or {}
                 for l_i, (k_full, v_full) in ready_layers.items():
                     if l_i not in other_layers:
-                        self.store.register_prompt(
+                        self.store.register_chunks(
                             other_sid,
                             l_i,
-                            k_full[:, :, :other_len, :].contiguous().clone(),
-                            v_full[:, :, :other_len, :].contiguous().clone(),
+                            [
+                                (
+                                    k_full[:, :, :other_len, :],
+                                    v_full[:, :, :other_len, :],
+                                )
+                            ],
                         )
 
     def register_prompt(
@@ -643,12 +698,25 @@ class ContextServer:
         nodes, matched_len = self.prefix_cache.match(
             token_ids, required_layers=required if required else None
         )
-        if matched_len == 0:
+        if matched_len == 0 or not nodes:
             return 0, None
 
-        k_by_layer, v_by_layer = self.prefix_cache.assemble_kv(nodes)
-        if not k_by_layer or (required and not required.issubset(k_by_layer.keys())):
-            return 0, None
+        if required:
+            for node in nodes:
+                if not (
+                    required.issubset(node.k_cache.keys())
+                    and required.issubset(node.v_cache.keys())
+                ):
+                    return 0, None
+            available_layers = set(required)
+        else:
+            available_layers = set(nodes[0].k_cache.keys()) & set(
+                nodes[0].v_cache.keys()
+            )
+            for node in nodes[1:]:
+                available_layers &= set(node.k_cache.keys()) & set(node.v_cache.keys())
+            if not available_layers:
+                return 0, None
 
         session_id = (
             target_session_id or f"prefix-{abs(hash(tuple(token_ids[:matched_len]))):x}"
@@ -657,12 +725,15 @@ class ContextServer:
         self._staged_uploads.pop(session_id, None)
         self.store.release_session(session_id)
         self._session_tokens[session_id] = matched_tokens
-        for layer_idx, k in k_by_layer.items():
-            self.store.register_prompt(
-                session_id, layer_idx, k.clone(), v_by_layer[layer_idx].clone()
-            )
-        self._set_session_pin(session_id, matched_tokens)
 
+        # Zero-copy registration: reference node KV caches directly as chunks
+        for layer_idx in sorted(available_layers):
+            chunks = [
+                (node.k_cache[layer_idx], node.v_cache[layer_idx]) for node in nodes
+            ]
+            self.store.register_chunks(session_id, layer_idx, chunks)
+
+        self._set_session_pin(session_id, matched_tokens)
         return matched_len, session_id
 
     def query_partial_attention(
@@ -675,93 +746,172 @@ class ContextServer:
         sliding_window: int | None = None,
         past_local_len: int = 0,
     ) -> PartialAttentionChunk:
-        """Computes partial attention for a given query against stored prompt KV.
+        """Computes partial attention for a given query against stored prompt KV chunks.
 
-        Args:
-            session_id: Unique session identifier.
-            layer_idx: Transformer layer index.
-            q: Query tensor of shape `[batch, num_heads, q_len, head_dim]`.
-            scale: Softmax temperature scale factor.
-            context_len: Optional prefix slice length for zero-copy subset sharing.
-            sliding_window: Optional sliding attention window size.
-            past_local_len: Number of local tokens after the prompt KV cache.
+        Evaluates attention chunk-by-chunk using associative Online Softmax reduction,
+        guaranteeing bit-for-bit exactness without contiguous memory copies.
         """
-        kv = self.store.get_prompt(session_id, layer_idx)
-        if kv is None and session_id in self._session_tokens:
+        chunks = self.store.get_chunks(session_id, layer_idx)
+        if (chunks is None or len(chunks) == 0) and session_id in self._session_tokens:
             # Attempt lazy backfill from RadixPrefixCache if layer was published after match_prefix
             toks = self._session_tokens[session_id]
             nodes, m_len = self.prefix_cache.match(toks)
-            if m_len == len(toks):
-                k_by_l, v_by_l = self.prefix_cache.assemble_kv(nodes)
-                if layer_idx in k_by_l and layer_idx in v_by_l:
-                    self.store.register_prompt(
-                        session_id, layer_idx, k_by_l[layer_idx], v_by_l[layer_idx]
-                    )
-                    kv = self.store.get_prompt(session_id, layer_idx)
+            if (
+                m_len == len(toks)
+                and nodes
+                and all(
+                    layer_idx in n.k_cache and layer_idx in n.v_cache for n in nodes
+                )
+            ):
+                lazy_chunks = [
+                    (n.k_cache[layer_idx], n.v_cache[layer_idx]) for n in nodes
+                ]
+                self.store.register_chunks(session_id, layer_idx, lazy_chunks)
+                chunks = self.store.get_chunks(session_id, layer_idx)
 
-        if kv is None:
+        if chunks is None or len(chunks) == 0:
             raise KeyError(
                 f"No prompt KV cache found for session '{session_id}', layer {layer_idx}"
             )
-        k, v = kv
-        if context_len is not None and context_len < k.shape[-2]:
-            k = k[:, :, :context_len, :]
-            v = v[:, :, :context_len, :]
 
         q_dev = q.to(self.device)
-        remote_mask: torch.Tensor | None = None
+        batch_size, num_heads, q_len, head_dim = q_dev.shape
 
+        # Calculate total sequence length across all chunks
+        total_p_len = sum(k_c.shape[-2] for k_c, _ in chunks)
+        eff_len = (
+            min(total_p_len, context_len) if context_len is not None else total_p_len
+        )
+
+        # Determine sliding window boundaries
+        first_q_pos = eff_len + max(0, past_local_len - q_len)
         if sliding_window is not None and sliding_window > 0:
-            n_p = k.shape[-2]
-            q_len = q_dev.shape[-2]
             if q_len == 1:
                 if past_local_len <= 0:
-                    start = max(0, n_p - sliding_window)
-                    k = k[:, :, start:, :]
-                    v = v[:, :, start:, :]
+                    start_bound = max(0, eff_len - sliding_window)
                 else:
                     rem_window = sliding_window - past_local_len
                     if rem_window <= 0:
-                        k = k[:, :, 0:0, :]
-                        v = v[:, :, 0:0, :]
+                        start_bound = eff_len
                     else:
-                        start = max(0, n_p - rem_window)
-                        k = k[:, :, start:, :]
-                        v = v[:, :, start:, :]
+                        start_bound = max(0, eff_len - rem_window)
             else:
-                first_q_pos = n_p + max(0, past_local_len - q_len)
-                start = max(0, first_q_pos - sliding_window + 1)
-                if start >= n_p:
-                    k = k[:, :, 0:0, :]
-                    v = v[:, :, 0:0, :]
-                else:
-                    k = k[:, :, start:, :]
-                    v = v[:, :, start:, :]
-                    rem_len = k.shape[-2]
-                    q_pos = torch.arange(
-                        first_q_pos, first_q_pos + q_len, device=self.device
-                    ).unsqueeze(1)
-                    k_pos = torch.arange(start, n_p, device=self.device).unsqueeze(0)
-                    out_of_window = k_pos <= (q_pos - sliding_window)
-                    if out_of_window.any():
-                        remote_mask = torch.where(
-                            out_of_window,
-                            torch.full(
-                                (q_len, rem_len),
-                                float("-inf"),
-                                dtype=torch.float32,
-                                device=self.device,
-                            ),
-                            torch.zeros(
-                                (q_len, rem_len),
-                                dtype=torch.float32,
-                                device=self.device,
-                            ),
-                        ).view(1, 1, q_len, rem_len)
+                start_bound = max(0, first_q_pos - sliding_window + 1)
+        else:
+            start_bound = 0
 
-        return compute_partial_attention(
-            q_dev, k, v, scale=scale, attention_mask=remote_mask
-        )
+        # If effective range is empty, return empty chunk immediately
+        if start_bound >= eff_len or eff_len <= 0:
+            return compute_partial_attention(
+                q_dev,
+                chunks[0][0][:, :, 0:0, :],
+                chunks[0][1][:, :, 0:0, :],
+                scale=scale,
+            )
+
+        # Single-chunk fast-path when only 1 chunk exists:
+        if len(chunks) == 1:
+            k_c, v_c = chunks[0]
+            c_len = k_c.shape[-2]
+            slice_end = min(c_len, eff_len)
+            slice_start = max(0, start_bound)
+            if slice_start >= slice_end:
+                return compute_partial_attention(
+                    q_dev, k_c[:, :, 0:0, :], v_c[:, :, 0:0, :], scale=scale
+                )
+            k_sub = k_c[:, :, slice_start:slice_end, :]
+            v_sub = v_c[:, :, slice_start:slice_end, :]
+
+            remote_mask: torch.Tensor | None = None
+            if sliding_window is not None and sliding_window > 0 and q_len > 1:
+                rem_len = k_sub.shape[-2]
+                q_pos = torch.arange(
+                    first_q_pos, first_q_pos + q_len, device=self.device
+                ).unsqueeze(1)
+                k_pos = torch.arange(
+                    slice_start, slice_end, device=self.device
+                ).unsqueeze(0)
+                out_of_window = k_pos <= (q_pos - sliding_window)
+                if out_of_window.any():
+                    remote_mask = torch.where(
+                        out_of_window,
+                        torch.full(
+                            (q_len, rem_len),
+                            float("-inf"),
+                            dtype=torch.float32,
+                            device=self.device,
+                        ),
+                        torch.zeros(
+                            (q_len, rem_len),
+                            dtype=torch.float32,
+                            device=self.device,
+                        ),
+                    ).view(1, 1, q_len, rem_len)
+
+            return compute_partial_attention(
+                q_dev, k_sub, v_sub, scale=scale, attention_mask=remote_mask
+            )
+
+        # Multi-chunk path: iterate through chunks, slice zero-copy views, compute partials & merge
+        partial_chunks: list[PartialAttentionChunk] = []
+        curr_offset = 0
+
+        for k_c, v_c in chunks:
+            c_len = k_c.shape[-2]
+            chunk_start = curr_offset
+            chunk_end = curr_offset + c_len
+            curr_offset = chunk_end
+
+            # Determine intersection with [start_bound, eff_len)
+            v_start = max(chunk_start, start_bound)
+            v_end = min(chunk_end, eff_len)
+
+            if v_start >= v_end:
+                continue
+
+            rel_start = v_start - chunk_start
+            rel_end = v_end - chunk_start
+            k_sub = k_c[:, :, rel_start:rel_end, :]
+            v_sub = v_c[:, :, rel_start:rel_end, :]
+            sub_len = k_sub.shape[-2]
+
+            remote_mask = None
+            if sliding_window is not None and sliding_window > 0 and q_len > 1:
+                q_pos = torch.arange(
+                    first_q_pos, first_q_pos + q_len, device=self.device
+                ).unsqueeze(1)
+                k_pos = torch.arange(v_start, v_end, device=self.device).unsqueeze(0)
+                out_of_window = k_pos <= (q_pos - sliding_window)
+                if out_of_window.any():
+                    remote_mask = torch.where(
+                        out_of_window,
+                        torch.full(
+                            (q_len, sub_len),
+                            float("-inf"),
+                            dtype=torch.float32,
+                            device=self.device,
+                        ),
+                        torch.zeros(
+                            (q_len, sub_len),
+                            dtype=torch.float32,
+                            device=self.device,
+                        ),
+                    ).view(1, 1, q_len, sub_len)
+
+            p_chunk = compute_partial_attention(
+                q_dev, k_sub, v_sub, scale=scale, attention_mask=remote_mask
+            )
+            partial_chunks.append(p_chunk)
+
+        if not partial_chunks:
+            return compute_partial_attention(
+                q_dev,
+                chunks[0][0][:, :, 0:0, :],
+                chunks[0][1][:, :, 0:0, :],
+                scale=scale,
+            )
+
+        return merge_partial_attentions(partial_chunks)
 
     def release_session(self, session_id: str) -> bool:
         """Evicts a session's static prompt KV cache."""

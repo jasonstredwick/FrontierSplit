@@ -415,6 +415,7 @@ class DisaggregatedModel:
         release_on_completion: bool = True,
         temperature: float = 0.0,
         top_p: float = 1.0,
+        reasoning_commit_threshold: int = 4000,
     ) -> Iterator[int]:
         """Synchronously streams generated tokens one by one as they are produced.
 
@@ -427,6 +428,8 @@ class DisaggregatedModel:
                 Set to False for multi-turn sessions with sliding TTL.
             temperature: Sampling temperature (0.0 for greedy decoding).
             top_p: Nucleus sampling probability threshold in (0.0, 1.0].
+            reasoning_commit_threshold: Token count threshold above which generated reasoning
+                tokens are committed to the Context Server (Review 4.3).
 
         Yields:
             Generated token IDs one by one (including the first generated token).
@@ -522,6 +525,8 @@ class DisaggregatedModel:
 
             # 2. Local volatile output cache (starts empty; never holds prompt tokens)
             local_cache = DynamicCache()
+            generated_tokens = [first_tok_id]
+            last_committed_idx = 0
 
             # 3. Autoregressive decode loop
             for step in range(1, max_new_tokens):
@@ -540,6 +545,35 @@ class DisaggregatedModel:
                         out.logits, temperature=temperature, top_p=top_p
                     )
                 tok_id = int(cur_tok.item())
+                generated_tokens.append(tok_id)
+
+                # Mid-generation reasoning commit if output sequence exceeds reasoning_commit_threshold
+                if (
+                    reasoning_commit_threshold > 0
+                    and len(local_cache.layers) > 0
+                    and local_cache.layers[0].keys.shape[-2]
+                    >= reasoning_commit_threshold
+                ):
+                    local_len = local_cache.layers[0].keys.shape[-2]
+                    chunk_tokens = generated_tokens[
+                        last_committed_idx : last_committed_idx + local_len
+                    ]
+                    num_layers = len(local_cache.layers)
+                    upload_id = uuid.uuid4().hex
+                    for l_idx, layer in enumerate(local_cache.layers):
+                        self.context_client.append_kv_sync(
+                            session_id=session_id,
+                            layer_idx=l_idx,
+                            k_delta=layer.keys,
+                            v_delta=layer.values,
+                            token_ids=chunk_tokens if l_idx == num_layers - 1 else None,
+                            num_layers=num_layers,
+                            upload_id=upload_id,
+                        )
+                    last_committed_idx += local_len
+                    prompt_len += local_len
+                    local_cache = DynamicCache()
+
                 if tok_id in eos_ids:
                     self._set_finish_reason("stop")
                     yield tok_id
@@ -547,6 +581,33 @@ class DisaggregatedModel:
                 yield tok_id
 
         finally:
+            if not release_on_completion:
+                # Turn-boundary reasoning trace commit policy (Review 4.3):
+                # If generated reasoning tokens reach threshold, commit them to the Context Server.
+                total_generated = len(generated_tokens)
+                if (
+                    reasoning_commit_threshold > 0
+                    and total_generated >= reasoning_commit_threshold
+                    and len(local_cache.layers) > 0
+                    and local_cache.layers[0].keys.shape[-2] > 0
+                ):
+                    rem_len = local_cache.layers[0].keys.shape[-2]
+                    chunk_tokens = generated_tokens[
+                        last_committed_idx : last_committed_idx + rem_len
+                    ]
+                    num_layers = len(local_cache.layers)
+                    upload_id = uuid.uuid4().hex
+                    for l_idx, layer in enumerate(local_cache.layers):
+                        self.context_client.append_kv_sync(
+                            session_id=session_id,
+                            layer_idx=l_idx,
+                            k_delta=layer.keys,
+                            v_delta=layer.values,
+                            token_ids=chunk_tokens if l_idx == num_layers - 1 else None,
+                            num_layers=num_layers,
+                            upload_id=upload_id,
+                        )
+
             if release_on_completion:
                 with contextlib.suppress(Exception):
                     self.context_client.release_session_sync(session_id)
@@ -561,6 +622,7 @@ class DisaggregatedModel:
         release_on_completion: bool = True,
         temperature: float = 0.0,
         top_p: float = 1.0,
+        reasoning_commit_threshold: int = 4000,
     ) -> list[int]:
         """Generates tokens synchronously using disaggregated attention merging.
 
@@ -572,6 +634,8 @@ class DisaggregatedModel:
             release_on_completion: If True, releases session KV cache on completion.
             temperature: Sampling temperature (0.0 for greedy decoding).
             top_p: Nucleus sampling probability threshold in (0.0, 1.0].
+            reasoning_commit_threshold: Token count threshold above which generated reasoning
+                tokens are committed to the Context Server (Review 4.3).
 
         Returns:
             List of generated token IDs (including the first generated token).
@@ -585,6 +649,7 @@ class DisaggregatedModel:
                 release_on_completion=release_on_completion,
                 temperature=temperature,
                 top_p=top_p,
+                reasoning_commit_threshold=reasoning_commit_threshold,
             )
         )
 
@@ -642,6 +707,7 @@ class DisaggregatedModel:
         release_on_completion: bool = True,
         temperature: float = 0.0,
         top_p: float = 1.0,
+        reasoning_commit_threshold: int = 4000,
     ) -> AsyncIterator[int]:
         """Asynchronously streams generated tokens one by one as they are produced.
 
@@ -653,6 +719,8 @@ class DisaggregatedModel:
             release_on_completion: If True, evicts session KV cache on completion.
             temperature: Sampling temperature (0.0 for greedy decoding).
             top_p: Nucleus sampling probability threshold in (0.0, 1.0].
+            reasoning_commit_threshold: Token count threshold above which generated reasoning
+                tokens are committed to the Context Server (Review 4.3).
 
         Yields:
             Generated token IDs one by one (including the first generated token).
@@ -740,6 +808,8 @@ class DisaggregatedModel:
             yield first_tok_id
             cur_tok = next_tok
             local_cache = DynamicCache()
+            generated_tokens = [first_tok_id]
+            last_committed_idx = 0
 
             for step in range(1, max_new_tokens):
                 position = prompt_len + step - 1
@@ -757,6 +827,38 @@ class DisaggregatedModel:
                         out.logits, temperature=temperature, top_p=top_p
                     )
                 tok_id = int(cur_tok.item())
+                generated_tokens.append(tok_id)
+
+                # Mid-generation reasoning commit if output sequence exceeds reasoning_commit_threshold
+                if (
+                    reasoning_commit_threshold > 0
+                    and len(local_cache.layers) > 0
+                    and local_cache.layers[0].keys.shape[-2]
+                    >= reasoning_commit_threshold
+                ):
+                    local_len = local_cache.layers[0].keys.shape[-2]
+                    chunk_tokens = generated_tokens[
+                        last_committed_idx : last_committed_idx + local_len
+                    ]
+                    num_layers = len(local_cache.layers)
+                    upload_id = uuid.uuid4().hex
+                    tasks = [
+                        self.context_client.append_kv(
+                            session_id=session_id,
+                            layer_idx=l_idx,
+                            k_delta=layer.keys,
+                            v_delta=layer.values,
+                            token_ids=chunk_tokens if l_idx == num_layers - 1 else None,
+                            num_layers=num_layers,
+                            upload_id=upload_id,
+                        )
+                        for l_idx, layer in enumerate(local_cache.layers)
+                    ]
+                    await asyncio.gather(*tasks)
+                    last_committed_idx += local_len
+                    prompt_len += local_len
+                    local_cache = DynamicCache()
+
                 if tok_id in eos_ids:
                     self._set_finish_reason("stop")
                     yield tok_id
@@ -764,6 +866,35 @@ class DisaggregatedModel:
                 yield tok_id
 
         finally:
+            if not release_on_completion:
+                total_generated = len(generated_tokens)
+                if (
+                    reasoning_commit_threshold > 0
+                    and total_generated >= reasoning_commit_threshold
+                    and len(local_cache.layers) > 0
+                    and local_cache.layers[0].keys.shape[-2] > 0
+                ):
+                    rem_len = local_cache.layers[0].keys.shape[-2]
+                    chunk_tokens = generated_tokens[
+                        last_committed_idx : last_committed_idx + rem_len
+                    ]
+                    num_layers = len(local_cache.layers)
+                    upload_id = uuid.uuid4().hex
+                    tasks = [
+                        self.context_client.append_kv(
+                            session_id=session_id,
+                            layer_idx=l_idx,
+                            k_delta=layer.keys,
+                            v_delta=layer.values,
+                            token_ids=chunk_tokens if l_idx == num_layers - 1 else None,
+                            num_layers=num_layers,
+                            upload_id=upload_id,
+                        )
+                        for l_idx, layer in enumerate(local_cache.layers)
+                    ]
+                    with contextlib.suppress(Exception):
+                        await asyncio.gather(*tasks)
+
             if release_on_completion:
                 with contextlib.suppress(Exception):
                     await self.context_client.release_session(session_id)
@@ -778,6 +909,7 @@ class DisaggregatedModel:
         release_on_completion: bool = True,
         temperature: float = 0.0,
         top_p: float = 1.0,
+        reasoning_commit_threshold: int = 4000,
     ) -> list[int]:
         """Asynchronously generates tokens using disaggregated attention merging.
 
@@ -789,6 +921,8 @@ class DisaggregatedModel:
             release_on_completion: If True, releases session KV cache on completion.
             temperature: Sampling temperature (0.0 for greedy decoding).
             top_p: Nucleus sampling probability threshold in (0.0, 1.0].
+            reasoning_commit_threshold: Token count threshold above which generated reasoning
+                tokens are committed to the Context Server (Review 4.3).
 
         Returns:
             List of generated token IDs (including the first generated token).
@@ -802,6 +936,7 @@ class DisaggregatedModel:
             release_on_completion=release_on_completion,
             temperature=temperature,
             top_p=top_p,
+            reasoning_commit_threshold=reasoning_commit_threshold,
         ):
             generated.append(tok)
         return generated

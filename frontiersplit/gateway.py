@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -18,13 +19,16 @@ from typing import Any
 import requests
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from frontiersplit.context.context_server import ContextClient
 from frontiersplit.context.hf_model import DisaggregatedModel
+from frontiersplit.context.routing import PrefixRouter
 from frontiersplit.pipeline.scheduler import PipelineScheduler
+
+logger = logging.getLogger("frontiersplit.gateway")
 
 try:
     from transformers import AutoTokenizer
@@ -96,6 +100,7 @@ def create_gateway_app(
     disaggregated_model: DisaggregatedModel | None = None,
     context_client: ContextClient | None = None,
     tokenizer: Any | None = None,
+    prefix_router: PrefixRouter | None = None,
 ) -> FastAPI:
     """Creates a FastAPI gateway application.
 
@@ -115,6 +120,7 @@ def create_gateway_app(
         disaggregated_model: Optional DisaggregatedModel instance for direct serving.
         context_client: Optional ContextClient instance for prefix cache queries.
         tokenizer: Optional tokenizer instance for text encoding/decoding.
+        prefix_router: Optional PrefixRouter instance for multi-shard intelligent routing.
 
     Returns:
         Configured FastAPI application instance.
@@ -162,6 +168,7 @@ def create_gateway_app(
     app.state.context_client = context_client
     app.state.tokenizer = tokenizer
     app.state.model_name = model_name
+    app.state.prefix_router = prefix_router
 
     @app.get("/health")
     def health():
@@ -211,10 +218,24 @@ def create_gateway_app(
             "model": app.state.model_name,
             "context_server_connected": app.state.context_client is not None,
             "prefix_caching": app.state.context_client is not None,
+            "multi_shard_routing": app.state.prefix_router is not None,
+            "shards": (
+                list(app.state.prefix_router.ring.shards.keys())
+                if app.state.prefix_router is not None
+                else []
+            ),
         }
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatCompletionRequest):
+    async def chat_completions(
+        req: ChatCompletionRequest,
+        x_frontiersplit_session_id: str | None = Header(
+            None, alias="X-FrontierSplit-Session-ID"
+        ),
+        x_frontiersplit_release_session: bool | None = Header(
+            None, alias="X-FrontierSplit-Release-Session"
+        ),
+    ):
         """OpenAI-compatible chat completion endpoint."""
         if req.temperature < 0.0:
             raise HTTPException(
@@ -268,7 +289,49 @@ def create_gateway_app(
 
             input_tensor = torch.tensor([token_ids], dtype=torch.long)
             req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-            session_id = f"sess-{req_id}"
+            explicit_session = bool(
+                x_frontiersplit_session_id and x_frontiersplit_session_id.strip()
+            )
+            session_id = (
+                x_frontiersplit_session_id.strip()
+                if explicit_session
+                else f"sess-{req_id}"
+            )
+            if x_frontiersplit_release_session is not None:
+                release_on_completion = x_frontiersplit_release_session
+            elif explicit_session:
+                release_on_completion = False
+            else:
+                release_on_completion = True
+
+            routed_shard_id: str | None = None
+            if (
+                app.state.prefix_router is not None
+                and app.state.disaggregated_model is not None
+            ):
+                try:
+                    decision = app.state.prefix_router.route_request(
+                        messages=req.messages,
+                        session_id=session_id if explicit_session else None,
+                        tokenizer=tok,
+                    )
+                    routed_shard_id = decision.shard.shard_id
+                    routed_client = decision.shard.get_client()
+                    disagg.context_client = routed_client
+                    for patcher in getattr(disagg, "_patchers", []):
+                        patcher.context_client = routed_client
+                except Exception as e:
+                    logger.warning(
+                        "PrefixRouter routing failed, falling back to default client: %s",
+                        e,
+                    )
+
+            resp_headers: dict[str, str] = {
+                "X-FrontierSplit-Session-ID": session_id,
+            }
+            if routed_shard_id:
+                resp_headers["X-FrontierSplit-Shard-ID"] = routed_shard_id
+
             created_time = int(time.time())
             max_new_tokens = req.max_tokens if req.max_tokens is not None else 32
 
@@ -299,6 +362,7 @@ def create_gateway_app(
                         max_new_tokens=max_new_tokens,
                         session_id=session_id,
                         use_prefix_cache=req.use_prefix_cache,
+                        release_on_completion=release_on_completion,
                         temperature=req.temperature,
                         top_p=req.top_p,
                     ):
@@ -379,7 +443,9 @@ def create_gateway_app(
                     yield "data: [DONE]\n\n"
 
                 return StreamingResponse(
-                    event_generator(), media_type="text/event-stream"
+                    event_generator(),
+                    media_type="text/event-stream",
+                    headers=resp_headers,
                 )
 
             # Non-streaming mode
@@ -388,6 +454,7 @@ def create_gateway_app(
                 max_new_tokens=max_new_tokens,
                 session_id=session_id,
                 use_prefix_cache=req.use_prefix_cache,
+                release_on_completion=release_on_completion,
                 temperature=req.temperature,
                 top_p=req.top_p,
             )
@@ -422,7 +489,10 @@ def create_gateway_app(
                     "total_tokens": prompt_count + comp_count,
                 },
             }
-            return JSONResponse(content=response_payload)
+            return JSONResponse(
+                content=response_payload,
+                headers=resp_headers,
+            )
 
         # 2. Pipeline Scheduler Execution Path
         assert app.state.scheduler is not None

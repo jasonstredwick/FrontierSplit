@@ -338,3 +338,68 @@ def test_disaggregated_model_temperature_and_top_p_sampling(
     finally:
         client.close_sync()
         server.stop_thread()
+
+
+def test_disaggregated_model_reasoning_commit_threshold(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify reasoning commit policy (Review 4.3): outputs >= threshold are committed to Context Server."""
+    base_model, prompt_t1, _ = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    session_id = "reasoning-commit-session"
+    try:
+        disagg = DisaggregatedModel(model=model, context_client=client)
+
+        # Turn 1: generate 5 tokens with reasoning_commit_threshold=4 and release_on_completion=False
+        out_t1 = disagg.generate(
+            input_ids=prompt_t1,
+            max_new_tokens=5,
+            session_id=session_id,
+            release_on_completion=False,
+            reasoning_commit_threshold=4,
+        )
+        assert len(out_t1) == 5
+
+        # Verify ContextStore now holds the prompt + reasoning output tokens
+        prompt_len = prompt_t1.shape[1]
+        kv_committed = server.store.get_prompt(session_id, 0)
+        assert kv_committed is not None
+        assert kv_committed[0].shape[-2] >= prompt_len + 4
+
+        # Turn 2: Construct continuation prompt including the committed reasoning tokens + new user tokens
+        committed_reasoning_tokens = out_t1[:4]
+        new_user_tokens = [99, 100]
+        prompt_t2 = torch.cat(
+            [
+                prompt_t1,
+                torch.tensor(
+                    [committed_reasoning_tokens + new_user_tokens], dtype=torch.long
+                ),
+            ],
+            dim=1,
+        )
+
+        # Turn 2 match_prefix on Context Server must match all prompt + reasoning tokens
+        matched_len, _ = client.match_prefix_sync(
+            prompt_t2[0].tolist(), session_id=session_id
+        )
+        assert matched_len >= prompt_len + 4
+
+        # Run Turn 2 generation
+        out_t2 = disagg.generate(
+            input_ids=prompt_t2,
+            max_new_tokens=2,
+            session_id=session_id,
+            use_prefix_cache=True,
+            release_on_completion=True,
+        )
+        assert len(out_t2) == 2
+        # After completion with release_on_completion=True, session is released
+        assert not server.store.has_session(session_id)
+    finally:
+        client.close_sync()
+        server.stop_thread()
