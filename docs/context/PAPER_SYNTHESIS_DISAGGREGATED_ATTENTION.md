@@ -324,6 +324,28 @@ During multi-turn conversational interactions (e.g., chain-of-thought code gener
 - **Zero-Copy Radix Extension**: Suffix tokens are attached directly under the matched prefix node using `insert_delta`, preserving canonical prefix tensor storage sharing across branching sessions without full-history tensor concatenation.
 - **Request-Bound Context Isolation**: The Gateway binds the selected `ContextClient` to the request's execution context via `contextvars`, guaranteeing that concurrent requests on a shared model singleton never cross-bleed or target the wrong server.
 
+### 6.8 Heterogeneous Timing-Balanced Scheduling & Work-Ratio Packing [Proposed Architecture]
+In production clusters mixing heterogeneous models (dense vs. MoE), diverse accelerators (e.g., fast compute TPUs/GPUs with high-capacity context servers), and multi-tiered networks, scheduling must account for the execution time ratio per layer per unit of work:
+
+$$R_{\text{balance}} = \frac{T_{\text{compute\_layer}}}{T_{\text{context\_attention}}}$$
+
+where:
+- $T_{\text{compute\_layer}}$ is the wall-clock execution time of the compute worker's transformer layer (including LayerNorm, QKV projections, feed-forward / MoE MLP operations $T_{\text{MLP}}$, output projection, and inter-stage activation network transit).
+- $T_{\text{context\_attention}}$ is the wall-clock execution time for the Context Server to stream the KV cache chunks from VRAM and compute partial attention.
+
+#### Operational Regimes & Scheduling Policies:
+1. **Compute-Dominant Regime ($T_{\text{compute\_layer}} \gg T_{\text{context\_attention}}$)**:
+   - For models with large feed-forward/MoE blocks or high FLOP-to-byte ratios, a layer's compute cycle may run substantially longer than the KV cache attention scan (e.g., $10\times$ longer, $R_{\text{balance}} \approx 10$).
+   - A single message stream leaves the Context Server's memory bus and compute units idle for $90\%$ of the cycle.
+   - **Multi-Message Packing by Time Ratio**: Assuming adequate VRAM capacity, the Context Server co-locates and phase-staggers KV caches from up to:
+     $$M_{\text{interleave}} \approx \lfloor R_{\text{balance}} \rfloor$$
+     independent message streams (e.g., 10 messages). While Message 1 executes its compute/MLP layer, the Context Server sequentially evaluates partial attention for Messages 2 through 10, achieving near-100% duty cycle on context hardware without queuing stalls.
+2. **Context-Dominant Regime ($T_{\text{context\_attention}} \gg T_{\text{compute\_layer}}$)**:
+   - When context sequences become massive ($>500\text{k}$ tokens), memory scan time dominates the compute worker's execution.
+   - The scheduler applies the Multi-Machine Analytical Sharding Trigger (Section 6.3), sharding the sequence across:
+     $$P \approx \left\lceil \frac{T_{\text{context\_attention}}}{T_{\text{compute\_layer}}} \right\rceil$$
+     context nodes, reducing $T_{\text{context\_attention}}$ until $R_{\text{balance}} \approx 1$ and restoring balanced pipeline symmetry.
+
 ---
 
 ## 7. Implementation Status & Paper Framing Summary
@@ -339,3 +361,4 @@ During multi-turn conversational interactions (e.g., chain-of-thought code gener
 | **Remainder Modulo 128** | Dynamic zero-padding with attention masks | Local volatile cache remainder retention | **Proposed Optimization** (Current prototype offloads full prompt) |
 | **Multi-Machine Sharding** | Fixed sequence tensor parallelism | Analytical roofline sharding trigger ($P$) | **Proposed Architecture** (Current prototype routes to single shard) |
 | **Hot Prefix Scaling** | Static single-node pinning | Active reader count dynamic read replicas | **Proposed Architecture** (Current prototype load-sheds to ring replicas) |
+| **Heterogeneous Timing & Work-Ratio Scheduling** | Uniform thread-pool / blind round-robin | Per-layer compute-to-context timing ratio ($R_{\text{balance}}$) multi-tenant packing | **Proposed Architecture** (Current prototype uses uniform session affinity) |
