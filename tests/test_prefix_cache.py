@@ -287,3 +287,55 @@ def test_radix_node_split_preserves_tensor_storage_view():
     assert suffix_node.v_cache[0].untyped_storage().data_ptr() == orig_v_ptr
 
 
+def test_eviction_compacts_split_nodes_and_frees_backing_allocation():
+    """Verify that evicting split nodes reclaims dead backing slabs via selective compaction."""
+    # Allow enough capacity so insert_delta does not trigger early eviction before pinning
+    cache = RadixPrefixCache(max_cached_tokens=200)
+
+    # 1. Insert 100 tokens
+    tokens_100 = list(range(1, 101))
+    k100 = {0: torch.randn(1, 2, 100, 16)}  # 1 * 2 * 100 * 16 * 4 = 12,800 bytes
+    v100 = {0: torch.randn(1, 2, 100, 16)}
+    cache.insert(tokens_100, k100, v100)
+
+    assert cache.total_tokens == 100
+    assert cache.total_backing_tokens == 100
+
+    # 2. Branch at token 1: insert [1, 999] so that node splits into 1 token and 99-token suffix
+    k_branch = {0: torch.randn(1, 2, 1, 16)}
+    v_branch = {0: torch.randn(1, 2, 1, 16)}
+    cache.insert_delta(
+        base_tokens=[1],
+        suffix_tokens=[999],
+        k_delta_by_layer=k_branch,
+        v_delta_by_layer=v_branch,
+    )
+
+    nodes, matched = cache.match([1])
+    assert matched == 1
+    prefix_node = nodes[0]
+    assert prefix_node.num_tokens == 1
+
+    # Pin the 1-token prefix node and branch node so they survive eviction
+    prefix_node.session_count = 1
+    branch_node = prefix_node.children[999]
+    branch_node.session_count = 1
+
+    # Before eviction: prefix node shares 100-token backing slab (12,800 bytes)
+    assert prefix_node.k_cache[0].untyped_storage().nbytes() == 12800
+
+    # 3. Change quota to force eviction of the unpinned 99-token suffix
+    cache.max_cached_tokens = 2
+    evicted_tokens = cache.evict_if_needed()
+    assert evicted_tokens == 99
+
+    # 4. Compaction must have been applied to surviving nodes:
+    # Surviving 1-token prefix node now only holds its own 1-token allocation (128 bytes)!
+    # The 12,800-byte backing slab has been freed!
+    assert prefix_node.k_cache[0].untyped_storage().nbytes() == 128
+    assert prefix_node.v_cache[0].untyped_storage().nbytes() == 128
+    assert cache.total_tokens == 2  # 1 token prefix + 1 token branch
+    assert cache.total_backing_tokens == 2
+
+
+

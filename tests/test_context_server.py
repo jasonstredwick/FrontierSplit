@@ -629,3 +629,143 @@ def test_multilayer_registration_with_optional_defaults():
     assert server.store.get_prompt("sess-defaults-multi", 0) is not None
     assert server.store.get_prompt("sess-defaults-multi", 1) is not None
 
+
+def test_layer_requirements_do_not_leak_across_models():
+    """Verify that multi-layer requirements are scoped to model schemas and do not leak across namespaces."""
+    server = ContextServer()
+    toks_a = [10, 20, 30]
+    k_a = torch.randn(1, 2, 3, 16)
+    v_a = torch.randn(1, 2, 3, 16)
+
+    # 1. Register 3 layers for model-a
+    for l_idx in range(3):
+        server.register_prompt(
+            "sess-model-a",
+            layer_idx=l_idx,
+            k=k_a,
+            v=v_a,
+            token_ids=toks_a,
+            num_layers=3,
+            model_id="model-a",
+        )
+
+    assert "sess-model-a" not in server._staged_uploads
+    assert server.store.has_session("sess-model-a")
+
+    # 2. Register 2 layers for model-b
+    toks_b = [10, 20, 30]
+    k_b = torch.randn(1, 2, 3, 16)
+    v_b = torch.randn(1, 2, 3, 16)
+    for l_idx in range(2):
+        server.register_prompt(
+            "sess-model-b",
+            layer_idx=l_idx,
+            k=k_b,
+            v=v_b,
+            token_ids=toks_b,
+            num_layers=2,
+            model_id="model-b",
+        )
+
+    # Model B's staged upload MUST publish once its 2 layers are provided;
+    # it must NOT wait for nonexistent layer 2 leaked from model A!
+    assert "sess-model-b" not in server._staged_uploads
+    assert server.store.has_session("sess-model-b")
+
+    # Prefix matching on model-b must succeed with only layers {0, 1}
+    matched_len, bound_sid = server.match_prefix(toks_b, model_id="model-b")
+    assert matched_len == 3
+    assert bound_sid is not None
+
+
+def test_omitting_lease_id_cannot_bypass_ownership_or_delete_session():
+    """Verify that omitting lease_id rejects unauthenticated deletion of leased sessions."""
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient("127.0.0.1", port)
+
+    try:
+        # 1. Leased session
+        assert server.acquire_lease("leased-session", "lease-alpha") is True
+        k = torch.randn(1, 2, 4, 16)
+        v = torch.randn(1, 2, 4, 16)
+        server.register_prompt(
+            "leased-session", 0, k, v, lease_id="lease-alpha"
+        )
+        assert server.store.has_session("leased-session")
+
+        # Directly calling release_session without lease_id MUST raise RuntimeError
+        with pytest.raises(
+            RuntimeError,
+            match="Session 'leased-session' is leased by active generation 'lease-alpha'",
+        ):
+            server.release_session("leased-session")
+
+        # Over TCP: unauthenticated client omitting lease_id MUST be rejected with error
+        with pytest.raises(RuntimeError, match="is leased by active generation"):
+            client.release_session_sync("leased-session")
+
+        # Wrong lease_id MUST also be rejected
+        with pytest.raises(RuntimeError, match="is leased by active generation"):
+            client.release_session_sync("leased-session", lease_id="wrong-lease")
+
+        # Session must still exist in store
+        assert server.store.has_session("leased-session")
+
+        # Owner calling with correct lease_id succeeds
+        assert client.release_session_sync("leased-session", lease_id="lease-alpha") is True
+        assert not server.store.has_session("leased-session")
+
+        # 2. Legacy unleased session
+        server.register_prompt("unleased-session", 0, k, v)
+        assert server.store.has_session("unleased-session")
+        # Legacy call without lease_id succeeds on unleased session
+        assert client.release_session_sync("unleased-session") is True
+        assert not server.store.has_session("unleased-session")
+    finally:
+        client.close_sync()
+        server.stop_thread()
+
+
+def test_worker_disconnect_before_registration_lease_expiry_and_prevention():
+    """Verify that an abandoned lease expires independently and prevents the expired worker from reclaiming it."""
+    import time
+    server = ContextServer(session_ttl_seconds=0.1, lease_ttl_seconds=0.1)
+
+    # Worker 1 acquires lease without registering prompt
+    assert server.acquire_lease("orphan-sess", "lease-worker-1") is True
+
+    # Advance time past lease TTL
+    time.sleep(0.15)
+
+    # Worker 2 acquires the abandoned session lease -> must succeed!
+    assert server.acquire_lease("orphan-sess", "lease-worker-2") is True
+
+    # Worker 1 comes back: cannot acquire or reclaim session
+    assert server.acquire_lease("orphan-sess", "lease-worker-1") is False
+
+    # Worker 1 attempts an operation with expired lease -> must raise RuntimeError
+    k = torch.randn(1, 2, 4, 16)
+    v = torch.randn(1, 2, 4, 16)
+    with pytest.raises(RuntimeError, match="has expired"):
+        server.register_prompt("orphan-sess", 0, k, v, lease_id="lease-worker-1")
+
+
+def test_prefix_cache_property_reentrancy_no_deadlock():
+    """Verify that reading server.prefix_cache uses re-entrant lock and does not deadlock."""
+    server1 = ContextServer()
+    # Read property on unparameterized server
+    cache1 = server1.prefix_cache
+    assert cache1 is not None
+
+    # Nested read while holding reference
+    cache1_again = server1.prefix_cache
+    assert cache1 is cache1_again
+
+    # Read property on model-scoped server
+    server2 = ContextServer(model_id="test-model")
+    cache2 = server2.prefix_cache
+    assert cache2 is not None
+    assert server2.prefix_cache is cache2
+
+

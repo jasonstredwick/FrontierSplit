@@ -53,7 +53,12 @@ _active_model_id_var: contextvars.ContextVar[str | None] = (
 
 
 def _compute_model_id(model: Any, model_id: str | None = None) -> str:
-    """Computes a deterministic model identifier based on model architecture and weights."""
+    """Computes a deterministic model identifier based on model architecture and weights.
+
+    Uses immutable commit hash if available, or computes a SHA-256 digest over model
+    parameters without relying on numpy. Raises ValueError if automatic identification
+    cannot establish a trustworthy identity.
+    """
     if model_id is not None:
         return model_id
     if hasattr(model, "model_id") and model.model_id:
@@ -64,15 +69,31 @@ def _compute_model_id(model: Any, model_id: str | None = None) -> str:
         or getattr(model, "name_or_path", None)
         or model.__class__.__name__
     )
-    h = hashlib.sha256(str(base_name).encode())
+
+    commit_hash = getattr(config, "_commit_hash", None)
+    if commit_hash:
+        return f"{base_name}:{commit_hash}"
+
     try:
-        # Sample parameters to fingerprint weight state / revision
-        for p in itertools.islice(model.parameters(), 8):
-            if p is not None and p.numel() > 0:
-                sample = p.detach().view(-1)[:256].cpu().numpy().tobytes()
-                h.update(sample)
-    except Exception:
-        pass
+        params = list(model.named_parameters())
+    except Exception as e:
+        raise ValueError(
+            f"Could not inspect parameters for model {base_name}: {e}"
+        ) from e
+
+    if not params:
+        raise ValueError(
+            f"Could not establish a trustworthy model identity for {base_name}: "
+            "model has no parameters and no immutable commit hash. Please specify 'model_id' explicitly."
+        )
+
+    h = hashlib.sha256(str(base_name).encode())
+    for name, p in params:
+        h.update(name.encode())
+        if p is not None and p.numel() > 0:
+            # Access raw untyped storage bytes directly, supporting BF16, FP16, FP32, etc.
+            h.update(bytes(p.detach().cpu().untyped_storage()))
+
     return f"{base_name}:{h.hexdigest()[:16]}"
 
 

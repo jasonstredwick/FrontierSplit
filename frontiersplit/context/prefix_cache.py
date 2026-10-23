@@ -43,6 +43,27 @@ class RadixNode:
         """Returns the number of tokens represented by this node."""
         return len(self.token_ids)
 
+    def compact(self) -> bool:
+        """Selectively compactor to isolate tensor storage when backing storage exceeds logical slice.
+
+        Returns:
+            True if compaction occurred (releasing a larger underlying slab), False otherwise.
+        """
+        compacted = False
+        for layer, k in list(self.k_cache.items()):
+            if k is not None and k.untyped_storage().nbytes() > (
+                k.numel() * k.element_size()
+            ):
+                self.k_cache[layer] = k.clone()
+                compacted = True
+        for layer, v in list(self.v_cache.items()):
+            if v is not None and v.untyped_storage().nbytes() > (
+                v.numel() * v.element_size()
+            ):
+                self.v_cache[layer] = v.clone()
+                compacted = True
+        return compacted
+
     def split(self, split_idx: int) -> RadixNode:
         """Splits this node at `split_idx` into a prefix parent and a suffix child.
 
@@ -119,6 +140,46 @@ class RadixPrefixCache:
             _traverse(child)
 
         return count
+
+    @property
+    def total_backing_tokens(self) -> int:
+        """Calculates total number of tokens physically allocated in unique backing tensor storages."""
+        seen_ptrs: set[int] = set()
+        total_tokens = 0
+
+        def _traverse(node: RadixNode) -> None:
+            nonlocal total_tokens
+            for t in list(node.k_cache.values()):
+                if t is not None:
+                    ptr = t.untyped_storage().data_ptr()
+                    if ptr not in seen_ptrs:
+                        seen_ptrs.add(ptr)
+                        token_dim = t.shape[-2]
+                        logical_bytes = t.numel() * t.element_size()
+                        storage_bytes = t.untyped_storage().nbytes()
+                        if logical_bytes > 0:
+                            backing_tokens = int(
+                                token_dim * (storage_bytes / logical_bytes)
+                            )
+                            total_tokens += backing_tokens
+            for child in node.children.values():
+                _traverse(child)
+
+        for child in self.root.children.values():
+            _traverse(child)
+        return total_tokens
+
+    def compact_all(self, node: RadixNode | None = None) -> int:
+        """Compacts all nodes in the tree whose backing allocation exceeds logical shape.
+
+        Returns:
+            Number of nodes compacted.
+        """
+        target = node or self.root
+        compacted_count = 1 if target.compact() else 0
+        for child in list(target.children.values()):
+            compacted_count += self.compact_all(child)
+        return compacted_count
 
     def match(
         self,
@@ -312,7 +373,7 @@ class RadixPrefixCache:
             self._find_unpinned_leaves(node, child, out)
 
     def evict_if_needed(self) -> int:
-        """Evicts least recently used (LRU) leaf nodes if token count exceeds quota.
+        """Evicts least recently used (LRU) leaf nodes if token count or backing storage exceeds quota.
 
         Only leaf nodes with `session_count == 0` (unpinned) are eligible for eviction.
 
@@ -320,7 +381,10 @@ class RadixPrefixCache:
             Number of tokens evicted.
         """
         evicted_tokens = 0
-        while self.total_tokens > self.max_cached_tokens:
+        while (
+            self.total_tokens > self.max_cached_tokens
+            or self.total_backing_tokens > self.max_cached_tokens
+        ):
             candidates: list[tuple[float, RadixNode, RadixNode]] = []
             for child in self.root.children.values():
                 self._find_unpinned_leaves(self.root, child, candidates)
@@ -333,6 +397,9 @@ class RadixPrefixCache:
             _, parent, victim = candidates[0]
             del parent.children[victim.token_ids[0]]
             evicted_tokens += victim.num_tokens
+
+            # Selective compaction on eviction: compact surviving nodes to release dead backing slabs
+            self.compact_all(self.root)
 
         return evicted_tokens
 

@@ -455,26 +455,37 @@ class ContextServer:
         session_ttl_seconds: float = 600.0,
         expected_num_layers: int | None = None,
         model_id: str | None = None,
+        lease_ttl_seconds: float | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.store = ContextStore(ttl_seconds=session_ttl_seconds)
         self.max_cached_tokens = max_cached_tokens
         self.expected_num_layers = expected_num_layers
         self.model_id = model_id
+        self.session_ttl_seconds = session_ttl_seconds
+        self.lease_ttl_seconds = (
+            lease_ttl_seconds if lease_ttl_seconds is not None else session_ttl_seconds
+        )
         self._prefix_caches: dict[str, RadixPrefixCache] = {}
-        self._prefix_cache_lock = threading.Lock()
+        self._prefix_cache_lock = threading.RLock()
         self._known_layers: set[int] = (
             set(range(expected_num_layers))
             if expected_num_layers is not None and expected_num_layers > 0
             else set()
         )
+        self._model_known_layers: dict[str, set[int]] = {}
+        if expected_num_layers is not None and expected_num_layers > 0:
+            init_model = model_id or "default"
+            self._model_known_layers[init_model] = set(range(expected_num_layers))
         self._session_expected_layers: dict[str, int] = {}
         self._session_tokens: dict[str, list[int]] = {}
         self._session_model_ids: dict[str, str] = {}
         self._staged_uploads: dict[str, _StagedUpload] = {}
         self._committed_uploads: dict[str, set[str]] = {}
         self._session_leases: dict[str, str] = {}
-        self._session_leases_lock = threading.Lock()
+        self._session_lease_last_active: dict[str, float] = {}
+        self._expired_leases: set[str] = set()
+        self._session_leases_lock = threading.RLock()
         self._pinned_sessions: dict[str, tuple[str, tuple[int, ...]]] = {}
         self._server: asyncio.Server | None = None
         self._ttl_task: asyncio.Task[None] | None = None
@@ -498,6 +509,16 @@ class ContextServer:
                 return next(iter(self._prefix_caches.keys()))
         return "default"
 
+    def _get_prefix_cache_locked(
+        self,
+        effective_id: str,
+    ) -> RadixPrefixCache:
+        if effective_id not in self._prefix_caches:
+            self._prefix_caches[effective_id] = RadixPrefixCache(
+                max_cached_tokens=self.max_cached_tokens,
+            )
+        return self._prefix_caches[effective_id]
+
     def _get_prefix_cache(
         self,
         model_id: str | None = None,
@@ -505,23 +526,19 @@ class ContextServer:
     ) -> RadixPrefixCache:
         effective_id = self._resolve_model_id(model_id, session_id)
         with self._prefix_cache_lock:
-            if effective_id not in self._prefix_caches:
-                self._prefix_caches[effective_id] = RadixPrefixCache(
-                    max_cached_tokens=self.max_cached_tokens,
-                )
-            return self._prefix_caches[effective_id]
+            return self._get_prefix_cache_locked(effective_id)
 
     @property
     def prefix_cache(self) -> RadixPrefixCache:
         """Returns the active/default RadixPrefixCache instance."""
         with self._prefix_cache_lock:
             if self.model_id is not None:
-                return self._get_prefix_cache(self.model_id)
+                return self._get_prefix_cache_locked(self.model_id)
             if "default" in self._prefix_caches and len(self._prefix_caches) > 1:
                 return self._prefix_caches["default"]
             if len(self._prefix_caches) == 1:
                 return next(iter(self._prefix_caches.values()))
-            return self._get_prefix_cache("default")
+            return self._get_prefix_cache_locked("default")
 
     @prefix_cache.setter
     def prefix_cache(self, cache: RadixPrefixCache) -> None:
@@ -529,36 +546,60 @@ class ContextServer:
         with self._prefix_cache_lock:
             self._prefix_caches[effective_id] = cache
 
+    def _purge_expired_lease_locked(self, session_id: str) -> None:
+        """Purges the lease for session_id if its lease TTL has elapsed."""
+        current = self._session_leases.get(session_id)
+        if current is not None and session_id in self._session_lease_last_active:
+            last_t = self._session_lease_last_active[session_id]
+            if (time.time() - last_t) > self.lease_ttl_seconds:
+                self._expired_leases.add(current)
+                self._session_leases.pop(session_id, None)
+                self._session_lease_last_active.pop(session_id, None)
+
     def acquire_lease(self, session_id: str, lease_id: str) -> bool:
         """Acquires exclusive ownership of session_id for generation lease_id."""
         with self._session_leases_lock:
+            if lease_id in self._expired_leases:
+                return False
+            self._purge_expired_lease_locked(session_id)
             current = self._session_leases.get(session_id)
             if current is not None and current != lease_id:
                 return False
             self._session_leases[session_id] = lease_id
+            self._session_lease_last_active[session_id] = time.time()
             return True
 
     def release_lease(self, session_id: str, lease_id: str) -> bool:
         """Releases ownership of session_id if held by lease_id."""
         with self._session_leases_lock:
+            self._purge_expired_lease_locked(session_id)
             current = self._session_leases.get(session_id)
             if current == lease_id:
                 self._session_leases.pop(session_id, None)
+                self._session_lease_last_active.pop(session_id, None)
                 return True
             return False
 
     def _verify_lease(self, session_id: str, lease_id: str | None) -> None:
         """Verifies that lease_id holds ownership of session_id, or claims it."""
         with self._session_leases_lock:
+            if lease_id is not None and lease_id in self._expired_leases:
+                raise RuntimeError(
+                    f"Lease '{lease_id}' for session '{session_id}' has expired. "
+                    f"Expired workers cannot perform operations or reclaim sessions."
+                )
+            self._purge_expired_lease_locked(session_id)
             current = self._session_leases.get(session_id)
             if current is not None:
-                if lease_id is not None and current != lease_id:
+                if lease_id != current:
                     raise RuntimeError(
                         f"Session '{session_id}' is leased by active generation '{current}'. "
                         f"Overlapping requests targeting the same session must be serialized."
                     )
+                self._session_lease_last_active[session_id] = time.time()
             elif lease_id is not None:
                 self._session_leases[session_id] = lease_id
+                self._session_lease_last_active[session_id] = time.time()
 
     def _walk_prefix_nodes(
         self, seq: tuple[int, ...], model_id: str | None = None
@@ -610,12 +651,23 @@ class ContextServer:
             node.session_count = max(0, node.session_count - 1)
 
     def _required_layers_for_session(
-        self, session_id: str, current_layers: dict[int, Any]
+        self,
+        session_id: str,
+        current_layers: dict[int, Any],
+        model_id: str | None = None,
     ) -> set[int]:
         """Computes the set of layer indices required before a session cache is complete."""
-        required = set(self._known_layers) | set(current_layers.keys())
+        eff_model_id = (
+            model_id
+            or self._session_model_ids.get(session_id)
+            or self.model_id
+            or "default"
+        )
+        model_layers = self._model_known_layers.get(eff_model_id, set())
+        required = set(model_layers) | set(current_layers.keys())
         if self.expected_num_layers is not None and self.expected_num_layers > 0:
-            required |= set(range(self.expected_num_layers))
+            if self.model_id is None or self.model_id == eff_model_id:
+                required |= set(range(self.expected_num_layers))
         exp = self._session_expected_layers.get(session_id)
         if exp is not None and exp > 0:
             required |= set(range(exp))
@@ -633,7 +685,15 @@ class ContextServer:
             if kv[0].shape[-2] == target_len and kv[1].shape[-2] == target_len
         }
 
-        required = self._required_layers_for_session(session_id, state.layers)
+        eff_model_id = (
+            state.model_id
+            or self._session_model_ids.get(session_id)
+            or self.model_id
+            or "default"
+        )
+        required = self._required_layers_for_session(
+            session_id, state.layers, model_id=eff_model_id
+        )
         if state.expected_layers is not None and state.expected_layers > 0:
             required |= set(range(state.expected_layers))
         if not required or not required.issubset(ready_layers.keys()):
@@ -651,12 +711,6 @@ class ContextServer:
             self._committed_uploads.setdefault(session_id, set()).add(state.upload_id)
         self._staged_uploads.pop(session_id, None)
 
-        eff_model_id = (
-            state.model_id
-            or self._session_model_ids.get(session_id)
-            or self.model_id
-            or "default"
-        )
         self._session_model_ids[session_id] = eff_model_id
         prefix_cache = self._get_prefix_cache(eff_model_id)
 
@@ -794,9 +848,12 @@ class ContextServer:
         self._session_model_ids[session_id] = eff_model_id
 
         self._known_layers.add(layer_idx)
+        model_layers = self._model_known_layers.setdefault(eff_model_id, set())
+        model_layers.add(layer_idx)
         if num_layers is not None and num_layers > 0:
             self._session_expected_layers[session_id] = num_layers
             self._known_layers.update(range(num_layers))
+            model_layers.update(range(num_layers))
 
         k_dev = k.to(self.device)
         v_dev = v.to(self.device)
@@ -897,9 +954,12 @@ class ContextServer:
         self._session_model_ids[session_id] = eff_model_id
 
         self._known_layers.add(layer_idx)
+        model_layers = self._model_known_layers.setdefault(eff_model_id, set())
+        model_layers.add(layer_idx)
         if num_layers is not None and num_layers > 0:
             self._session_expected_layers[session_id] = num_layers
             self._known_layers.update(range(num_layers))
+            model_layers.update(range(num_layers))
 
         k_dev = k_delta.to(self.device)
         v_dev = v_delta.to(self.device)
@@ -965,13 +1025,29 @@ class ContextServer:
     ) -> list[str]:
         """Evicts sessions whose sliding TTL has expired."""
         evicted = self.store.evict_expired(max_idle_seconds=max_idle_seconds)
+        now = time.time()
+        limit = (
+            max_idle_seconds if max_idle_seconds is not None else self.lease_ttl_seconds
+        )
+        with self._session_leases_lock:
+            for sid, last_t in list(self._session_lease_last_active.items()):
+                if (now - last_t) > limit:
+                    if sid not in evicted:
+                        evicted.append(sid)
+                    old_lease = self._session_leases.pop(sid, None)
+                    if old_lease is not None:
+                        self._expired_leases.add(old_lease)
+                    self._session_lease_last_active.pop(sid, None)
+
         for sid in evicted:
             self._clear_session_pin(sid)
             self._staged_uploads.pop(sid, None)
             self._session_tokens.pop(sid, None)
             self._session_expected_layers.pop(sid, None)
             self._committed_uploads.pop(sid, None)
-            self._session_leases.pop(sid, None)
+            with self._session_leases_lock:
+                self._session_leases.pop(sid, None)
+                self._session_lease_last_active.pop(sid, None)
             self._session_model_ids.pop(sid, None)
         return evicted
 
@@ -997,9 +1073,17 @@ class ContextServer:
         eff_model_id = self._resolve_model_id(model_id, target_session_id)
         prefix_cache = self._get_prefix_cache(eff_model_id)
 
-        required = set(self._known_layers)
+        required = set(self._model_known_layers.get(eff_model_id, set()))
         if self.expected_num_layers is not None and self.expected_num_layers > 0:
-            required |= set(range(self.expected_num_layers))
+            if self.model_id is None or self.model_id == eff_model_id:
+                required |= set(range(self.expected_num_layers))
+        target_exp = (
+            self._session_expected_layers.get(target_session_id)
+            if target_session_id is not None
+            else None
+        )
+        if target_exp is not None and target_exp > 0:
+            required |= set(range(target_exp))
 
         nodes, matched_len = prefix_cache.match(
             token_ids, required_layers=required if required else None
@@ -1198,14 +1282,17 @@ class ContextServer:
 
         return running_chunk
 
-    def release_session(self, session_id: str) -> bool:
+    def release_session(self, session_id: str, lease_id: str | None = None) -> bool:
         """Evicts a session's static prompt KV cache."""
+        self._verify_lease(session_id, lease_id)
         self._clear_session_pin(session_id)
         self._staged_uploads.pop(session_id, None)
         self._session_tokens.pop(session_id, None)
         self._session_expected_layers.pop(session_id, None)
         self._committed_uploads.pop(session_id, None)
-        self._session_leases.pop(session_id, None)
+        with self._session_leases_lock:
+            self._session_leases.pop(session_id, None)
+            self._session_lease_last_active.pop(session_id, None)
         self._session_model_ids.pop(session_id, None)
         return self.store.release_session(session_id)
 
@@ -1440,8 +1527,7 @@ class ContextServer:
                     session_id = meta["session_id"]
                     lease_id = meta.get("lease_id")
                     try:
-                        self._verify_lease(session_id, lease_id)
-                        evicted = self.release_session(session_id)
+                        evicted = self.release_session(session_id, lease_id=lease_id)
                         resp = pack_context_frame(
                             MSG_RELEASE_SESSION_RESP,
                             {

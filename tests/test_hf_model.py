@@ -13,6 +13,7 @@ import copy
 import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
+from transformers.cache_utils import DynamicCache
 
 from frontiersplit.context.context_server import ContextClient, ContextServer
 from frontiersplit.context.hf_model import DisaggregatedModel
@@ -1057,6 +1058,98 @@ def test_two_distinct_models_sharing_server_isolated_prefix_cache():
         client1.close_sync()
         client2.close_sync()
         server.stop_thread()
+
+
+def test_bf16_model_fingerprint_and_generation():
+    """Verify BF16 models produce distinct IDs based on weights and generate correct tokens."""
+    cfg = LlamaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        torch_dtype="bfloat16",
+    )
+    torch.manual_seed(101)
+    model1 = LlamaForCausalLM(cfg).to(torch.bfloat16).eval()
+    torch.manual_seed(202)
+    model2 = LlamaForCausalLM(cfg).to(torch.bfloat16).eval()
+
+    # Model IDs must differ even though configs and model names are identical
+    from frontiersplit.context.hf_model import _compute_model_id
+    id1 = _compute_model_id(model1)
+    id2 = _compute_model_id(model2)
+    assert id1 != id2
+
+    # Verification of error when no parameters or commit hash exist
+    empty_mod = torch.nn.Module()
+    with pytest.raises(
+        ValueError, match="Could not establish a trustworthy model identity"
+    ):
+        _compute_model_id(empty_mod)
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client1 = ContextClient("127.0.0.1", port)
+    client2 = ContextClient("127.0.0.1", port)
+
+    try:
+        disagg1 = DisaggregatedModel(model1, context_client=client1)
+        disagg2 = DisaggregatedModel(model2, context_client=client2)
+        assert disagg1.model_id != disagg2.model_id
+
+        prompt = torch.tensor([[7, 14, 21, 28]])
+
+        # Native generation for model 2 in BF16
+        with torch.no_grad():
+            out2_native = []
+            cur = prompt
+            cache = DynamicCache()
+            for _ in range(4):
+                res = model2(cur, past_key_values=cache, use_cache=True)
+                tok = int(res.logits[:, -1, :].argmax(dim=-1).item())
+                out2_native.append(tok)
+                cur = torch.tensor([[tok]])
+
+        # Native generation for model 1 in BF16
+        with torch.no_grad():
+            out1_native = []
+            cur = prompt
+            cache = DynamicCache()
+            for _ in range(4):
+                res = model1(cur, past_key_values=cache, use_cache=True)
+                tok = int(res.logits[:, -1, :].argmax(dim=-1).item())
+                out1_native.append(tok)
+                cur = torch.tensor([[tok]])
+
+        # Ensure the two independently initialized models produce distinct outputs
+        assert out1_native != out2_native
+
+        # Model 1 generates over TCP
+        out1_disagg = disagg1.generate(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="bf16-sess1",
+            release_on_completion=False,
+            use_prefix_cache=False,
+        )
+        assert out1_disagg == out1_native
+
+        # Model 2 generates over TCP with same prompt
+        out2_disagg = disagg2.generate(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="bf16-sess2",
+            release_on_completion=True,
+            use_prefix_cache=False,
+        )
+        assert out2_disagg == out2_native
+    finally:
+        client1.close_sync()
+        client2.close_sync()
+        server.stop_thread()
+
 
 
 
