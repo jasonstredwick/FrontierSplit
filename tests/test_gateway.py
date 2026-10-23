@@ -581,3 +581,69 @@ def test_gateway_with_real_chat_tokenizer_and_eos_filtering():
         client.close_sync()
         server.stop_thread()
 
+
+def test_gateway_concurrent_same_session_serialization(disagg_cluster) -> None:
+    """Verify that concurrent requests sharing the same session ID are serialized by the gateway."""
+    import asyncio
+    import httpx
+
+    test_client, _, _ = disagg_cluster
+    app = test_client.app
+
+    async def _run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+
+            async def _send(msg: str):
+                return await ac.post(
+                    "/v1/chat/completions",
+                    headers={"X-FrontierSplit-Session-ID": "shared-gateway-sess"},
+                    json={
+                        "model": "test-disagg-llama",
+                        "messages": [{"role": "user", "content": msg}],
+                        "max_tokens": 6,
+                        "temperature": 0.0,
+                        "stream": False,
+                    },
+                )
+
+            resp1, resp2 = await asyncio.gather(
+                _send("1 2 3 4 5"), _send("6 7 8 9 10")
+            )
+            assert resp1.status_code == 200, f"Request 1 failed: {resp1.text}"
+            assert resp2.status_code == 200, f"Request 2 failed: {resp2.text}"
+
+    asyncio.run(_run())
+
+
+def test_gateway_disconnect_anyio_scope_releases_session(disagg_cluster) -> None:
+    """Verify that when a client stream is interrupted/cancelled, AnyIO scope protection releases the session."""
+    test_client, _, server = disagg_cluster
+
+    # Request streaming with release_session enabled
+    with test_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={
+            "X-FrontierSplit-Session-ID": "disconnect-sess",
+            "X-FrontierSplit-Release-Session": "true",
+        },
+        json={
+            "model": "test-disagg-llama",
+            "messages": [{"role": "user", "content": "1 2 3 4 5"}],
+            "max_tokens": 10,
+            "temperature": 0.0,
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        # Read only the first chunk, then close/exit the context manager early (simulating client disconnect)
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                break
+
+    # Context manager exit aborts the stream and triggers generator aclose() / AnyIO cancellation.
+    # The session must be cleanly evicted on the server:
+    assert not server.store.has_session("disconnect-sess")
+
+

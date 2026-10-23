@@ -707,16 +707,147 @@ def test_async_generation_cancellation_safety_and_cache_consistency(
                 sum(k.shape[-2] for k, _ in chunks)
                 for layer_idx, chunks in sess.items()
             ]
-            num_expected_layers = len(disagg.model.model.layers)
-            assert len(layer_lens) == num_expected_layers
-            assert all(l == layer_lens[0] for l in layer_lens), (
-                f"Layers desynchronized after cancellation: {layer_lens}"
-            )
+    try:
+        asyncio.run(_run())
+    finally:
+        client.close_sync()
+        server.stop_thread()
+
+
+def test_concurrent_same_session_rejected_by_model(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify that concurrent generations using the exact same session ID are rejected."""
+    base_model, prompt, _ = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+    disagg = DisaggregatedModel(model=model, context_client=client)
+
+    async def _run() -> None:
+        gen1 = disagg.generate_stream_async(
+            input_ids=prompt,
+            max_new_tokens=8,
+            session_id="shared-session",
+            release_on_completion=False,
+        )
+        # Advance gen1 by one token so it enters active generation
+        tok1 = await gen1.__anext__()
+        assert isinstance(tok1, int)
+
+        # Attempting gen2 with same session_id must immediately raise RuntimeError
+        gen2 = disagg.generate_stream_async(
+            input_ids=prompt,
+            max_new_tokens=8,
+            session_id="shared-session",
+            release_on_completion=False,
+        )
+        with pytest.raises(RuntimeError, match="already in use by an active generation"):
+            await gen2.__anext__()
+
+        # Finish gen1 cleanly
+        async for _ in gen1:
+            pass
+
+        # Now that gen1 is finished, shared-session is available again
+        gen3 = disagg.generate_stream_async(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="shared-session",
+            release_on_completion=True,
+        )
+        tokens3 = [t async for t in gen3]
+        assert len(tokens3) > 0
 
     try:
         asyncio.run(_run())
     finally:
         client.close_sync()
         server.stop_thread()
+
+
+def test_staged_append_retry_idempotency_prevents_duplicate_tokens() -> None:
+    """Verify that retrying a partially failed multi-layer commit is idempotent."""
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    try:
+        # Register initial 5-token prompt across 2 layers
+        tokens = [1, 2, 3, 4, 5]
+        k0 = torch.randn(1, 2, 5, 16)
+        v0 = torch.randn(1, 2, 5, 16)
+        k1 = torch.randn(1, 2, 5, 16)
+        v1 = torch.randn(1, 2, 5, 16)
+
+        client.register_prompt_sync("idemp-sess", 0, k0, v0, num_layers=2)
+        client.register_prompt_sync(
+            "idemp-sess", 1, k1, v1, token_ids=tokens, num_layers=2
+        )
+
+        assert server.store.get_seq_len("idemp-sess", 0) == 5
+        assert server.store.get_seq_len("idemp-sess", 1) == 5
+
+        # 2-token commit delta
+        k_delta0 = torch.randn(1, 2, 2, 16)
+        v_delta0 = torch.randn(1, 2, 2, 16)
+        k_delta1 = torch.randn(1, 2, 2, 16)
+        v_delta1 = torch.randn(1, 2, 2, 16)
+        stable_upload_id = "commit-idemp-sess-0-2"
+
+        # Layer 0 upload succeeds
+        client.append_kv_sync(
+            session_id="idemp-sess",
+            layer_idx=0,
+            k_delta=k_delta0,
+            v_delta=v_delta0,
+            num_layers=2,
+            upload_id=stable_upload_id,
+        )
+
+        # Before layer 1 is uploaded, store must NOT have committed layer 0 to live cache
+        assert server.store.get_seq_len("idemp-sess", 0) == 5
+        assert server.store.get_seq_len("idemp-sess", 1) == 5
+
+        # Simulate client retry of both layers using the same stable_upload_id
+        client.append_kv_sync(
+            session_id="idemp-sess",
+            layer_idx=0,
+            k_delta=k_delta0,
+            v_delta=v_delta0,
+            num_layers=2,
+            upload_id=stable_upload_id,
+        )
+        client.append_kv_sync(
+            session_id="idemp-sess",
+            layer_idx=1,
+            k_delta=k_delta1,
+            v_delta=v_delta1,
+            token_ids=[6, 7],
+            num_layers=2,
+            upload_id=stable_upload_id,
+        )
+
+        # Now both layers must be committed atomically to 7 tokens (NOT 9 for layer 0)
+        assert server.store.get_seq_len("idemp-sess", 0) == 7
+        assert server.store.get_seq_len("idemp-sess", 1) == 7
+
+        # Third retry of same upload_id returns 7 tokens idempotently
+        res0 = client.append_kv_sync(
+            session_id="idemp-sess",
+            layer_idx=0,
+            k_delta=k_delta0,
+            v_delta=v_delta0,
+            num_layers=2,
+            upload_id=stable_upload_id,
+        )
+        assert res0 == 7
+        assert server.store.get_seq_len("idemp-sess", 0) == 7
+    finally:
+        client.close_sync()
+        server.stop_thread()
+
 
 

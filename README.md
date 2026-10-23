@@ -38,12 +38,12 @@ Instead of keeping both on an expensive GPU:
 └───────────────────────────┬────────────────────────────┘
                             │  ▲ Query vector q (8 KB)
                             │  │
-                            │  ▼ Partial Attention (A, m, l) (8.25 KB)
+                            │  ▼ Partial Attention (A, m, l) (16.39 KB FP32 / 8.25 KB FP16)
 ┌───────────────────────────┴────────────────────────────┐
 │             Lightweight Decode Worker (Small GPU)       │
 │   • Holds ONLY the local output tokens (e.g. 32 tokens)│
 │   • Merges prompt + output via Online Softmax          │
-│   • Produces exact, bit-for-bit identical attention    │
+│   • Produces mathematically equivalent attention       │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -58,7 +58,7 @@ The Context Server computes partial attention against the prompt and returns thr
 * The local maximum logit: $m_p = \max(s_p)$
 * The sum of exponentials: $\ell_p = \sum e^{s_p - m_p}$
 
-The Decode Worker computes the same on its tiny local output cache ($A_o, m_o, \ell_o$), and merges them with **zero approximation or accuracy loss**:
+The Decode Worker computes the same on its tiny local output cache ($A_o, m_o, \ell_o$), and merges them with **zero approximation loss** (identical within floating-point associative precision):
 
 $$m_{\text{global}} = \max(m_p, m_o)$$
 

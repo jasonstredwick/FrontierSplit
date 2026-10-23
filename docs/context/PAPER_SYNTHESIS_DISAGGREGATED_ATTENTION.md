@@ -192,10 +192,10 @@ Partitioning the sequence dimension during decode attention and reducing partial
               Final Attention Output: O = Part_0 ⊕ Part_1 ⊕ ... ⊕ Part_P
 ```
 
-1. **Tier 1 (Horizontal / Vector Line Alignment)**: Sized to 128 tokens (matching `head_dim` $d=128$) to saturate the inner contracting dimension of one multiplier line, eliminating horizontal ALU idling.
-2. **Tier 2 (Vertical / Single Unit Grid Rows)**: Sized to 128 chunks ($128 \times 128 = 16{,}384$ tokens) to saturate all 128 vertical multiplier rows of a single physical systolic array (or one SM's active warp execution slots).
-3. **Tier 3 (Multi-Compute Unit Fabric Multiplier)**: Sized across the chip's total physical compute units ($U_{\text{compute}}$). On a TPU with 4 MXUs ($2\text{ cores} \times 2\text{ MXUs}$), single-stream sequence saturation requires $16{,}384 \times 4 = \mathbf{65{,}536\text{ tokens}}$ ($512$ chunks of 128).
-4. **The Unification**: The reduction of partial attention results on-chip (Flash-Decoding) and across distributed network nodes (FrontierSplit) shares the **exact same associative Online Softmax operator ($\oplus$)**.
+1. **Tier 1 (Horizontal / Feature Dimension Contracting Line)**: Sized to the hidden head dimension $d=128$ (`head_dim`) to saturate the inner contracting dot-product dimension of hardware vector lines and multiplier accumulators, eliminating horizontal ALU lane idling.
+2. **Tier 2 (Vertical / Sequence Tiling Grid Rows)**: Sized in uniform blocks of sequence tokens (e.g., 128 tokens) to tile along the sequence length dimension $N$, matching systolic array grid dimensions or GPU thread block tile boundaries to eliminate boundary fragmentation.
+3. **Tier 3 (Multi-Compute Unit Fabric Distribution)**: Distributes sequence chunks across the chip's physical compute units ($U_{\text{compute}}$, such as TPU MXUs or GPU Streaming Multiprocessors) or multiplexes independent message/layer KV caches to uphold temporal utilization. These scaling dimensions serve as empirical tuning proxies across hardware targets rather than rigid saturation invariants.
+4. **The Unification**: The reduction of partial attention results on-chip (Flash-Decoding) and across distributed network nodes (FrontierSplit) shares the **exact same associative Online Softmax operator ($\oplus$)**, achieving mathematical equivalence within standard floating-point associative tolerances.
 
 
 ---

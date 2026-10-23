@@ -32,6 +32,11 @@ if TYPE_CHECKING:
 
     from frontiersplit.context.context_server import ContextClient
 
+try:
+    import anyio
+except ImportError:
+    anyio = None
+
 logger = logging.getLogger("frontiersplit.hf_model")
 
 _active_context_client_var: contextvars.ContextVar[ContextClient | None] = (
@@ -257,6 +262,8 @@ class DisaggregatedModel:
             f"frontiersplit_finish_reason_{id(self)}", default="stop"
         )
         self._patched = False
+        self._active_sessions: set[str] = set()
+        self._active_sessions_lock = threading.Lock()
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=8, thread_name_prefix="frontiersplit-forward"
         )
@@ -414,7 +421,7 @@ class DisaggregatedModel:
         prompt_len = input_ids.shape[1]
         tokens = input_ids[0].tolist()
         num_layers = len(prompt_cache.layers)
-        upload_id = uuid.uuid4().hex
+        upload_id = f"prefill-{session_id}-0-{prompt_len}"
 
         # Offload each layer's static prompt KV cache to the remote Context Server
         for l_idx, layer in enumerate(prompt_cache.layers):
@@ -476,6 +483,14 @@ class DisaggregatedModel:
         eos_ids = self._get_eos_token_ids()
         self._set_finish_reason("length")
 
+        with self._active_sessions_lock:
+            if session_id in self._active_sessions:
+                raise RuntimeError(
+                    f"Session '{session_id}' is already in use by an active generation. "
+                    "Overlapping requests with the same session ID must be serialized."
+                )
+            self._active_sessions.add(session_id)
+
         # Initialize lifecycle state BEFORE try: so finally block is always safe
         generated_tokens: list[int] = []
         local_cache: DynamicCache | None = None
@@ -536,7 +551,7 @@ class DisaggregatedModel:
                 # Append suffix KV activations to the Context Server
                 suffix_tokens = tokens[matched_len:]
                 num_layers = len(suffix_cache.layers)
-                upload_id = uuid.uuid4().hex
+                upload_id = f"delta-{session_id}-{matched_len}-{base_prompt_len}"
                 for l_idx, layer in enumerate(suffix_cache.layers):
                     target_client.append_kv_sync(
                         session_id=session_id,
@@ -606,7 +621,7 @@ class DisaggregatedModel:
                         last_committed_idx : last_committed_idx + local_len
                     ]
                     num_layers = len(local_cache.layers)
-                    upload_id = uuid.uuid4().hex
+                    upload_id = f"commit-{session_id}-{last_committed_idx}-{last_committed_idx + local_len}"
                     for l_idx, layer in enumerate(local_cache.layers):
                         target_client.append_kv_sync(
                             session_id=session_id,
@@ -645,7 +660,7 @@ class DisaggregatedModel:
                             last_committed_idx : last_committed_idx + rem_len
                         ]
                         num_layers = len(local_cache.layers)
-                        upload_id = uuid.uuid4().hex
+                        upload_id = f"commit-{session_id}-{last_committed_idx}-{last_committed_idx + rem_len}"
                         for l_idx, layer in enumerate(local_cache.layers):
                             target_client.append_kv_sync(
                                 session_id=session_id,
@@ -665,7 +680,8 @@ class DisaggregatedModel:
                     with contextlib.suppress(Exception):
                         target_client.release_session_sync(session_id)
             finally:
-                # Active session MUST be cleared unconditionally
+                with self._active_sessions_lock:
+                    self._active_sessions.discard(session_id)
                 self.set_active_session(None)
 
     def generate(
@@ -742,16 +758,13 @@ class DisaggregatedModel:
             prompt_cache, next_token = await asyncio.wrap_future(active_prefill_fut)
         finally:
             if not active_prefill_fut.done():
-                with contextlib.suppress(Exception):
-                    await asyncio.shield(asyncio.wrap_future(active_prefill_fut))
-                if not active_prefill_fut.done():
-                    with contextlib.suppress(Exception):
-                        active_prefill_fut.result()
+                with contextlib.suppress(BaseException):
+                    active_prefill_fut.result()
 
         prompt_len = input_ids.shape[1]
         tokens = input_ids[0].tolist()
         num_layers = len(prompt_cache.layers)
-        upload_id = uuid.uuid4().hex
+        upload_id = f"prefill-{session_id}-0-{prompt_len}"
 
         tasks = []
         for l_idx, layer in enumerate(prompt_cache.layers):
@@ -812,6 +825,14 @@ class DisaggregatedModel:
         remote_prompt_len = base_prompt_len
         eos_ids = self._get_eos_token_ids()
         self._set_finish_reason("length")
+
+        with self._active_sessions_lock:
+            if session_id in self._active_sessions:
+                raise RuntimeError(
+                    f"Session '{session_id}' is already in use by an active generation. "
+                    "Overlapping requests with the same session ID must be serialized."
+                )
+            self._active_sessions.add(session_id)
 
         # Initialize lifecycle state BEFORE try: so finally block is always safe
         generated_tokens: list[int] = []
@@ -888,7 +909,7 @@ class DisaggregatedModel:
 
                 suffix_tokens = tokens[matched_len:]
                 num_layers = len(suffix_cache.layers)
-                upload_id = uuid.uuid4().hex
+                upload_id = f"delta-{session_id}-{matched_len}-{base_prompt_len}"
                 tasks = [
                     target_client.append_kv(
                         session_id=session_id,
@@ -966,7 +987,7 @@ class DisaggregatedModel:
                         last_committed_idx : last_committed_idx + local_len
                     ]
                     num_layers = len(local_cache.layers)
-                    upload_id = uuid.uuid4().hex
+                    upload_id = f"commit-{session_id}-{last_committed_idx}-{last_committed_idx + local_len}"
                     tasks = [
                         target_client.append_kv(
                             session_id=session_id,
@@ -994,61 +1015,78 @@ class DisaggregatedModel:
 
         finally:
             try:
-                # 1. If a forward worker thread is still executing, await it cleanly to completion
-                # so it does not mutate local_cache or query context servers concurrently.
+                # 1. Drain worker thread synchronously so it finishes before any cleanup
                 if (
                     active_forward_future is not None
                     and not active_forward_future.done()
                 ):
-                    with contextlib.suppress(Exception):
-                        await asyncio.shield(asyncio.wrap_future(active_forward_future))
-                    if not active_forward_future.done():
-                        with contextlib.suppress(Exception):
-                            active_forward_future.result()
+                    with contextlib.suppress(BaseException):
+                        active_forward_future.result()
 
-                # 2. Consistent cache commit for retained sessions
-                if not release_on_completion:
-                    total_generated = len(generated_tokens)
-                    completed_uncommitted = total_generated - last_committed_idx
-                    if (
-                        reasoning_commit_threshold > 0
-                        and total_generated >= reasoning_commit_threshold
-                        and local_cache is not None
-                        and len(local_cache.layers) > 0
-                        and completed_uncommitted > 0
-                    ):
-                        min_layer_len = min(
-                            layer.keys.shape[-2] for layer in local_cache.layers
-                        )
-                        valid_len = min(completed_uncommitted, min_layer_len)
-                        if valid_len > 0:
-                            chunk_tokens = generated_tokens[
-                                last_committed_idx : last_committed_idx + valid_len
-                            ]
-                            num_layers = len(local_cache.layers)
-                            upload_id = uuid.uuid4().hex
-                            tasks = [
-                                target_client.append_kv(
-                                    session_id=session_id,
-                                    layer_idx=l_idx,
-                                    k_delta=layer.keys[..., :valid_len, :],
-                                    v_delta=layer.values[..., :valid_len, :],
-                                    token_ids=chunk_tokens
-                                    if l_idx == num_layers - 1
-                                    else None,
-                                    num_layers=num_layers,
-                                    upload_id=upload_id,
+                # 2. Shield async cleanup against AnyIO / Starlette cancel scopes (e.g. client disconnect)
+                curr_task = asyncio.current_task()
+                cancelling_count = 0
+                if curr_task is not None and hasattr(curr_task, "uncancel"):
+                    while curr_task.cancelling() > 0:
+                        curr_task.uncancel()
+                        cancelling_count += 1
+
+                try:
+                    shield_ctx = (
+                        anyio.CancelScope(shield=True)
+                        if anyio is not None
+                        else contextlib.nullcontext()
+                    )
+                    with shield_ctx:
+                        # 2a. Consistent cache commit for retained sessions
+                        if not release_on_completion:
+                            total_generated = len(generated_tokens)
+                            completed_uncommitted = total_generated - last_committed_idx
+                            if (
+                                reasoning_commit_threshold > 0
+                                and total_generated >= reasoning_commit_threshold
+                                and local_cache is not None
+                                and len(local_cache.layers) > 0
+                                and completed_uncommitted > 0
+                            ):
+                                min_layer_len = min(
+                                    layer.keys.shape[-2] for layer in local_cache.layers
                                 )
-                                for l_idx, layer in enumerate(local_cache.layers)
-                            ]
-                            with contextlib.suppress(Exception):
-                                await asyncio.gather(*tasks)
+                                valid_len = min(completed_uncommitted, min_layer_len)
+                                if valid_len > 0:
+                                    chunk_tokens = generated_tokens[
+                                        last_committed_idx : last_committed_idx + valid_len
+                                    ]
+                                    num_layers = len(local_cache.layers)
+                                    upload_id = f"commit-{session_id}-{last_committed_idx}-{last_committed_idx + valid_len}"
+                                    tasks = [
+                                        target_client.append_kv(
+                                            session_id=session_id,
+                                            layer_idx=l_idx,
+                                            k_delta=layer.keys[..., :valid_len, :],
+                                            v_delta=layer.values[..., :valid_len, :],
+                                            token_ids=chunk_tokens
+                                            if l_idx == num_layers - 1
+                                            else None,
+                                            num_layers=num_layers,
+                                            upload_id=upload_id,
+                                        )
+                                        for l_idx, layer in enumerate(local_cache.layers)
+                                    ]
+                                    with contextlib.suppress(BaseException):
+                                        await asyncio.gather(*tasks)
 
-                if release_on_completion:
-                    with contextlib.suppress(Exception):
-                        await target_client.release_session(session_id)
+                        # 2b. Release session if requested
+                        if release_on_completion:
+                            with contextlib.suppress(BaseException):
+                                await target_client.release_session(session_id)
+                finally:
+                    if curr_task is not None and hasattr(curr_task, "cancelling"):
+                        for _ in range(cancelling_count):
+                            curr_task.cancel()
             finally:
-                # Active session MUST be cleared unconditionally
+                with self._active_sessions_lock:
+                    self._active_sessions.discard(session_id)
                 self.set_active_session(None)
 
     async def generate_async(

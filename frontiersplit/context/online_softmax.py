@@ -140,6 +140,8 @@ def compute_partial_attention(
     attention_mask: torch.Tensor | None = None,
     is_causal: bool = False,
     sliding_window: int | None = None,
+    q_pos_offset: int | None = None,
+    k_pos_offset: int | None = None,
     query_chunk_size: int = 128,
     kv_chunk_size: int = 1024,
 ) -> PartialAttentionChunk:
@@ -156,6 +158,8 @@ def compute_partial_attention(
         attention_mask: Optional mask broadcastable to `[batch, 1, q_len, kv_len]`.
         is_causal: If True, applies causal lower-triangular masking within tiles.
         sliding_window: Optional Mistral-style local attention window size.
+        q_pos_offset: Optional starting position offset for queries (default: kv_len - q_len).
+        k_pos_offset: Optional starting position offset for keys (default: 0).
         query_chunk_size: Maximum query tokens per tiled workspace block (default: 128).
         kv_chunk_size: Maximum KV tokens per tiled workspace block (default: 1024).
 
@@ -169,6 +173,8 @@ def compute_partial_attention(
         scale = 1.0 / math.sqrt(head_dim)
 
     orig_dtype = q.dtype
+    q_base = (kv_len - q_len) if q_pos_offset is None else q_pos_offset
+    k_base = 0 if k_pos_offset is None else k_pos_offset
 
     if q_len == 0 or kv_len == 0:
         return PartialAttentionChunk(
@@ -196,10 +202,10 @@ def compute_partial_attention(
     if q_len <= query_chunk_size and kv_len <= kv_chunk_size:
         local_mask = attention_mask
         if is_causal or sliding_window is not None:
-            q_pos = (kv_len - q_len) + torch.arange(
+            q_pos = q_base + torch.arange(
                 q_len, device=q.device
             ).unsqueeze(1)
-            k_pos = torch.arange(kv_len, device=q.device).unsqueeze(0)
+            k_pos = k_base + torch.arange(kv_len, device=q.device).unsqueeze(0)
             masked_out = None
             if is_causal:
                 masked_out = k_pos > q_pos
@@ -235,7 +241,7 @@ def compute_partial_attention(
         max_q: torch.Tensor | None = None
         sum_q: torch.Tensor | None = None
 
-        last_q_pos = (kv_len - q_len) + q_end - 1
+        last_q_pos = q_base + q_end - 1
 
         for kv_start in range(0, kv_len, kv_chunk_size):
             kv_end = min(kv_start + kv_chunk_size, kv_len)
@@ -263,7 +269,8 @@ def compute_partial_attention(
                     mask_block = attention_mask
 
             # Fast check: if strictly upper triangular (all keys in tile are in the future of all queries in tile)
-            if is_causal and kv_start > last_q_pos:
+            first_k_pos = k_base + kv_start
+            if is_causal and first_k_pos > last_q_pos:
                 block_res = PartialAttentionChunk(
                     accumulator=torch.zeros(
                         (batch_size, num_heads, q_block_len, head_dim),
@@ -285,10 +292,10 @@ def compute_partial_attention(
                 )
             else:
                 if is_causal or sliding_window is not None:
-                    q_pos = (kv_len - q_len + q_start) + torch.arange(
+                    q_pos = (q_base + q_start) + torch.arange(
                         q_block_len, device=q.device
                     ).unsqueeze(1)
-                    k_pos = kv_start + torch.arange(
+                    k_pos = (k_base + kv_start) + torch.arange(
                         kv_block_len, device=q.device
                     ).unsqueeze(0)
 

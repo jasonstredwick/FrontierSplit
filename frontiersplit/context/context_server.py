@@ -24,8 +24,31 @@ from frontiersplit.context.online_softmax import (
     PartialAttentionChunk,
     compute_partial_attention,
     merge_partial_attentions,
+    merge_two_partial_attentions,
 )
 from frontiersplit.context.prefix_cache import RadixPrefixCache
+
+if hasattr(asyncio, "timeout"):
+    _async_timeout = asyncio.timeout
+else:
+
+    @contextlib.asynccontextmanager
+    async def _async_timeout(delay: float | None):
+        if delay is None:
+            yield
+            return
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        assert task is not None
+        handle = loop.call_later(delay, task.cancel)
+        try:
+            yield
+        except asyncio.CancelledError:
+            if handle.when() <= loop.time():
+                raise TimeoutError() from None
+            raise
+        finally:
+            handle.cancel()
 
 logger = logging.getLogger("frontiersplit.context_server")
 
@@ -288,6 +311,14 @@ class ContextStore:
             self.touch_session(session_id)
             return sum(k.shape[-2] for k, _ in self._store[session_id][layer_idx])
 
+    def get_seq_len(self, session_id: str, layer_idx: int = 0) -> int:
+        """Returns the current cumulative sequence length for a session and layer."""
+        with self._lock:
+            session = self._store.get(session_id)
+            if session is None or layer_idx not in session:
+                return 0
+            return sum(k.shape[-2] for k, _ in session[layer_idx])
+
     def get_chunks(
         self,
         session_id: str,
@@ -431,6 +462,8 @@ class ContextServer:
         self._session_expected_layers: dict[str, int] = {}
         self._session_tokens: dict[str, list[int]] = {}
         self._staged_uploads: dict[str, _StagedUpload] = {}
+        self._committed_uploads: dict[str, set[str]] = {}
+        self._session_leases: dict[str, str] = {}
         self._pinned_sessions: dict[str, tuple[int, ...]] = {}
         self._server: asyncio.Server | None = None
         self._ttl_task: asyncio.Task[None] | None = None
@@ -525,6 +558,11 @@ class ContextServer:
             self.prefix_cache.insert(full_tokens, k_dict, v_dict)
         else:
             assert state.base_tokens is not None
+            # Atomically commit staged layers to ContextStore
+            for l_i in sorted(ready_layers.keys()):
+                k_l, v_l = ready_layers[l_i]
+                self.store.append_kv(session_id, l_i, k_l, v_l)
+
             k_dict = {l_i: kv[0].clone() for l_i, kv in ready_layers.items()}
             v_dict = {l_i: kv[1].clone() for l_i, kv in ready_layers.items()}
             inserted = self.prefix_cache.insert_delta(
@@ -551,6 +589,9 @@ class ContextServer:
                             break
                     if can_reconstruct:
                         self.prefix_cache.insert(full_tokens, full_k, full_v)
+
+            self._committed_uploads.setdefault(session_id, set()).add(state.upload_id)
+            self._staged_uploads.pop(session_id, None)
         self._set_session_pin(session_id, full_tokens)
 
         # Backfill any active prefix-bound sessions that matched a prefix of `full_tokens`
@@ -660,8 +701,12 @@ class ContextServer:
         v_dev = v_delta.to(self.device)
         delta_len = int(k_dev.shape[-2])
 
-        state = self._staged_uploads.get(session_id)
         eff_upload_id = upload_id or "__implicit__"
+        if eff_upload_id in self._committed_uploads.get(session_id, set()):
+            # Already committed idempotently: return current total length
+            return self.store.get_seq_len(session_id, layer_idx)
+
+        state = self._staged_uploads.get(session_id)
         is_new_upload = (
             state is None
             or state.op != "append"
@@ -690,13 +735,6 @@ class ContextServer:
             self._staged_uploads[session_id] = state
 
         assert state is not None
-        new_len = self.store.append_kv(
-            session_id=session_id,
-            layer_idx=layer_idx,
-            k_delta=k_dev,
-            v_delta=v_dev,
-        )
-
         state.layers[layer_idx] = (k_dev, v_dev)
         if num_layers is not None and num_layers > 0:
             state.expected_layers = num_layers
@@ -704,7 +742,11 @@ class ContextServer:
             state.token_ids = list(token_ids)
 
         self._try_publish_staged_upload(session_id, state)
-        return new_len
+
+        base_len = self.store.get_seq_len(session_id, layer_idx)
+        if eff_upload_id in self._committed_uploads.get(session_id, set()):
+            return base_len
+        return base_len + delta_len
 
     def evict_expired_sessions(
         self, max_idle_seconds: float | None = None
@@ -859,38 +901,19 @@ class ContextServer:
             k_sub = k_c[:, :, slice_start:slice_end, :]
             v_sub = v_c[:, :, slice_start:slice_end, :]
 
-            remote_mask: torch.Tensor | None = None
-            if sliding_window is not None and sliding_window > 0 and q_len > 1:
-                rem_len = k_sub.shape[-2]
-                q_pos = torch.arange(
-                    first_q_pos, first_q_pos + q_len, device=self.device
-                ).unsqueeze(1)
-                k_pos = torch.arange(
-                    slice_start, slice_end, device=self.device
-                ).unsqueeze(0)
-                out_of_window = k_pos <= (q_pos - sliding_window)
-                if out_of_window.any():
-                    remote_mask = torch.where(
-                        out_of_window,
-                        torch.full(
-                            (q_len, rem_len),
-                            float("-inf"),
-                            dtype=torch.float32,
-                            device=self.device,
-                        ),
-                        torch.zeros(
-                            (q_len, rem_len),
-                            dtype=torch.float32,
-                            device=self.device,
-                        ),
-                    ).view(1, 1, q_len, rem_len)
-
             return compute_partial_attention(
-                q_dev, k_sub, v_sub, scale=scale, attention_mask=remote_mask
+                q_dev,
+                k_sub,
+                v_sub,
+                scale=scale,
+                is_causal=(first_q_pos < slice_end and q_len > 1),
+                sliding_window=sliding_window if q_len > 1 else None,
+                q_pos_offset=first_q_pos,
+                k_pos_offset=slice_start,
             )
 
-        # Multi-chunk path: iterate through chunks, slice zero-copy views, compute partials & merge
-        partial_chunks: list[PartialAttentionChunk] = []
+        # Multi-chunk path: stream through chunks, compute partials & merge immediately into running accumulator
+        running_chunk: PartialAttentionChunk | None = None
         curr_offset = 0
 
         for k_c, v_c in chunks:
@@ -910,37 +933,23 @@ class ContextServer:
             rel_end = v_end - chunk_start
             k_sub = k_c[:, :, rel_start:rel_end, :]
             v_sub = v_c[:, :, rel_start:rel_end, :]
-            sub_len = k_sub.shape[-2]
-
-            remote_mask = None
-            if sliding_window is not None and sliding_window > 0 and q_len > 1:
-                q_pos = torch.arange(
-                    first_q_pos, first_q_pos + q_len, device=self.device
-                ).unsqueeze(1)
-                k_pos = torch.arange(v_start, v_end, device=self.device).unsqueeze(0)
-                out_of_window = k_pos <= (q_pos - sliding_window)
-                if out_of_window.any():
-                    remote_mask = torch.where(
-                        out_of_window,
-                        torch.full(
-                            (q_len, sub_len),
-                            float("-inf"),
-                            dtype=torch.float32,
-                            device=self.device,
-                        ),
-                        torch.zeros(
-                            (q_len, sub_len),
-                            dtype=torch.float32,
-                            device=self.device,
-                        ),
-                    ).view(1, 1, q_len, sub_len)
 
             p_chunk = compute_partial_attention(
-                q_dev, k_sub, v_sub, scale=scale, attention_mask=remote_mask
+                q_dev,
+                k_sub,
+                v_sub,
+                scale=scale,
+                is_causal=(first_q_pos < v_end and q_len > 1),
+                sliding_window=sliding_window if q_len > 1 else None,
+                q_pos_offset=first_q_pos,
+                k_pos_offset=v_start,
             )
-            partial_chunks.append(p_chunk)
+            if running_chunk is None:
+                running_chunk = p_chunk
+            else:
+                running_chunk = merge_two_partial_attentions(running_chunk, p_chunk)
 
-        if not partial_chunks:
+        if running_chunk is None:
             return compute_partial_attention(
                 q_dev,
                 chunks[0][0][:, :, 0:0, :],
@@ -948,7 +957,7 @@ class ContextServer:
                 scale=scale,
             )
 
-        return merge_partial_attentions(partial_chunks)
+        return running_chunk
 
     def release_session(self, session_id: str) -> bool:
         """Evicts a session's static prompt KV cache."""
@@ -956,6 +965,8 @@ class ContextServer:
         self._staged_uploads.pop(session_id, None)
         self._session_tokens.pop(session_id, None)
         self._session_expected_layers.pop(session_id, None)
+        self._committed_uploads.pop(session_id, None)
+        self._session_leases.pop(session_id, None)
         return self.store.release_session(session_id)
 
     async def _handle_connection(
@@ -1308,7 +1319,7 @@ class ContextClient:
         """Performs a cancellation- and timeout-safe async request/response exchange over TCP."""
         async with self._get_lock():
             try:
-                async with asyncio.timeout(self.timeout):
+                async with _async_timeout(self.timeout):
                     await self.connect()
                     assert self.writer is not None and self.reader is not None
                     frame = pack_context_frame(req_msg_type, meta, payload)

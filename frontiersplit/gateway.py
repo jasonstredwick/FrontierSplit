@@ -9,8 +9,10 @@ and distributed pipeline schedulers.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -29,6 +31,19 @@ from frontiersplit.context.routing import PrefixRouter
 from frontiersplit.pipeline.scheduler import PipelineScheduler
 
 logger = logging.getLogger("frontiersplit.gateway")
+
+_session_locks: dict[str, asyncio.Lock] = {}
+_session_locks_guard = threading.Lock()
+
+
+async def _acquire_session_lock(session_id: str) -> asyncio.Lock:
+    """Acquires a per-session lock to serialize concurrent requests targeting the same session ID."""
+    with _session_locks_guard:
+        if session_id not in _session_locks:
+            _session_locks[session_id] = asyncio.Lock()
+        lock = _session_locks[session_id]
+    await lock.acquire()
+    return lock
 
 try:
     from transformers import AutoTokenizer
@@ -340,70 +355,175 @@ def create_gateway_app(
             else:
                 release_on_completion = True
 
-            routed_shard_id: str | None = None
-            routed_client = None
-            if (
-                app.state.prefix_router is not None
-                and app.state.disaggregated_model is not None
-            ):
-                try:
-                    decision = app.state.prefix_router.route_request(
-                        messages=req.messages,
-                        session_id=session_id if explicit_session else None,
-                        tokenizer=tok,
-                    )
-                    routed_shard_id = decision.shard.shard_id
-                    routed_client = decision.shard.get_client()
-                except Exception as e:
-                    logger.warning(
-                        "PrefixRouter routing failed, falling back to default client: %s",
-                        e,
-                    )
+            session_lock = await _acquire_session_lock(session_id)
+            try:
+                routed_shard_id: str | None = None
+                routed_client = None
+                if (
+                    app.state.prefix_router is not None
+                    and app.state.disaggregated_model is not None
+                ):
+                    try:
+                        decision = app.state.prefix_router.route_request(
+                            messages=req.messages,
+                            session_id=session_id if explicit_session else None,
+                            tokenizer=tok,
+                        )
+                        routed_shard_id = decision.shard.shard_id
+                        routed_client = decision.shard.get_client()
+                    except Exception as e:
+                        logger.warning(
+                            "PrefixRouter routing failed, falling back to default client: %s",
+                            e,
+                        )
 
-            resp_headers: dict[str, str] = {
-                "X-FrontierSplit-Session-ID": session_id,
-            }
-            if routed_shard_id:
-                resp_headers["X-FrontierSplit-Shard-ID"] = routed_shard_id
+                resp_headers: dict[str, str] = {
+                    "X-FrontierSplit-Session-ID": session_id,
+                }
+                if routed_shard_id:
+                    resp_headers["X-FrontierSplit-Shard-ID"] = routed_shard_id
 
-            created_time = int(time.time())
-            max_new_tokens = req.max_tokens if req.max_tokens is not None else 32
+                created_time = int(time.time())
+                max_new_tokens = req.max_tokens if req.max_tokens is not None else 32
 
-            eos_ids: set[int] = set()
-            if tok is not None:
-                if hasattr(tok, "eos_token_id"):
-                    if isinstance(tok.eos_token_id, int):
-                        eos_ids.add(tok.eos_token_id)
-                    elif isinstance(tok.eos_token_id, (list, tuple, set)):
-                        eos_ids.update(tok.eos_token_id)
-                if hasattr(tok, "all_special_ids") and tok.all_special_ids:
-                    eos_ids.update(tok.all_special_ids)
-            if hasattr(disagg, "_get_eos_token_ids"):
-                eos_ids.update(disagg._get_eos_token_ids())
+                eos_ids: set[int] = set()
+                if tok is not None:
+                    if hasattr(tok, "eos_token_id"):
+                        if isinstance(tok.eos_token_id, int):
+                            eos_ids.add(tok.eos_token_id)
+                        elif isinstance(tok.eos_token_id, (list, tuple, set)):
+                            eos_ids.update(tok.eos_token_id)
+                    if hasattr(tok, "all_special_ids") and tok.all_special_ids:
+                        eos_ids.update(tok.all_special_ids)
+                if hasattr(disagg, "_get_eos_token_ids"):
+                    eos_ids.update(disagg._get_eos_token_ids())
 
-            if req.stream:
+                if req.stream:
 
-                async def event_generator():
-                    # Initial role delta chunk
-                    role_chunk = {
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": active_model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": ""},
-                                "finish_reason": None,
+                    async def event_generator():
+                        try:
+                            # Initial role delta chunk
+                            role_chunk = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": active_model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"role": "assistant", "content": ""},
+                                        "finish_reason": None,
+                                    }
+                                ],
                             }
-                        ],
-                    }
-                    yield f"data: {json.dumps(role_chunk)}\n\n"
+                            yield f"data: {json.dumps(role_chunk)}\n\n"
 
-                    streamed_token_ids: list[int] = []
-                    emitted_len = 0
+                            streamed_token_ids: list[int] = []
+                            emitted_len = 0
 
-                    gen = disagg.generate_stream_async(
+                            gen = disagg.generate_stream_async(
+                                input_ids=input_tensor,
+                                max_new_tokens=max_new_tokens,
+                                session_id=session_id,
+                                use_prefix_cache=req.use_prefix_cache,
+                                release_on_completion=release_on_completion,
+                                temperature=req.temperature,
+                                top_p=req.top_p,
+                                context_client=routed_client,
+                            )
+                            try:
+                                async for token_id in gen:
+                                    if token_id in eos_ids:
+                                        continue
+                                    streamed_token_ids.append(token_id)
+                                    if tok is not None:
+                                        decoded_so_far = _safe_decode(tok, streamed_token_ids)
+                                        # Hold back trailing replacement char (\ufffd) until multi-token
+                                        # UTF-8 character sequences complete.
+                                        if decoded_so_far.endswith("\ufffd"):
+                                            stable_end = len(decoded_so_far.rstrip("\ufffd"))
+                                        else:
+                                            stable_end = len(decoded_so_far)
+
+                                        if stable_end > emitted_len:
+                                            delta_text = decoded_so_far[emitted_len:stable_end]
+                                            emitted_len = stable_end
+                                        else:
+                                            delta_text = ""
+                                    else:
+                                        delta_text = str(token_id) + " "
+
+                                    if delta_text:
+                                        chunk = {
+                                            "id": req_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created_time,
+                                            "model": active_model,
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": {"content": delta_text},
+                                                    "finish_reason": None,
+                                                }
+                                            ],
+                                        }
+                                        yield f"data: {json.dumps(chunk)}\n\n"
+                            finally:
+                                await gen.aclose()
+
+                            if tok is not None and streamed_token_ids:
+                                final_decoded = _safe_decode(tok, streamed_token_ids)
+                                if len(final_decoded) > emitted_len:
+                                    tail_chunk = {
+                                        "id": req_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created_time,
+                                        "model": active_model,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {
+                                                    "content": final_decoded[emitted_len:]
+                                                },
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                    yield f"data: {json.dumps(tail_chunk)}\n\n"
+
+                            # Final finish reason chunk
+                            finish_reason = (
+                                disagg.get_finish_reason()
+                                if hasattr(disagg, "get_finish_reason")
+                                else "stop"
+                            )
+                            final_chunk = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": active_model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": finish_reason,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(final_chunk)}\n\n"
+                            yield "data: [DONE]\n\n"
+                        finally:
+                            session_lock.release()
+
+                    return StreamingResponse(
+                        event_generator(),
+                        media_type="text/event-stream",
+                        headers=resp_headers,
+                    )
+
+                # Non-streaming mode
+                try:
+                    generated_token_ids = await disagg.generate_async(
                         input_ids=input_tensor,
                         max_new_tokens=max_new_tokens,
                         session_id=session_id,
@@ -413,141 +533,48 @@ def create_gateway_app(
                         top_p=req.top_p,
                         context_client=routed_client,
                     )
-                    try:
-                        async for token_id in gen:
-                            if token_id in eos_ids:
-                                continue
-                            streamed_token_ids.append(token_id)
-                            if tok is not None:
-                                decoded_so_far = _safe_decode(tok, streamed_token_ids)
-                                # Hold back trailing replacement char (\ufffd) until multi-token
-                                # UTF-8 character sequences complete.
-                                if decoded_so_far.endswith("\ufffd"):
-                                    stable_end = len(decoded_so_far.rstrip("\ufffd"))
-                                else:
-                                    stable_end = len(decoded_so_far)
+                finally:
+                    session_lock.release()
 
-                                if stable_end > emitted_len:
-                                    delta_text = decoded_so_far[emitted_len:stable_end]
-                                    emitted_len = stable_end
-                                else:
-                                    delta_text = ""
-                            else:
-                                delta_text = str(token_id) + " "
-
-                            if delta_text:
-                                chunk = {
-                                    "id": req_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": active_model,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {"content": delta_text},
-                                            "finish_reason": None,
-                                        }
-                                    ],
-                                }
-                                yield f"data: {json.dumps(chunk)}\n\n"
-                    finally:
-                        await gen.aclose()
-
-                    if tok is not None and streamed_token_ids:
-                        final_decoded = _safe_decode(tok, streamed_token_ids)
-                        if len(final_decoded) > emitted_len:
-                            tail_chunk = {
-                                "id": req_id,
-                                "object": "chat.completion.chunk",
-                                "created": created_time,
-                                "model": active_model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {
-                                            "content": final_decoded[emitted_len:]
-                                        },
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                            yield f"data: {json.dumps(tail_chunk)}\n\n"
-
-                    # Final finish reason chunk
-                    finish_reason = (
-                        disagg.get_finish_reason()
-                        if hasattr(disagg, "get_finish_reason")
-                        else "stop"
-                    )
-                    final_chunk = {
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": active_model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": finish_reason,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(final_chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-
-                return StreamingResponse(
-                    event_generator(),
-                    media_type="text/event-stream",
-                    headers=resp_headers,
+                display_tokens = [t for t in generated_token_ids if t not in eos_ids]
+                content = (
+                    _safe_decode(tok, display_tokens)
+                    if tok is not None
+                    else " ".join(str(t) for t in display_tokens)
+                )
+                prompt_count = len(token_ids)
+                comp_count = len(generated_token_ids)
+                finish_reason = (
+                    disagg.get_finish_reason()
+                    if hasattr(disagg, "get_finish_reason")
+                    else "stop"
                 )
 
-            # Non-streaming mode
-            generated_token_ids = await disagg.generate_async(
-                input_ids=input_tensor,
-                max_new_tokens=max_new_tokens,
-                session_id=session_id,
-                use_prefix_cache=req.use_prefix_cache,
-                release_on_completion=release_on_completion,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                context_client=routed_client,
-            )
-            display_tokens = [t for t in generated_token_ids if t not in eos_ids]
-            content = (
-                _safe_decode(tok, display_tokens)
-                if tok is not None
-                else " ".join(str(t) for t in display_tokens)
-            )
-            prompt_count = len(token_ids)
-            comp_count = len(generated_token_ids)
-            finish_reason = (
-                disagg.get_finish_reason()
-                if hasattr(disagg, "get_finish_reason")
-                else "stop"
-            )
-
-            response_payload = {
-                "id": req_id,
-                "object": "chat.completion",
-                "created": created_time,
-                "model": active_model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": content},
-                        "finish_reason": finish_reason,
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": prompt_count,
-                    "completion_tokens": comp_count,
-                    "total_tokens": prompt_count + comp_count,
-                },
-            }
-            return JSONResponse(
-                content=response_payload,
-                headers=resp_headers,
-            )
+                response_payload = {
+                    "id": req_id,
+                    "object": "chat.completion",
+                    "created": created_time,
+                    "model": active_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": content},
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": prompt_count,
+                        "completion_tokens": comp_count,
+                        "total_tokens": prompt_count + comp_count,
+                    },
+                }
+                return JSONResponse(
+                    content=response_payload,
+                    headers=resp_headers,
+                )
+            except BaseException:
+                session_lock.release()
+                raise
 
         # 2. Pipeline Scheduler Execution Path
         assert app.state.scheduler is not None
