@@ -154,34 +154,46 @@ During autoregressive generation ($M=1$ token):
 
 ---
 
-## 4. The Two-Tier Chunking Architecture (Relation to Split-K & Flash-Decoding)
+## 4. The Three-Tier Chunking Architecture (Line → Grid → Multi-Unit Fabric)
 
-Partitioning the sequence dimension during decode attention and reducing partial accumulators using online softmax was pioneered by **Flash-Decoding (Dao et al., 2023)**. FrontierSplit extends this sequence-partitioning principle from within a single GPU SM to a distributed multi-tenant context fabric.
+Partitioning the sequence dimension during decode attention and reducing partial accumulators using online softmax was pioneered by **Flash-Decoding (Dao et al., 2023)**. FrontierSplit extends this sequence-partitioning principle from within a single GPU SM to a distributed multi-tenant context fabric, structuring KV cache memory across a three-tier hardware hierarchy:
 
 ```
-                       KV Cache Sequence (e.g. 16,384 tokens)
-  ┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
-  │   Chunk 0    │   Chunk 1    │   Chunk 2    │     ...      │  Chunk 127   │
-  │ (128 tokens) │ (128 tokens) │ (128 tokens) │              │ (128 tokens) │
-  └───────┬──────┴───────┬──────┴───────┬──────┴──────────────┴───────┬──────┘
-          │              │              │                             │
-          ▼              ▼              ▼                             ▼
-     ┌─────────┐    ┌─────────┐    ┌─────────┐                   ┌─────────┐
-     │  Part 0 │    │  Part 1 │    │  Part 2 │                   │ Part 127│
-     └────┬────┘    └────┬────┘    └────┬────┘                   └────┬────┘
-          │              │              │                             │
-          ▼              ▼              ▼                             ▼
-     (A_0,m_0,l_0)  (A_1,m_1,l_1)  (A_2,m_2,l_2)               (A_127,m_127,l_127)
-          │              │              │                             │
-          └──────────────┴──────────────┴─────────────────────────────┘
-                                        │
-                                        ▼ Online Softmax Reduction (Within Chip)
-                               Final Attention Output
+                          KV Cache Sequence (e.g. 65,536 tokens)
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │ Tier 3: Multi-Compute Unit Fabric (e.g. 4 MXUs / N_SM Streaming Multiprocessors) │
+   │  ┌───────────────────────┬───────────────────────┬──────────────────┐  │
+   │  │   Compute Unit 0      │   Compute Unit 1      │      ...         │  │
+   │  │   (16,384 tokens)     │   (16,384 tokens)     │                  │  │
+   └──┴───────────┬───────────┴───────────┬───────────┴──────────────────┴──┘
+                  │                       │
+      ┌───────────▼───────────┐           ▼
+      │ Tier 2: 128 Grid Rows │
+      │ ┌───────────────────┐ │
+      │ │ Chunk 0 (128 tok) │ │
+      │ ├───────────────────┤ │
+      │ │ Chunk 1 (128 tok) │ │
+      │ ├───────────────────┤ │
+      │ │ ...               │ │
+      │ ├───────────────────┤ │
+      │ │ Chunk 127(128 tok)│ │
+      │ └─────────┬─────────┘ │
+      └───────────┼───────────┘
+                  │
+      ┌───────────▼────────────────────────────────────────┐
+      │ Tier 1: Horizontal Vector Line (128 Numbers)       │
+      │ • Fills inner contracting dot-product dimension    │
+      └────────────────────────────────────────────────────┘
+                  │
+                  ▼ Online Softmax Reduction (Within Chip & Across Nodes)
+              Final Attention Output: O = Part_0 ⊕ Part_1 ⊕ ... ⊕ Part_P
 ```
 
-1. **Tier 1 (Horizontal / Tile Size Alignment)**: Sized to 128 tokens to saturate the inner contracting dimension of the multiplier line.
-2. **Tier 2 (Vertical / Spatial Parallelism - Split-K) [Proposed Architecture]**: Instead of evaluating chunks sequentially on a single thread, partitions are dispatched across parallel execution units simultaneously. *(Current prototype implementation: evaluates chunks iteratively in PyTorch on the Context Server without requiring custom kernel dependencies).*
-3. **The Unification**: The reduction of partial attention results on-chip (Flash-Decoding) and across distributed network nodes (FrontierSplit) shares the **exact same associative Online Softmax operator ($\oplus$)**.
+1. **Tier 1 (Horizontal / Vector Line Alignment)**: Sized to 128 tokens (matching `head_dim` $d=128$) to saturate the inner contracting dimension of one multiplier line, eliminating horizontal ALU idling.
+2. **Tier 2 (Vertical / Single Unit Grid Rows)**: Sized to 128 chunks ($128 \times 128 = 16{,}384$ tokens) to saturate all 128 vertical multiplier rows of a single physical systolic array (or one SM's active warp execution slots).
+3. **Tier 3 (Multi-Compute Unit Fabric Multiplier)**: Sized across the chip's total physical compute units ($U_{\text{compute}}$). On a TPU with 4 MXUs ($2\text{ cores} \times 2\text{ MXUs}$), single-stream sequence saturation requires $16{,}384 \times 4 = \mathbf{65{,}536\text{ tokens}}$ ($512$ chunks of 128).
+4. **The Unification**: The reduction of partial attention results on-chip (Flash-Decoding) and across distributed network nodes (FrontierSplit) shares the **exact same associative Online Softmax operator ($\oplus$)**.
+
 
 ---
 
@@ -259,11 +271,37 @@ For a single conversational stream, transformer layers are evaluated strictly se
 - **Layer Stacking**: A user session's KV caches for all $L$ layers are co-located on the same Context Server.
 - **Temporal Interleaving**: During the feed-forward MLP computation ($T_{\text{MLP}}$) on the compute worker, the Context Server interleaves queries from other staggered streams, achieving high memory bus saturation without multi-batch synchronization stalls.
 
-### 6.5 Multi-User Allocation: Sizing Spectrum & Lockstep Prevention [Architectural Model]
-Let $K_{\text{sat}}$ be the hardware saturation threshold—the number of chunks that saturates a machine's execution bandwidth in a single parallel pass:
-1. **Under-Saturation (1 Chunk per Machine)**: Susceptible to spatial convoys / lockstep queuing in multi-user systems.
-2. **Saturated Allocation ($K_{\text{sat}}$ Chunks per Machine) — [Target Architecture]**: Prompts allocated in units of $K_{\text{sat}}$ chunks per node, eliminating lockstep convoys and minimizing network RPC fan-out.
-3. **Oversubscription ($> K_{\text{sat}}$ Chunks per Machine)**: Machine holds multiple passes of chunks, trading single-user latency for zero network fan-out.
+### 6.5 Multi-User Allocation: Compute Unit Saturation ($K_{\text{sat}}$) and Machine Sizing [Architectural Model]
+
+The hardware saturation threshold, denoted $K_{\text{sat}}$, defines the total number of sequence tokens (and chunks) required to simultaneously saturate **all physical compute units on a single machine** in a single execution pass:
+
+$$K_{\text{sat}} = T_{\text{line}} \times R_{\text{unit}} \times U_{\text{compute}}$$
+
+where:
+- $T_{\text{line}} = 128$ tokens (Tier 1: inner contracting dimension / `head_dim`).
+- $R_{\text{unit}} = 128$ rows (Tier 2: rows per physical compute unit or systolic array).
+- $U_{\text{compute}}$ is the number of independent parallel compute units per chip/machine (Tier 3: physical hardware multiplier).
+
+#### Hardware Instantiations:
+- **Google TPU v2 / TPU v3**: Each chip hosts $2\text{ cores} \times 2\text{ MXUs} = 4\text{ MXUs}$ ($U_{\text{compute}} = 4$).
+  $$K_{\text{sat}} = 128 \times 128 \times 4 = \mathbf{65{,}536\text{ tokens (512 chunks of 128)}}$$
+- **Google TPU v4**: Each chip hosts $2\text{ cores} \times 2\text{ dual-MXUs} = 4\text{ MXU equivalents}$ ($K_{\text{sat}} = 65{,}536\text{ tokens}$).
+- **NVIDIA GPU (e.g. A100 / H100)**: With $N_{\text{SM}}$ Streaming Multiprocessors (108 SMs on A100, 132 SMs on H100) running 128-token chunk warps:
+  $$K_{\text{sat}} = 128 \times N_{\text{SM}} = \mathbf{13{,}824\text{ tokens (108 chunks per wave on A100)}}$$
+
+#### Parallelism Modes Across $U_{\text{compute}}$:
+1. **Pure Sequence Parallelism (Split-K for $N \ge K_{\text{sat}}$)**: A single long context is partitioned across all $U_{\text{compute}}$ units simultaneously. For example, on a 4-MXU TPU, 512 chunks are mapped 128 chunks per MXU, executing in a single parallel sweep.
+2. **Hybrid Sequence + Head Parallelism ($N < K_{\text{sat}}$)**: When context length is below full-chip saturation, multi-head parallelism distributes Grouped-Query Attention (GQA) heads across idle compute units. For instance, in Mistral ($H_{\text{kv}} = 8$ heads) on a $16{,}384$-token prompt, each of the 4 MXUs evaluates 2 KV heads over 128 chunks, maintaining full hardware utilization without ALU idling.
+
+#### Machine VRAM Provisioning in Units of $K_{\text{sat}}$:
+For a 32-layer transformer with GQA ($H_{\text{kv}} = 8$, $d = 128$, FP16 format = 4 KB per token across all layers):
+- One full $K_{\text{sat}}$ block ($65{,}536$ tokens) consumes:
+  $$65{,}536 \text{ tokens} \times 4{,}096\text{ bytes/token} = \mathbf{268.4\text{ MB per layer}} \times 32\text{ layers} \approx \mathbf{8.59\text{ GB}}$$
+- On a 32 GB HBM/VRAM Context Server, the node cleanly provisions **3 full $K_{\text{sat}}$ blocks** ($\sim 25.8\text{ GB}$), leaving $\sim 6.2\text{ GB}$ of high-speed memory for operating system buffers, prefix trie lookup tables, and dynamic reasoning trace delta allocations.
+- **Sizing Spectrum**:
+  1. **Under-Saturation ($< K_{\text{sat}}$ tokens per machine)**: Leaves compute units stranded unless head parallelism or multi-tenant interleaving fills vacant units.
+  2. **Saturated Allocation ($K_{\text{sat}}$ chunks per machine) — [Target Architecture]**: Context allocated in clean integer multiples of $K_{\text{sat}}$, guaranteeing single-wave execution efficiency and minimizing network RPC fan-out.
+  3. **Oversubscription ($> K_{\text{sat}}$ chunks per machine)**: Node holds multiple $K_{\text{sat}}$ waves, trading single-stream execution latency for consolidated memory density and zero network serialization.
 
 ### 6.6 Hot Prefix Replication via Active Reader Counting [Proposed Architecture]
 - In high-concurrency environments, popular shared prefixes (system prompts, repository indexes) track an `active_reader_count`.
