@@ -246,3 +246,44 @@ def test_insert_delta_evicted_base_does_not_publish_orphan_suffix():
     _, match_orphan = cache.match([9])
     assert match_orphan == 0
 
+
+def test_radix_node_split_preserves_tensor_storage_view():
+    """Verify that RadixNode.split() creates zero-copy slice views sharing the underlying storage pointer."""
+    cache = RadixPrefixCache(max_cached_tokens=10_000)
+    tokens_initial = [10, 20, 30, 40, 50, 60]
+    k = {0: torch.randn(1, 2, 6, 16)}
+    v = {0: torch.randn(1, 2, 6, 16)}
+    cache.insert(tokens_initial, k, v)
+
+    nodes, matched = cache.match(tokens_initial)
+    assert matched == 6
+    assert len(nodes) == 1
+    orig_node = nodes[0]
+    orig_k_ptr = orig_node.k_cache[0].untyped_storage().data_ptr()
+    orig_v_ptr = orig_node.v_cache[0].untyped_storage().data_ptr()
+
+    # Split the node at index 3 (branching with a new sequence [10, 20, 30, 77, 88])
+    tokens_branch = [10, 20, 30, 77, 88]
+    k_branch = {0: torch.randn(1, 2, 2, 16)}
+    v_branch = {0: torch.randn(1, 2, 2, 16)}
+    cache.insert_delta(
+        base_tokens=[10, 20, 30],
+        suffix_tokens=[77, 88],
+        k_delta_by_layer=k_branch,
+        v_delta_by_layer=v_branch,
+    )
+
+    # Now match the prefix [10, 20, 30]
+    nodes_split, matched_split = cache.match([10, 20, 30])
+    assert matched_split == 3
+    assert len(nodes_split) == 1
+    prefix_node = nodes_split[0]
+    suffix_node = prefix_node.children[40]
+
+    # Verify underlying storage pointer is identical for both prefix and suffix views
+    assert prefix_node.k_cache[0].untyped_storage().data_ptr() == orig_k_ptr
+    assert prefix_node.v_cache[0].untyped_storage().data_ptr() == orig_v_ptr
+    assert suffix_node.k_cache[0].untyped_storage().data_ptr() == orig_k_ptr
+    assert suffix_node.v_cache[0].untyped_storage().data_ptr() == orig_v_ptr
+
+

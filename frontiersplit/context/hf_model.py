@@ -11,6 +11,8 @@ import asyncio
 import concurrent.futures
 import contextlib
 import contextvars
+import hashlib
+import itertools
 import logging
 import threading
 import uuid
@@ -42,6 +44,36 @@ logger = logging.getLogger("frontiersplit.hf_model")
 _active_context_client_var: contextvars.ContextVar[ContextClient | None] = (
     contextvars.ContextVar("frontiersplit_active_context_client", default=None)
 )
+_active_lease_id_var: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar("frontiersplit_active_lease_id", default=None)
+)
+_active_model_id_var: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar("frontiersplit_active_model_id", default=None)
+)
+
+
+def _compute_model_id(model: Any, model_id: str | None = None) -> str:
+    """Computes a deterministic model identifier based on model architecture and weights."""
+    if model_id is not None:
+        return model_id
+    if hasattr(model, "model_id") and model.model_id:
+        return str(model.model_id)
+    config = getattr(model, "config", None)
+    base_name = (
+        getattr(config, "_name_or_path", None)
+        or getattr(model, "name_or_path", None)
+        or model.__class__.__name__
+    )
+    h = hashlib.sha256(str(base_name).encode())
+    try:
+        # Sample parameters to fingerprint weight state / revision
+        for p in itertools.islice(model.parameters(), 8):
+            if p is not None and p.numel() > 0:
+                sample = p.detach().view(-1)[:256].cpu().numpy().tobytes()
+                h.update(sample)
+    except Exception:
+        pass
+    return f"{base_name}:{h.hexdigest()[:16]}"
 
 
 def _apply_rotary_pos_emb(
@@ -168,6 +200,8 @@ class DisaggregatedAttentionPatcher:
         client = self.client
         scaling = getattr(self.original_attn, "scaling", 1.0 / (head_dim**0.5))
         sliding_window = self._get_sliding_window()
+        lease_id = _active_lease_id_var.get()
+        model_id = _active_model_id_var.get()
 
         if past_key_values is None:
             prompt_chunk = client.query_partial_attention_sync(
@@ -178,6 +212,8 @@ class DisaggregatedAttentionPatcher:
                 context_len=context_len,
                 sliding_window=sliding_window,
                 past_local_len=0,
+                lease_id=lease_id,
+                model_id=model_id,
             ).to(q.device)
             attn_out = finalize_attention(prompt_chunk)
         else:
@@ -200,6 +236,8 @@ class DisaggregatedAttentionPatcher:
                             context_len=context_len,
                             sliding_window=sliding_window,
                             past_local_len=kv_len,
+                            lease_id=lease_id,
+                            model_id=model_id,
                         )
                         # Compute local partial attention while Context Server computes remote chunk
                         local_chunk = compute_partial_attention(
@@ -225,6 +263,8 @@ class DisaggregatedAttentionPatcher:
                     context_len=context_len,
                     sliding_window=sliding_window,
                     past_local_len=kv_len,
+                    lease_id=lease_id,
+                    model_id=model_id,
                 ).to(q.device)
                 local_chunk = compute_partial_attention(
                     q,
@@ -252,9 +292,11 @@ class DisaggregatedModel:
         self,
         model: PreTrainedModel,
         context_client: ContextClient,
+        model_id: str | None = None,
     ) -> None:
         self.model = model
         self.context_client = context_client
+        self.model_id = _compute_model_id(model, model_id)
         self._patchers: list[DisaggregatedAttentionPatcher] = []
         self._forward_lock = threading.RLock()
         self.last_finish_reason: str = "stop"
@@ -365,19 +407,33 @@ class DisaggregatedModel:
         session_id: str | None,
         context_len: int | None = None,
         client: ContextClient | None = None,
+        lease_id: str | None = None,
+        model_id: str | None = None,
     ):
-        """Scopes task-bound ContextClient and active session strictly around a model forward pass."""
+        """Scopes task-bound ContextClient, active session, lease, and model ID strictly around a model forward pass."""
         self.set_active_session(session_id, context_len)
-        token = (
+        token_client = (
             _active_context_client_var.set(client)
             if client is not None
             else None
         )
+        token_lease = (
+            _active_lease_id_var.set(lease_id)
+            if lease_id is not None
+            else None
+        )
+        token_model = _active_model_id_var.set(
+            model_id or getattr(self, "model_id", None)
+        )
         try:
             yield
         finally:
-            if token is not None:
-                _active_context_client_var.reset(token)
+            if token_client is not None:
+                _active_context_client_var.reset(token_client)
+            if token_lease is not None:
+                _active_lease_id_var.reset(token_lease)
+            if token_model is not None:
+                _active_model_id_var.reset(token_model)
             self.set_active_session(None)
 
     def _get_context_client(self) -> ContextClient:
@@ -392,6 +448,7 @@ class DisaggregatedModel:
         temperature: float = 0.0,
         top_p: float = 1.0,
         context_client: ContextClient | None = None,
+        lease_id: str | None = None,
     ) -> tuple[torch.Tensor, int]:
         """Runs prefill on the prompt and offloads static prompt KV caches to Context Server.
 
@@ -401,6 +458,7 @@ class DisaggregatedModel:
             temperature: Sampling temperature (0.0 for greedy decoding).
             top_p: Nucleus sampling probability threshold in (0.0, 1.0].
             context_client: Optional request-bound ContextClient.
+            lease_id: Optional session lease identifier.
 
         Returns:
             Tuple of (first_generated_token_id, prompt_length).
@@ -436,6 +494,8 @@ class DisaggregatedModel:
                 token_ids=tokens if l_idx == num_layers - 1 else None,
                 num_layers=num_layers,
                 upload_id=upload_id,
+                model_id=self.model_id,
+                lease_id=lease_id,
             )
 
         # Bind session to all patchers for subsequent decode steps
@@ -494,17 +554,29 @@ class DisaggregatedModel:
 
         # Initialize lifecycle state BEFORE try: so finally block is always safe
         turn_id = uuid.uuid4().hex[:8]
+        lease_id = f"{session_id}-{turn_id}"
         generated_tokens: list[int] = []
         local_cache: DynamicCache | None = None
         last_committed_idx = 0
+        lease_acquired = False
 
         try:
+            if not target_client.acquire_lease_sync(session_id, lease_id):
+                raise RuntimeError(
+                    f"Session '{session_id}' is already leased by another active generation. "
+                    "Overlapping requests with the same session ID must be serialized."
+                )
+            lease_acquired = True
+
             # Check for warm prefix cache hit on Context Server
             cache_hit = False
             matched_len = 0
             if use_prefix_cache:
                 matched_len, _ = target_client.match_prefix_sync(
-                    tokens, session_id=session_id
+                    tokens,
+                    session_id=session_id,
+                    model_id=self.model_id,
+                    lease_id=lease_id,
                 )
                 if matched_len == base_prompt_len:
                     cache_hit = True
@@ -518,7 +590,13 @@ class DisaggregatedModel:
                 with (
                     self._forward_lock,
                     torch.no_grad(),
-                    self._scoped_forward_context(session_id, None, target_client),
+                    self._scoped_forward_context(
+                        session_id,
+                        None,
+                        target_client,
+                        lease_id=lease_id,
+                        model_id=self.model_id,
+                    ),
                 ):
                     out_fast = self.model(
                         last_tok, position_ids=pos_tensor, use_cache=False
@@ -538,7 +616,13 @@ class DisaggregatedModel:
                 with (
                     self._forward_lock,
                     torch.no_grad(),
-                    self._scoped_forward_context(session_id, matched_len, target_client),
+                    self._scoped_forward_context(
+                        session_id,
+                        matched_len,
+                        target_client,
+                        lease_id=lease_id,
+                        model_id=self.model_id,
+                    ),
                 ):
                     out_suffix = self.model(
                         suffix_ids,
@@ -563,6 +647,8 @@ class DisaggregatedModel:
                         token_ids=suffix_tokens if l_idx == num_layers - 1 else None,
                         num_layers=num_layers,
                         upload_id=upload_id,
+                        model_id=self.model_id,
+                        lease_id=lease_id,
                     )
             else:
                 # 1. Prefill and offload prompt KV
@@ -572,6 +658,7 @@ class DisaggregatedModel:
                     temperature=temperature,
                     top_p=top_p,
                     context_client=target_client,
+                    lease_id=lease_id,
                 )
                 base_prompt_len = prompt_len
                 remote_prompt_len = prompt_len
@@ -597,7 +684,13 @@ class DisaggregatedModel:
                 with (
                     self._forward_lock,
                     torch.no_grad(),
-                    self._scoped_forward_context(session_id, None, target_client),
+                    self._scoped_forward_context(
+                        session_id,
+                        None,
+                        target_client,
+                        lease_id=lease_id,
+                        model_id=self.model_id,
+                    ),
                 ):
                     out = self.model(
                         cur_tok,
@@ -633,6 +726,8 @@ class DisaggregatedModel:
                             token_ids=chunk_tokens if l_idx == num_layers - 1 else None,
                             num_layers=num_layers,
                             upload_id=upload_id,
+                            model_id=self.model_id,
+                            lease_id=lease_id,
                         )
                     last_committed_idx += local_len
                     remote_prompt_len += local_len
@@ -674,13 +769,20 @@ class DisaggregatedModel:
                                 else None,
                                 num_layers=num_layers,
                                 upload_id=upload_id,
+                                model_id=self.model_id,
+                                lease_id=lease_id,
                             )
                         last_committed_idx += rem_len
                         remote_prompt_len += rem_len
 
                 if release_on_completion:
                     with contextlib.suppress(Exception):
-                        target_client.release_session_sync(session_id)
+                        target_client.release_session_sync(
+                            session_id, lease_id=lease_id
+                        )
+                elif lease_acquired:
+                    with contextlib.suppress(Exception):
+                        target_client.release_lease_sync(session_id, lease_id)
             finally:
                 with self._active_sessions_lock:
                     self._active_sessions.discard(session_id)
@@ -736,6 +838,7 @@ class DisaggregatedModel:
         temperature: float = 0.0,
         top_p: float = 1.0,
         context_client: ContextClient | None = None,
+        lease_id: str | None = None,
     ) -> tuple[torch.Tensor, int]:
         """Asynchronously runs prefill on the prompt and offloads KV caches."""
         self._validate_sampling_params(temperature, top_p)
@@ -805,6 +908,8 @@ class DisaggregatedModel:
                     token_ids=tokens if l_idx == num_layers - 1 else None,
                     num_layers=num_layers,
                     upload_id=upload_id,
+                    model_id=self.model_id,
+                    lease_id=lease_id,
                 )
             )
         await asyncio.gather(*tasks)
@@ -862,17 +967,29 @@ class DisaggregatedModel:
 
         # Initialize lifecycle state BEFORE try: so finally block is always safe
         turn_id = uuid.uuid4().hex[:8]
+        lease_id = f"{session_id}-{turn_id}"
         generated_tokens: list[int] = []
         local_cache: DynamicCache | None = None
         last_committed_idx = 0
         active_forward_future: concurrent.futures.Future | None = None
+        lease_acquired = False
 
         try:
+            if not await target_client.acquire_lease(session_id, lease_id):
+                raise RuntimeError(
+                    f"Session '{session_id}' is already leased by another active generation. "
+                    "Overlapping requests with the same session ID must be serialized."
+                )
+            lease_acquired = True
+
             cache_hit = False
             matched_len = 0
             if use_prefix_cache:
                 matched_len, _ = await target_client.match_prefix(
-                    tokens, session_id=session_id
+                    tokens,
+                    session_id=session_id,
+                    model_id=self.model_id,
+                    lease_id=lease_id,
                 )
                 if matched_len == base_prompt_len:
                     cache_hit = True
@@ -887,7 +1004,13 @@ class DisaggregatedModel:
                     with (
                         self._forward_lock,
                         torch.no_grad(),
-                        self._scoped_forward_context(session_id, None, target_client),
+                        self._scoped_forward_context(
+                            session_id,
+                            None,
+                            target_client,
+                            lease_id=lease_id,
+                            model_id=self.model_id,
+                        ),
                     ):
                         out_fast = self.model(
                             last_tok_in, position_ids=pos_in, use_cache=False
@@ -913,7 +1036,11 @@ class DisaggregatedModel:
                         self._forward_lock,
                         torch.no_grad(),
                         self._scoped_forward_context(
-                            session_id, matched_len, target_client
+                            session_id,
+                            matched_len,
+                            target_client,
+                            lease_id=lease_id,
+                            model_id=self.model_id,
                         ),
                     ):
                         out_suffix = self.model(
@@ -946,6 +1073,8 @@ class DisaggregatedModel:
                         token_ids=suffix_tokens if l_idx == num_layers - 1 else None,
                         num_layers=num_layers,
                         upload_id=upload_id,
+                        model_id=self.model_id,
+                        lease_id=lease_id,
                     )
                     for l_idx, layer in enumerate(suffix_cache.layers)
                 ]
@@ -957,6 +1086,7 @@ class DisaggregatedModel:
                     temperature=temperature,
                     top_p=top_p,
                     context_client=target_client,
+                    lease_id=lease_id,
                 )
                 base_prompt_len = prompt_len
                 remote_prompt_len = prompt_len
@@ -977,7 +1107,13 @@ class DisaggregatedModel:
                 with (
                     self._forward_lock,
                     torch.no_grad(),
-                    self._scoped_forward_context(session_id, None, target_client),
+                    self._scoped_forward_context(
+                        session_id,
+                        None,
+                        target_client,
+                        lease_id=lease_id,
+                        model_id=self.model_id,
+                    ),
                 ):
                     out = self.model(
                         cur_tok_in,
@@ -1026,6 +1162,8 @@ class DisaggregatedModel:
                             else None,
                             num_layers=num_layers,
                             upload_id=upload_id,
+                            model_id=self.model_id,
+                            lease_id=lease_id,
                         )
                         for l_idx, layer in enumerate(local_cache.layers)
                     ]
@@ -1102,16 +1240,23 @@ class DisaggregatedModel:
                                             else None,
                                             num_layers=num_layers,
                                             upload_id=upload_id,
+                                            model_id=self.model_id,
+                                            lease_id=lease_id,
                                         )
                                         for l_idx, layer in enumerate(local_cache.layers)
                                     ]
                                     with contextlib.suppress(BaseException):
                                         await asyncio.gather(*tasks)
 
-                        # 2b. Release session if requested
+                        # 2b. Release session or lease
                         if release_on_completion:
                             with contextlib.suppress(BaseException):
-                                await target_client.release_session(session_id)
+                                await target_client.release_session(
+                                    session_id, lease_id=lease_id
+                                )
+                        elif lease_acquired:
+                            with contextlib.suppress(BaseException):
+                                await target_client.release_lease(session_id, lease_id)
                 finally:
                     if curr_task is not None and hasattr(curr_task, "cancelling"):
                         for _ in range(cancelling_count):

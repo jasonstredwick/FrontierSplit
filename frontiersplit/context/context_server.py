@@ -63,6 +63,10 @@ MSG_MATCH_PREFIX_REQ = 0x26
 MSG_MATCH_PREFIX_RESP = 0x27
 MSG_APPEND_KV_REQ = 0x28
 MSG_APPEND_KV_RESP = 0x29
+MSG_ACQUIRE_LEASE_REQ = 0x2A
+MSG_ACQUIRE_LEASE_RESP = 0x2B
+MSG_RELEASE_LEASE_REQ = 0x2C
+MSG_RELEASE_LEASE_RESP = 0x2D
 
 # 16-byte fixed binary header: MAGIC (2B), msg_type (1B), flags (1B), meta_len (4B), payload_len (8B)
 CONTEXT_HEADER_FORMAT = "<2sBB I Q"
@@ -438,6 +442,7 @@ class _StagedUpload:
     token_ids: list[int] | None = None
     base_tokens: list[int] | None = None
     expected_layers: int | None = None
+    model_id: str | None = None
 
 
 class ContextServer:
@@ -449,11 +454,15 @@ class ContextServer:
         max_cached_tokens: int = 1_000_000,
         session_ttl_seconds: float = 600.0,
         expected_num_layers: int | None = None,
+        model_id: str | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.store = ContextStore(ttl_seconds=session_ttl_seconds)
-        self.prefix_cache = RadixPrefixCache(max_cached_tokens=max_cached_tokens)
+        self.max_cached_tokens = max_cached_tokens
         self.expected_num_layers = expected_num_layers
+        self.model_id = model_id
+        self._prefix_caches: dict[str, RadixPrefixCache] = {}
+        self._prefix_cache_lock = threading.Lock()
         self._known_layers: set[int] = (
             set(range(expected_num_layers))
             if expected_num_layers is not None and expected_num_layers > 0
@@ -461,19 +470,102 @@ class ContextServer:
         )
         self._session_expected_layers: dict[str, int] = {}
         self._session_tokens: dict[str, list[int]] = {}
+        self._session_model_ids: dict[str, str] = {}
         self._staged_uploads: dict[str, _StagedUpload] = {}
         self._committed_uploads: dict[str, set[str]] = {}
         self._session_leases: dict[str, str] = {}
-        self._pinned_sessions: dict[str, tuple[int, ...]] = {}
+        self._session_leases_lock = threading.Lock()
+        self._pinned_sessions: dict[str, tuple[str, tuple[int, ...]]] = {}
         self._server: asyncio.Server | None = None
         self._ttl_task: asyncio.Task[None] | None = None
         self._thread: threading.Thread | None = None
         self._thread_loop: asyncio.AbstractEventLoop | None = None
         self._active_tasks: set[asyncio.Task[Any]] = set()
 
-    def _walk_prefix_nodes(self, seq: tuple[int, ...]) -> list[Any]:
-        """Walks the Radix tree along `seq` without mutating or splitting nodes."""
-        curr = self.prefix_cache.root
+    def _resolve_model_id(
+        self,
+        model_id: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        if model_id is not None:
+            return model_id
+        if session_id is not None and session_id in self._session_model_ids:
+            return self._session_model_ids[session_id]
+        if self.model_id is not None:
+            return self.model_id
+        with self._prefix_cache_lock:
+            if len(self._prefix_caches) == 1:
+                return next(iter(self._prefix_caches.keys()))
+        return "default"
+
+    def _get_prefix_cache(
+        self,
+        model_id: str | None = None,
+        session_id: str | None = None,
+    ) -> RadixPrefixCache:
+        effective_id = self._resolve_model_id(model_id, session_id)
+        with self._prefix_cache_lock:
+            if effective_id not in self._prefix_caches:
+                self._prefix_caches[effective_id] = RadixPrefixCache(
+                    max_cached_tokens=self.max_cached_tokens,
+                )
+            return self._prefix_caches[effective_id]
+
+    @property
+    def prefix_cache(self) -> RadixPrefixCache:
+        """Returns the active/default RadixPrefixCache instance."""
+        with self._prefix_cache_lock:
+            if self.model_id is not None:
+                return self._get_prefix_cache(self.model_id)
+            if "default" in self._prefix_caches and len(self._prefix_caches) > 1:
+                return self._prefix_caches["default"]
+            if len(self._prefix_caches) == 1:
+                return next(iter(self._prefix_caches.values()))
+            return self._get_prefix_cache("default")
+
+    @prefix_cache.setter
+    def prefix_cache(self, cache: RadixPrefixCache) -> None:
+        effective_id = self.model_id or "default"
+        with self._prefix_cache_lock:
+            self._prefix_caches[effective_id] = cache
+
+    def acquire_lease(self, session_id: str, lease_id: str) -> bool:
+        """Acquires exclusive ownership of session_id for generation lease_id."""
+        with self._session_leases_lock:
+            current = self._session_leases.get(session_id)
+            if current is not None and current != lease_id:
+                return False
+            self._session_leases[session_id] = lease_id
+            return True
+
+    def release_lease(self, session_id: str, lease_id: str) -> bool:
+        """Releases ownership of session_id if held by lease_id."""
+        with self._session_leases_lock:
+            current = self._session_leases.get(session_id)
+            if current == lease_id:
+                self._session_leases.pop(session_id, None)
+                return True
+            return False
+
+    def _verify_lease(self, session_id: str, lease_id: str | None) -> None:
+        """Verifies that lease_id holds ownership of session_id, or claims it."""
+        with self._session_leases_lock:
+            current = self._session_leases.get(session_id)
+            if current is not None:
+                if lease_id is not None and current != lease_id:
+                    raise RuntimeError(
+                        f"Session '{session_id}' is leased by active generation '{current}'. "
+                        f"Overlapping requests targeting the same session must be serialized."
+                    )
+            elif lease_id is not None:
+                self._session_leases[session_id] = lease_id
+
+    def _walk_prefix_nodes(
+        self, seq: tuple[int, ...], model_id: str | None = None
+    ) -> list[Any]:
+        """Walks the Radix tree for model_id along `seq` without mutating or splitting nodes."""
+        prefix_cache = self._get_prefix_cache(model_id)
+        curr = prefix_cache.root
         pos = 0
         nodes = []
         while pos < len(seq):
@@ -487,24 +579,34 @@ class ContextServer:
         return nodes
 
     def _set_session_pin(
-        self, session_id: str, tokens: list[int] | tuple[int, ...]
+        self,
+        session_id: str,
+        tokens: list[int] | tuple[int, ...],
+        model_id: str | None = None,
     ) -> None:
         """Pins the RadixNode chain corresponding to `tokens` for `session_id`."""
+        eff_model_id = (
+            model_id
+            or self._session_model_ids.get(session_id)
+            or self.model_id
+            or "default"
+        )
         new_seq = tuple(tokens)
-        if self._pinned_sessions.get(session_id) == new_seq:
+        if self._pinned_sessions.get(session_id) == (eff_model_id, new_seq):
             return
         if session_id in self._pinned_sessions:
             self._clear_session_pin(session_id)
-        for node in self._walk_prefix_nodes(new_seq):
+        for node in self._walk_prefix_nodes(new_seq, model_id=eff_model_id):
             node.session_count += 1
-        self._pinned_sessions[session_id] = new_seq
+        self._pinned_sessions[session_id] = (eff_model_id, new_seq)
 
     def _clear_session_pin(self, session_id: str) -> None:
         """Unpins the RadixNode chain previously bound to `session_id`."""
-        old_seq = self._pinned_sessions.pop(session_id, None)
-        if old_seq is None:
+        old_val = self._pinned_sessions.pop(session_id, None)
+        if old_val is None:
             return
-        for node in self._walk_prefix_nodes(old_seq):
+        eff_model_id, old_seq = old_val
+        for node in self._walk_prefix_nodes(old_seq, model_id=eff_model_id):
             node.session_count = max(0, node.session_count - 1)
 
     def _required_layers_for_session(
@@ -549,8 +651,21 @@ class ContextServer:
             self._committed_uploads.setdefault(session_id, set()).add(state.upload_id)
         self._staged_uploads.pop(session_id, None)
 
+        eff_model_id = (
+            state.model_id
+            or self._session_model_ids.get(session_id)
+            or self.model_id
+            or "default"
+        )
+        self._session_model_ids[session_id] = eff_model_id
+        prefix_cache = self._get_prefix_cache(eff_model_id)
+
         # 2. Optional Prefix Cache Publication (requires token_ids)
         if state.token_ids is None or not state.token_ids:
+            # An append without token metadata introduces an unindexed gap (Issue 1).
+            # Invalidate session token sequence so subsequent partial appends cannot rebind
+            # or publish invalid prefixes over missing metadata.
+            self._session_tokens.pop(session_id, None)
             return
 
         k_dict = {l_i: kv[0] for l_i, kv in ready_layers.items()}
@@ -559,8 +674,8 @@ class ContextServer:
         if state.op == "register":
             full_tokens = list(state.token_ids)
             self._session_tokens[session_id] = full_tokens
-            nodes = self.prefix_cache.insert(full_tokens, k_dict, v_dict)
-            self._set_session_pin(session_id, full_tokens)
+            nodes = prefix_cache.insert(full_tokens, k_dict, v_dict)
+            self._set_session_pin(session_id, full_tokens, model_id=eff_model_id)
 
             # Rebind session store to canonical Radix nodes to eliminate duplicate allocations
             for l_i in ready_layers:
@@ -577,6 +692,8 @@ class ContextServer:
             for other_sid, other_toks in list(self._session_tokens.items()):
                 if other_sid == session_id or not self.store.has_session(other_sid):
                     continue
+                if self._session_model_ids.get(other_sid) != eff_model_id:
+                    continue
                 other_len = len(other_toks)
                 if (
                     0 < other_len <= target_len
@@ -585,7 +702,7 @@ class ContextServer:
                     other_layers = self.store.get_session_layer_chunks(other_sid) or {}
                     for l_i in ready_layers:
                         if l_i not in other_layers:
-                            matched_nodes, m_len = self.prefix_cache.match(other_toks)
+                            matched_nodes, m_len = prefix_cache.match(other_toks)
                             if m_len == other_len:
                                 c_chunks = [
                                     (n.k_cache[l_i], n.v_cache[l_i])
@@ -595,11 +712,21 @@ class ContextServer:
                                 if c_chunks:
                                     self.store.register_chunks(other_sid, l_i, c_chunks)
         else:
-            assert state.base_tokens is not None
+            if state.base_tokens is None:
+                return
+
+            sample_layer = next(iter(ready_layers.keys()))
+            total_stored_len = self.store.get_seq_len(session_id, sample_layer)
+            if len(state.base_tokens) + len(state.token_ids) != total_stored_len:
+                # Token metadata does not cover the complete stored sequence (a gap occurred).
+                # Preserve the live KV data in ContextStore and prohibit suffix publication.
+                self._session_tokens.pop(session_id, None)
+                return
+
             full_tokens = list(state.base_tokens) + list(state.token_ids)
             self._session_tokens[session_id] = full_tokens
 
-            inserted = self.prefix_cache.insert_delta(
+            inserted = prefix_cache.insert_delta(
                 base_tokens=state.base_tokens,
                 suffix_tokens=state.token_ids,
                 k_delta_by_layer=k_dict,
@@ -622,7 +749,7 @@ class ContextServer:
                             can_reconstruct = False
                             break
                     if can_reconstruct:
-                        nodes = self.prefix_cache.insert(full_tokens, full_k, full_v)
+                        nodes = prefix_cache.insert(full_tokens, full_k, full_v)
                         for l_i in ready_layers:
                             c_chunks = [
                                 (n.k_cache[l_i], n.v_cache[l_i])
@@ -632,7 +759,7 @@ class ContextServer:
                             if c_chunks:
                                 self.store.register_chunks(session_id, l_i, c_chunks)
             else:
-                nodes, m_len = self.prefix_cache.match(full_tokens)
+                nodes, m_len = prefix_cache.match(full_tokens)
                 if m_len == len(full_tokens):
                     for l_i in ready_layers:
                         c_chunks = [
@@ -643,7 +770,7 @@ class ContextServer:
                         if c_chunks:
                             self.store.register_chunks(session_id, l_i, c_chunks)
 
-            self._set_session_pin(session_id, full_tokens)
+            self._set_session_pin(session_id, full_tokens, model_id=eff_model_id)
 
     def register_prompt(
         self,
@@ -654,8 +781,18 @@ class ContextServer:
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
         upload_id: str | None = None,
+        model_id: str | None = None,
+        lease_id: str | None = None,
     ) -> None:
         """Registers a static prompt KV cache in memory and indexes into prefix cache."""
+        self._verify_lease(session_id, lease_id)
+        if self.model_id is not None and model_id is not None and self.model_id != model_id:
+            raise ValueError(
+                f"Mismatched model identity for ContextServer: expected '{self.model_id}', got '{model_id}'"
+            )
+        eff_model_id = model_id or self.model_id or "default"
+        self._session_model_ids[session_id] = eff_model_id
+
         self._known_layers.add(layer_idx)
         if num_layers is not None and num_layers > 0:
             self._session_expected_layers[session_id] = num_layers
@@ -667,6 +804,24 @@ class ContextServer:
 
         if upload_id is not None and upload_id in self._committed_uploads.get(session_id, set()):
             return
+
+        existing_layers = self.store.get_session_layer_chunks(session_id) or {}
+        # A prompt replacement occurs if this layer was already registered, or if seq_len changes
+        is_replacement = (
+            layer_idx in existing_layers
+            or (
+                bool(existing_layers)
+                and self.store.get_seq_len(
+                    session_id, next(iter(existing_layers))
+                )
+                != seq_len
+            )
+        )
+        if is_replacement:
+            self._clear_session_pin(session_id)
+            self._session_tokens.pop(session_id, None)
+            self.store.release_session(session_id)
+            self._staged_uploads.pop(session_id, None)
 
         state = self._staged_uploads.get(session_id)
         is_new_upload = (
@@ -683,15 +838,18 @@ class ContextServer:
             )
         )
         if is_new_upload:
-            self._clear_session_pin(session_id)
-            self._session_tokens.pop(session_id, None)
-            self.store.release_session(session_id)
             state = _StagedUpload(
                 upload_id=upload_id,
                 op="register",
                 seq_len=seq_len,
                 expected_layers=num_layers,
+                model_id=eff_model_id,
             )
+            # Preserve existing layers already in store for incremental registration (Issue 4)
+            for ex_l, (ex_k, ex_v) in (
+                self.store.get_session_layers(session_id) or {}
+            ).items():
+                state.layers[ex_l] = (ex_k, ex_v)
             self._staged_uploads[session_id] = state
 
         assert state is not None
@@ -699,6 +857,8 @@ class ContextServer:
             state.expected_layers = num_layers
         if token_ids is not None:
             state.token_ids = list(token_ids)
+        if model_id is not None:
+            state.model_id = model_id
         state.layers[layer_idx] = (k_dev, v_dev)
 
         self.store.register_prompt(
@@ -719,8 +879,23 @@ class ContextServer:
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
         upload_id: str | None = None,
+        model_id: str | None = None,
+        lease_id: str | None = None,
     ) -> int:
         """Appends a delta KV tensor slice to an active session cache."""
+        self._verify_lease(session_id, lease_id)
+        if self.model_id is not None and model_id is not None and self.model_id != model_id:
+            raise ValueError(
+                f"Mismatched model identity for ContextServer: expected '{self.model_id}', got '{model_id}'"
+            )
+        eff_model_id = (
+            model_id
+            or self._session_model_ids.get(session_id)
+            or self.model_id
+            or "default"
+        )
+        self._session_model_ids[session_id] = eff_model_id
+
         self._known_layers.add(layer_idx)
         if num_layers is not None and num_layers > 0:
             self._session_expected_layers[session_id] = num_layers
@@ -749,17 +924,22 @@ class ContextServer:
             )
         )
         if is_new_upload:
-            base_toks = (
-                list(self._session_tokens[session_id])
-                if session_id in self._session_tokens
-                else None
-            )
+            cur_stored_len = self.store.get_seq_len(session_id, layer_idx)
+            known_base = self._session_tokens.get(session_id)
+            if known_base is not None and len(known_base) != cur_stored_len:
+                # Gap detected between stored KV and token sequence (Issue 1)
+                self._session_tokens.pop(session_id, None)
+                base_toks = None
+            else:
+                base_toks = list(known_base) if known_base is not None else None
+
             state = _StagedUpload(
                 upload_id=upload_id,
                 op="append",
                 seq_len=delta_len,
                 base_tokens=base_toks,
                 expected_layers=num_layers,
+                model_id=eff_model_id,
             )
             self._staged_uploads[session_id] = state
 
@@ -769,6 +949,8 @@ class ContextServer:
             state.expected_layers = num_layers
         if token_ids is not None:
             state.token_ids = list(token_ids)
+        if model_id is not None:
+            state.model_id = model_id
 
         self._try_publish_staged_upload(session_id, state)
 
@@ -790,23 +972,36 @@ class ContextServer:
             self._session_expected_layers.pop(sid, None)
             self._committed_uploads.pop(sid, None)
             self._session_leases.pop(sid, None)
+            self._session_model_ids.pop(sid, None)
         return evicted
 
     def match_prefix(
         self,
         token_ids: list[int],
         target_session_id: str | None = None,
+        model_id: str | None = None,
+        lease_id: str | None = None,
     ) -> tuple[int, str | None]:
         """Matches a token sequence against cached prefixes in the Radix tree.
 
         Returns:
             Tuple of (matched_length, bound_session_id).
         """
+        if target_session_id is not None:
+            self._verify_lease(target_session_id, lease_id)
+            if self.model_id is not None and model_id is not None and self.model_id != model_id:
+                raise ValueError(
+                    f"Mismatched model identity for ContextServer: expected '{self.model_id}', got '{model_id}'"
+                )
+
+        eff_model_id = self._resolve_model_id(model_id, target_session_id)
+        prefix_cache = self._get_prefix_cache(eff_model_id)
+
         required = set(self._known_layers)
         if self.expected_num_layers is not None and self.expected_num_layers > 0:
             required |= set(range(self.expected_num_layers))
 
-        nodes, matched_len = self.prefix_cache.match(
+        nodes, matched_len = prefix_cache.match(
             token_ids, required_layers=required if required else None
         )
         if matched_len == 0 or not nodes:
@@ -832,6 +1027,8 @@ class ContextServer:
         session_id = (
             target_session_id or f"prefix-{abs(hash(tuple(token_ids[:matched_len]))):x}"
         )
+        self._verify_lease(session_id, lease_id)
+        self._session_model_ids[session_id] = eff_model_id
         matched_tokens = list(token_ids[:matched_len])
         self._staged_uploads.pop(session_id, None)
         self.store.release_session(session_id)
@@ -844,7 +1041,7 @@ class ContextServer:
             ]
             self.store.register_chunks(session_id, layer_idx, chunks)
 
-        self._set_session_pin(session_id, matched_tokens)
+        self._set_session_pin(session_id, matched_tokens, model_id=eff_model_id)
         return matched_len, session_id
 
     def query_partial_attention(
@@ -856,17 +1053,27 @@ class ContextServer:
         context_len: int | None = None,
         sliding_window: int | None = None,
         past_local_len: int = 0,
+        lease_id: str | None = None,
+        model_id: str | None = None,
     ) -> PartialAttentionChunk:
         """Computes partial attention for a given query against stored prompt KV chunks.
 
         Evaluates attention chunk-by-chunk using associative Online Softmax reduction,
         guaranteeing bit-for-bit exactness without contiguous memory copies.
         """
+        self._verify_lease(session_id, lease_id)
+        eff_model_id = (
+            model_id
+            or self._session_model_ids.get(session_id)
+            or self.model_id
+            or "default"
+        )
+        prefix_cache = self._get_prefix_cache(eff_model_id)
         chunks = self.store.get_chunks(session_id, layer_idx)
         if (chunks is None or len(chunks) == 0) and session_id in self._session_tokens:
             # Attempt lazy backfill from RadixPrefixCache if layer was published after match_prefix
             toks = self._session_tokens[session_id]
-            nodes, m_len = self.prefix_cache.match(toks)
+            nodes, m_len = prefix_cache.match(toks)
             if (
                 m_len == len(toks)
                 and nodes
@@ -999,6 +1206,7 @@ class ContextServer:
         self._session_expected_layers.pop(session_id, None)
         self._committed_uploads.pop(session_id, None)
         self._session_leases.pop(session_id, None)
+        self._session_model_ids.pop(session_id, None)
         return self.store.release_session(session_id)
 
     async def _handle_connection(
@@ -1030,6 +1238,8 @@ class ContextServer:
                     context_len = meta.get("context_len")
                     sliding_window = meta.get("sliding_window")
                     past_local_len = int(meta.get("past_local_len", 0))
+                    lease_id = meta.get("lease_id")
+                    model_id = meta.get("model_id")
                     q = deserialize_tensor(payload)
 
                     try:
@@ -1041,6 +1251,8 @@ class ContextServer:
                             context_len=context_len,
                             sliding_window=sliding_window,
                             past_local_len=past_local_len,
+                            lease_id=lease_id,
+                            model_id=model_id,
                         )
                         chunk_bytes = serialize_chunk(chunk)
                         resp = pack_context_frame(
@@ -1052,7 +1264,7 @@ class ContextServer:
                             },
                             chunk_bytes,
                         )
-                    except KeyError as e:
+                    except (KeyError, RuntimeError) as e:
                         resp = pack_context_frame(
                             MSG_QUERY_PARTIAL_RESP,
                             {
@@ -1072,26 +1284,42 @@ class ContextServer:
                     token_ids = meta.get("token_ids")
                     num_layers = meta.get("num_layers")
                     upload_id = meta.get("upload_id")
+                    lease_id = meta.get("lease_id")
+                    model_id = meta.get("model_id")
                     k_delta, v_delta = _deserialize_kv_pair(payload)
-                    new_len = self.append_kv(
-                        session_id=session_id,
-                        layer_idx=layer_idx,
-                        k_delta=k_delta,
-                        v_delta=v_delta,
-                        token_ids=token_ids,
-                        num_layers=num_layers,
-                        upload_id=upload_id,
-                    )
-                    resp = pack_context_frame(
-                        MSG_APPEND_KV_RESP,
-                        {
-                            "status": "ok",
-                            "session_id": session_id,
-                            "layer_idx": layer_idx,
-                            "new_len": new_len,
-                        },
-                        b"",
-                    )
+                    try:
+                        new_len = self.append_kv(
+                            session_id=session_id,
+                            layer_idx=layer_idx,
+                            k_delta=k_delta,
+                            v_delta=v_delta,
+                            token_ids=token_ids,
+                            num_layers=num_layers,
+                            upload_id=upload_id,
+                            model_id=model_id,
+                            lease_id=lease_id,
+                        )
+                        resp = pack_context_frame(
+                            MSG_APPEND_KV_RESP,
+                            {
+                                "status": "ok",
+                                "session_id": session_id,
+                                "layer_idx": layer_idx,
+                                "new_len": new_len,
+                            },
+                            b"",
+                        )
+                    except RuntimeError as e:
+                        resp = pack_context_frame(
+                            MSG_APPEND_KV_RESP,
+                            {
+                                "status": "error",
+                                "error": str(e),
+                                "session_id": session_id,
+                                "layer_idx": layer_idx,
+                            },
+                            b"",
+                        )
                     writer.write(resp)
                     await writer.drain()
 
@@ -1101,43 +1329,107 @@ class ContextServer:
                     token_ids = meta.get("token_ids")
                     num_layers = meta.get("num_layers")
                     upload_id = meta.get("upload_id")
+                    lease_id = meta.get("lease_id")
+                    model_id = meta.get("model_id")
                     k_tensor, v_tensor = _deserialize_kv_pair(payload)
-                    self.register_prompt(
-                        session_id,
-                        layer_idx,
-                        k_tensor,
-                        v_tensor,
-                        token_ids=token_ids,
-                        num_layers=num_layers,
-                        upload_id=upload_id,
-                    )
-
-                    resp = pack_context_frame(
-                        MSG_REGISTER_PROMPT_RESP,
-                        {
-                            "status": "ok",
-                            "session_id": session_id,
-                            "layer_idx": layer_idx,
-                        },
-                        b"",
-                    )
+                    try:
+                        self.register_prompt(
+                            session_id,
+                            layer_idx,
+                            k_tensor,
+                            v_tensor,
+                            token_ids=token_ids,
+                            num_layers=num_layers,
+                            upload_id=upload_id,
+                            model_id=model_id,
+                            lease_id=lease_id,
+                        )
+                        resp = pack_context_frame(
+                            MSG_REGISTER_PROMPT_RESP,
+                            {
+                                "status": "ok",
+                                "session_id": session_id,
+                                "layer_idx": layer_idx,
+                            },
+                            b"",
+                        )
+                    except RuntimeError as e:
+                        resp = pack_context_frame(
+                            MSG_REGISTER_PROMPT_RESP,
+                            {
+                                "status": "error",
+                                "error": str(e),
+                                "session_id": session_id,
+                                "layer_idx": layer_idx,
+                            },
+                            b"",
+                        )
                     writer.write(resp)
                     await writer.drain()
 
                 elif msg_type == MSG_MATCH_PREFIX_REQ:
                     token_ids = meta["token_ids"]
                     target_session_id = meta.get("session_id")
-                    matched_len, bound_session_id = self.match_prefix(
-                        token_ids=token_ids,
-                        target_session_id=target_session_id,
-                    )
+                    lease_id = meta.get("lease_id")
+                    model_id = meta.get("model_id")
+                    try:
+                        matched_len, bound_session_id = self.match_prefix(
+                            token_ids=token_ids,
+                            target_session_id=target_session_id,
+                            model_id=model_id,
+                            lease_id=lease_id,
+                        )
+                        resp = pack_context_frame(
+                            MSG_MATCH_PREFIX_RESP,
+                            {
+                                "status": "ok",
+                                "matched_len": matched_len,
+                                "session_id": bound_session_id,
+                                "req_session_id": target_session_id,
+                            },
+                            b"",
+                        )
+                    except RuntimeError as e:
+                        resp = pack_context_frame(
+                            MSG_MATCH_PREFIX_RESP,
+                            {
+                                "status": "error",
+                                "error": str(e),
+                                "matched_len": 0,
+                                "session_id": None,
+                                "req_session_id": target_session_id,
+                            },
+                            b"",
+                        )
+                    writer.write(resp)
+                    await writer.drain()
+
+                elif msg_type == MSG_ACQUIRE_LEASE_REQ:
+                    session_id = meta["session_id"]
+                    lease_id = meta["lease_id"]
+                    success = self.acquire_lease(session_id, lease_id)
                     resp = pack_context_frame(
-                        MSG_MATCH_PREFIX_RESP,
+                        MSG_ACQUIRE_LEASE_RESP,
+                        {
+                            "status": "ok" if success else "busy",
+                            "session_id": session_id,
+                            "leased": success,
+                        },
+                        b"",
+                    )
+                    writer.write(resp)
+                    await writer.drain()
+
+                elif msg_type == MSG_RELEASE_LEASE_REQ:
+                    session_id = meta["session_id"]
+                    lease_id = meta["lease_id"]
+                    success = self.release_lease(session_id, lease_id)
+                    resp = pack_context_frame(
+                        MSG_RELEASE_LEASE_RESP,
                         {
                             "status": "ok",
-                            "matched_len": matched_len,
-                            "session_id": bound_session_id,
-                            "req_session_id": target_session_id,
+                            "session_id": session_id,
+                            "released": success,
                         },
                         b"",
                     )
@@ -1146,16 +1438,30 @@ class ContextServer:
 
                 elif msg_type == MSG_RELEASE_SESSION_REQ:
                     session_id = meta["session_id"]
-                    evicted = self.release_session(session_id)
-                    resp = pack_context_frame(
-                        MSG_RELEASE_SESSION_RESP,
-                        {
-                            "status": "ok",
-                            "evicted": evicted,
-                            "session_id": session_id,
-                        },
-                        b"",
-                    )
+                    lease_id = meta.get("lease_id")
+                    try:
+                        self._verify_lease(session_id, lease_id)
+                        evicted = self.release_session(session_id)
+                        resp = pack_context_frame(
+                            MSG_RELEASE_SESSION_RESP,
+                            {
+                                "status": "ok",
+                                "evicted": evicted,
+                                "session_id": session_id,
+                            },
+                            b"",
+                        )
+                    except Exception as e:
+                        resp = pack_context_frame(
+                            MSG_RELEASE_SESSION_RESP,
+                            {
+                                "status": "error",
+                                "error": str(e),
+                                "evicted": False,
+                                "session_id": session_id,
+                            },
+                            b"",
+                        )
                     writer.write(resp)
                     await writer.drain()
 
@@ -1445,6 +1751,46 @@ class ContextClient:
             self.writer = None
             self.reader = None
 
+    async def acquire_lease(self, session_id: str, lease_id: str) -> bool:
+        """Acquires a session lease asynchronously over TCP."""
+        resp_meta, _ = await self._exchange_async(
+            MSG_ACQUIRE_LEASE_REQ,
+            MSG_ACQUIRE_LEASE_RESP,
+            {"session_id": session_id, "lease_id": lease_id},
+            b"",
+        )
+        return bool(resp_meta.get("leased", False))
+
+    def acquire_lease_sync(self, session_id: str, lease_id: str) -> bool:
+        """Acquires a session lease synchronously over TCP."""
+        resp_meta, _ = self._exchange_sync(
+            MSG_ACQUIRE_LEASE_REQ,
+            MSG_ACQUIRE_LEASE_RESP,
+            {"session_id": session_id, "lease_id": lease_id},
+            b"",
+        )
+        return bool(resp_meta.get("leased", False))
+
+    async def release_lease(self, session_id: str, lease_id: str) -> bool:
+        """Releases a session lease asynchronously over TCP."""
+        resp_meta, _ = await self._exchange_async(
+            MSG_RELEASE_LEASE_REQ,
+            MSG_RELEASE_LEASE_RESP,
+            {"session_id": session_id, "lease_id": lease_id},
+            b"",
+        )
+        return bool(resp_meta.get("released", False))
+
+    def release_lease_sync(self, session_id: str, lease_id: str) -> bool:
+        """Releases a session lease synchronously over TCP."""
+        resp_meta, _ = self._exchange_sync(
+            MSG_RELEASE_LEASE_REQ,
+            MSG_RELEASE_LEASE_RESP,
+            {"session_id": session_id, "lease_id": lease_id},
+            b"",
+        )
+        return bool(resp_meta.get("released", False))
+
     async def register_prompt(
         self,
         session_id: str,
@@ -1454,6 +1800,8 @@ class ContextClient:
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
         upload_id: str | None = None,
+        model_id: str | None = None,
+        lease_id: str | None = None,
     ) -> bool:
         """Registers a static prompt KV cache on the remote Context Server."""
         payload = _serialize_kv_pair(k, v)
@@ -1464,11 +1812,19 @@ class ContextClient:
             meta["num_layers"] = num_layers
         if upload_id is not None:
             meta["upload_id"] = upload_id
+        if model_id is not None:
+            meta["model_id"] = model_id
+        if lease_id is not None:
+            meta["lease_id"] = lease_id
 
         resp_meta, _ = await self._exchange_async(
             MSG_REGISTER_PROMPT_REQ, MSG_REGISTER_PROMPT_RESP, meta, payload
         )
-        return resp_meta.get("status") == "ok"
+        if resp_meta.get("status") != "ok":
+            raise RuntimeError(
+                f"Context Server error: {resp_meta.get('error', 'unknown error')}"
+            )
+        return True
 
     async def query_partial_attention(
         self,
@@ -1479,6 +1835,8 @@ class ContextClient:
         context_len: int | None = None,
         sliding_window: int | None = None,
         past_local_len: int = 0,
+        lease_id: str | None = None,
+        model_id: str | None = None,
     ) -> PartialAttentionChunk:
         """Queries the remote Context Server to compute partial attention over prompt."""
         payload = serialize_tensor(q)
@@ -1492,6 +1850,10 @@ class ContextClient:
         if sliding_window is not None:
             meta["sliding_window"] = sliding_window
             meta["past_local_len"] = past_local_len
+        if lease_id is not None:
+            meta["lease_id"] = lease_id
+        if model_id is not None:
+            meta["model_id"] = model_id
 
         resp_meta, resp_payload = await self._exchange_async(
             MSG_QUERY_PARTIAL_REQ, MSG_QUERY_PARTIAL_RESP, meta, payload
@@ -1511,6 +1873,8 @@ class ContextClient:
         context_len: int | None = None,
         sliding_window: int | None = None,
         past_local_len: int = 0,
+        lease_id: str | None = None,
+        model_id: str | None = None,
     ) -> None:
         """Sends a partial attention query frame over the synchronous TCP socket without blocking on response."""
         with self._sync_lock:
@@ -1528,6 +1892,10 @@ class ContextClient:
             if sliding_window is not None:
                 meta["sliding_window"] = sliding_window
                 meta["past_local_len"] = past_local_len
+            if lease_id is not None:
+                meta["lease_id"] = lease_id
+            if model_id is not None:
+                meta["model_id"] = model_id
 
             frame = pack_context_frame(MSG_QUERY_PARTIAL_REQ, meta, payload)
             try:
@@ -1577,6 +1945,8 @@ class ContextClient:
         context_len: int | None = None,
         sliding_window: int | None = None,
         past_local_len: int = 0,
+        lease_id: str | None = None,
+        model_id: str | None = None,
     ) -> PartialAttentionChunk:
         """Queries the remote Context Server synchronously over raw TCP socket."""
         with self._sync_lock:
@@ -1588,6 +1958,8 @@ class ContextClient:
                 context_len=context_len,
                 sliding_window=sliding_window,
                 past_local_len=past_local_len,
+                lease_id=lease_id,
+                model_id=model_id,
             )
             return self.recv_query_partial_sync(device=q.device)
 
@@ -1600,6 +1972,8 @@ class ContextClient:
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
         upload_id: str | None = None,
+        model_id: str | None = None,
+        lease_id: str | None = None,
     ) -> int:
         """Appends delta KV tensors to an active session cache on the Context Server."""
         payload = _serialize_kv_pair(k_delta, v_delta)
@@ -1610,6 +1984,10 @@ class ContextClient:
             meta["num_layers"] = num_layers
         if upload_id is not None:
             meta["upload_id"] = upload_id
+        if model_id is not None:
+            meta["model_id"] = model_id
+        if lease_id is not None:
+            meta["lease_id"] = lease_id
 
         resp_meta, _ = await self._exchange_async(
             MSG_APPEND_KV_REQ, MSG_APPEND_KV_RESP, meta, payload
@@ -1629,6 +2007,8 @@ class ContextClient:
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
         upload_id: str | None = None,
+        model_id: str | None = None,
+        lease_id: str | None = None,
     ) -> int:
         """Synchronously appends delta KV tensors over TCP."""
         payload = _serialize_kv_pair(k_delta, v_delta)
@@ -1639,6 +2019,10 @@ class ContextClient:
             meta["num_layers"] = num_layers
         if upload_id is not None:
             meta["upload_id"] = upload_id
+        if model_id is not None:
+            meta["model_id"] = model_id
+        if lease_id is not None:
+            meta["lease_id"] = lease_id
 
         resp_meta, _ = self._exchange_sync(
             MSG_APPEND_KV_REQ, MSG_APPEND_KV_RESP, meta, payload
@@ -1667,6 +2051,8 @@ class ContextClient:
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
         upload_id: str | None = None,
+        model_id: str | None = None,
+        lease_id: str | None = None,
     ) -> bool:
         """Synchronously registers static prompt KV cache for a layer over TCP."""
         payload = _serialize_kv_pair(k, v)
@@ -1677,21 +2063,35 @@ class ContextClient:
             meta["num_layers"] = num_layers
         if upload_id is not None:
             meta["upload_id"] = upload_id
+        if model_id is not None:
+            meta["model_id"] = model_id
+        if lease_id is not None:
+            meta["lease_id"] = lease_id
 
         resp_meta, _ = self._exchange_sync(
             MSG_REGISTER_PROMPT_REQ, MSG_REGISTER_PROMPT_RESP, meta, payload
         )
-        return resp_meta.get("status") == "ok"
+        if resp_meta.get("status") != "ok":
+            raise RuntimeError(
+                f"Context Server error: {resp_meta.get('error', 'unknown error')}"
+            )
+        return True
 
     async def match_prefix(
         self,
         token_ids: list[int],
         session_id: str | None = None,
+        model_id: str | None = None,
+        lease_id: str | None = None,
     ) -> tuple[int, str | None]:
         """Queries the Context Server for the longest matching cached token prefix."""
         meta: dict[str, Any] = {"token_ids": token_ids}
         if session_id is not None:
             meta["session_id"] = session_id
+        if model_id is not None:
+            meta["model_id"] = model_id
+        if lease_id is not None:
+            meta["lease_id"] = lease_id
 
         resp_meta, _ = await self._exchange_async(
             MSG_MATCH_PREFIX_REQ, MSG_MATCH_PREFIX_RESP, meta, b""
@@ -1706,11 +2106,17 @@ class ContextClient:
         self,
         token_ids: list[int],
         session_id: str | None = None,
+        model_id: str | None = None,
+        lease_id: str | None = None,
     ) -> tuple[int, str | None]:
         """Synchronously queries the Context Server for matching cached token prefix."""
         meta: dict[str, Any] = {"token_ids": token_ids}
         if session_id is not None:
             meta["session_id"] = session_id
+        if model_id is not None:
+            meta["model_id"] = model_id
+        if lease_id is not None:
+            meta["lease_id"] = lease_id
 
         resp_meta, _ = self._exchange_sync(
             MSG_MATCH_PREFIX_REQ, MSG_MATCH_PREFIX_RESP, meta, b""
@@ -1721,24 +2127,42 @@ class ContextClient:
             )
         return resp_meta.get("matched_len", 0), resp_meta.get("session_id")
 
-    def release_session_sync(self, session_id: str) -> bool:
+    def release_session_sync(
+        self, session_id: str, lease_id: str | None = None
+    ) -> bool:
         """Synchronously releases the prompt KV cache on the remote Context Server."""
+        meta = {"session_id": session_id}
+        if lease_id is not None:
+            meta["lease_id"] = lease_id
         resp_meta, _ = self._exchange_sync(
             MSG_RELEASE_SESSION_REQ,
             MSG_RELEASE_SESSION_RESP,
-            {"session_id": session_id},
+            meta,
             b"",
         )
+        if resp_meta.get("status") == "error":
+            raise RuntimeError(
+                f"Context Server error: {resp_meta.get('error', 'unknown error')}"
+            )
         return bool(resp_meta.get("evicted", False))
 
-    async def release_session(self, session_id: str) -> bool:
+    async def release_session(
+        self, session_id: str, lease_id: str | None = None
+    ) -> bool:
         """Releases the prompt KV cache on the remote Context Server."""
+        meta = {"session_id": session_id}
+        if lease_id is not None:
+            meta["lease_id"] = lease_id
         resp_meta, _ = await self._exchange_async(
             MSG_RELEASE_SESSION_REQ,
             MSG_RELEASE_SESSION_RESP,
-            {"session_id": session_id},
+            meta,
             b"",
         )
+        if resp_meta.get("status") == "error":
+            raise RuntimeError(
+                f"Context Server error: {resp_meta.get('error', 'unknown error')}"
+            )
         return bool(resp_meta.get("evicted", False))
 
 

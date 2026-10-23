@@ -720,3 +720,95 @@ def test_gateway_non_streaming_error_no_double_release(disagg_cluster) -> None:
     assert sess_id not in _session_locks
 
 
+def test_gateway_streaming_detokenization_punctuation_stability():
+    """Verify streaming detokenization preserves punctuation and matches non-streaming output exactly."""
+    token_vocab = {
+        0: "Hello",
+        1: " ,",
+        2: " world",
+        3: " !",
+    }
+
+    class PunctuationTokenizer:
+
+        def encode(self, text: str) -> list[int]:
+            return [0]
+
+        def decode(
+            self,
+            token_ids: list[int],
+            skip_special_tokens: bool = False,
+            clean_up_tokenization_spaces: bool = True,
+        ) -> str:
+            raw = "".join(token_vocab.get(t, "") for t in token_ids)
+            if clean_up_tokenization_spaces:
+                import re
+
+                raw = re.sub(r"\s+([,!?])", r"\1", raw)
+            return raw
+
+    tok = PunctuationTokenizer()
+
+    class MockDisaggModel:
+
+        def generate_stream(self, *args, **kwargs):
+            for t in [0, 1, 2, 3]:
+                yield t
+
+        async def generate_stream_async(self, *args, **kwargs):
+            for t in [0, 1, 2, 3]:
+                yield t
+
+        async def generate_async(self, *args, **kwargs):
+            return [0, 1, 2, 3]
+
+        def get_finish_reason(self):
+            return "stop"
+
+    app = create_gateway_app(
+        model_name="test-punct-model",
+        disaggregated_model=MockDisaggModel(),
+        context_client=None,
+        tokenizer=tok,
+    )
+    test_client = TestClient(app)
+
+    # 1. Non-streaming request
+    resp_non_stream = test_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-punct-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        },
+    )
+    assert resp_non_stream.status_code == 200
+    non_streaming_text = resp_non_stream.json()["choices"][0]["message"][
+        "content"
+    ]
+
+    # 2. Streaming request
+    resp_stream = test_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-punct-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+    assert resp_stream.status_code == 200
+    lines = [
+        line.strip() for line in resp_stream.text.split("\n") if line.strip()
+    ]
+    chunks = [json.loads(line.removeprefix("data: ")) for line in lines[:-1]]
+    streamed_text = "".join(
+        c["choices"][0]["delta"].get("content", "") for c in chunks
+    )
+
+    # Both non-streaming and streaming must preserve punctuation and match each other
+    assert "," in streamed_text
+    assert "!" in streamed_text
+    assert streamed_text == non_streaming_text
+
+
+

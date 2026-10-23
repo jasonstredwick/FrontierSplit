@@ -528,3 +528,104 @@ def test_canonical_radix_storage_sharing():
     # Verify identical underlying storage (zero memory duplicate)
     assert store_k.data_ptr() == radix_k.data_ptr()
 
+
+def test_gap_in_token_metadata_preserves_live_cache_and_prohibits_invalid_suffix():
+    """Verify that unindexed appends between indexed ones preserve the live KV store without truncation or publishing invalid prefix."""
+    server = ContextServer()
+    # 1. Register 5 indexed tokens
+    k5 = torch.randn(1, 2, 5, 16)
+    v5 = torch.randn(1, 2, 5, 16)
+    server.register_prompt(
+        "sess-gap", 0, k5, v5, token_ids=[1, 2, 3, 4, 5], num_layers=1
+    )
+    assert server.store.get_seq_len("sess-gap", 0) == 5
+
+    # 2. Append 2 tokens without metadata
+    k2 = torch.randn(1, 2, 2, 16)
+    v2 = torch.randn(1, 2, 2, 16)
+    server.append_kv("sess-gap", 0, k2, v2)
+    assert server.store.get_seq_len("sess-gap", 0) == 7
+
+    # 3. Append 1 token with metadata
+    k1 = torch.randn(1, 2, 1, 16)
+    v1 = torch.randn(1, 2, 1, 16)
+    server.append_kv("sess-gap", 0, k1, v1, token_ids=[8], num_layers=1)
+
+    # Cache length must reach 8 (5 -> 7 -> 8), NOT truncated to 6!
+    assert server.store.get_seq_len("sess-gap", 0) == 8
+
+    # Suffix [8] must NOT be published as a prefix attached directly to [1, 2, 3, 4, 5]
+    matched, _ = server.match_prefix([1, 2, 3, 4, 5, 8])
+    assert matched == 5  # Only matches [1..5], does not match 8 because of the gap
+
+
+def test_model_identity_isolation_on_shared_server():
+    """Verify that multiple models with distinct model_ids sharing a server have isolated prefix caches."""
+    server = ContextServer()
+    tokens = [10, 20, 30]
+    k_a = torch.randn(1, 2, 3, 16)
+    v_a = torch.randn(1, 2, 3, 16)
+    server.register_prompt(
+        "sess-model-a",
+        0,
+        k_a,
+        v_a,
+        token_ids=tokens,
+        num_layers=1,
+        model_id="model-a",
+    )
+
+    # Model B queries prefix for exact same tokens
+    matched_len, _ = server.match_prefix(tokens, model_id="model-b")
+    assert matched_len == 0
+
+    # Model A queries prefix
+    matched_len_a, _ = server.match_prefix(tokens, model_id="model-a")
+    assert matched_len_a == 3
+
+
+def test_server_side_session_lease_enforcement():
+    """Verify exclusive session lease ownership and prevention of overlapping access."""
+    server = ContextServer()
+    # Acquire lease for lease-1
+    assert server.acquire_lease("sess-lease", "lease-1") is True
+    # Duplicate lease with same lease_id succeeds
+    assert server.acquire_lease("sess-lease", "lease-1") is True
+    # Different lease_id fails
+    assert server.acquire_lease("sess-lease", "lease-2") is False
+
+    # Calling register_prompt with mismatched lease raises RuntimeError
+    k = torch.randn(1, 2, 4, 16)
+    v = torch.randn(1, 2, 4, 16)
+    with pytest.raises(
+        RuntimeError,
+        match="Session 'sess-lease' is leased by active generation 'lease-1'",
+    ):
+        server.register_prompt("sess-lease", 0, k, v, lease_id="lease-2")
+
+    # Releasing with wrong lease fails
+    assert server.release_lease("sess-lease", "lease-2") is False
+    # Releasing with correct lease succeeds
+    assert server.release_lease("sess-lease", "lease-1") is True
+    # Now lease-2 can be acquired
+    assert server.acquire_lease("sess-lease", "lease-2") is True
+
+
+def test_multilayer_registration_with_optional_defaults():
+    """Verify that registering multiple layers with optional defaults does not delete earlier layers."""
+    server = ContextServer()
+    k0 = torch.randn(1, 2, 4, 16)
+    v0 = torch.randn(1, 2, 4, 16)
+    k1 = torch.randn(1, 2, 4, 16)
+    v1 = torch.randn(1, 2, 4, 16)
+
+    # Register layer 0 without num_layers
+    server.register_prompt("sess-defaults-multi", 0, k0, v0)
+    assert server.store.get_prompt("sess-defaults-multi", 0) is not None
+
+    # Register layer 1 without num_layers
+    server.register_prompt("sess-defaults-multi", 1, k1, v1)
+    # Both layer 0 and layer 1 must exist
+    assert server.store.get_prompt("sess-defaults-multi", 0) is not None
+    assert server.store.get_prompt("sess-defaults-multi", 1) is not None
+

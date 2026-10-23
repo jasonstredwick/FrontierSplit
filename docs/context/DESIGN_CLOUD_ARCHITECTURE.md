@@ -401,8 +401,9 @@ spec:
           command: ["python", "-m", "frontiersplit.gateway"]
           args:
             - "--model-name=meta-llama/Llama-3-8B-Instruct"
-            - "--context-cluster=frontiersplit-context-headless:50060"
             - "--port=8000"
+            - "--stage0-tcp=frontiersplit-stage0:50051"
+            # Note: --context-cluster is an illustrative future configuration for multi-node context fabric routing
           ports:
             - containerPort: 8000
           readinessProbe:
@@ -431,7 +432,7 @@ spec:
       containers:
         - name: context-server
           image: ghcr.io/frontiersplit/frontiersplit:latest
-          command: ["python", "-m", "frontiersplit.context_server"]
+          command: ["python", "-m", "frontiersplit.context.context_server"]
           args:
             - "--host=0.0.0.0"
             - "--port=50060"

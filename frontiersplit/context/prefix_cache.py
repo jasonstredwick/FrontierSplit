@@ -60,21 +60,22 @@ class RadixNode:
         suffix_tokens = self.token_ids[split_idx:]
         prefix_tokens = self.token_ids[:split_idx]
 
+        # Preserve canonical immutable tensor storage via slice views (zero new memory allocation)
         suffix_k = {
-            layer: k[..., split_idx:, :].contiguous()
+            layer: k[..., split_idx:, :]
             for layer, k in self.k_cache.items()
         }
         suffix_v = {
-            layer: v[..., split_idx:, :].contiguous()
+            layer: v[..., split_idx:, :]
             for layer, v in self.v_cache.items()
         }
 
         prefix_k = {
-            layer: k[..., :split_idx, :].contiguous()
+            layer: k[..., :split_idx, :]
             for layer, k in self.k_cache.items()
         }
         prefix_v = {
-            layer: v[..., :split_idx, :].contiguous()
+            layer: v[..., :split_idx, :]
             for layer, v in self.v_cache.items()
         }
 

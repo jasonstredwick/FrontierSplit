@@ -988,4 +988,76 @@ def test_cancellation_drain_worker_thread_does_not_block_event_loop(
         server.stop_thread()
 
 
+def test_two_distinct_models_sharing_server_isolated_prefix_cache():
+    """Verify that two distinct models sharing a ContextServer do not cross-match or rebind to each other's KV."""
+    from transformers.cache_utils import DynamicCache
+
+    cfg = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+    )
+    torch.manual_seed(101)
+    model1 = LlamaForCausalLM(cfg)
+    model1.eval()
+
+    torch.manual_seed(202)
+    model2 = LlamaForCausalLM(cfg)
+    model2.eval()
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client1 = ContextClient(host="127.0.0.1", port=port)
+    client2 = ContextClient(host="127.0.0.1", port=port)
+
+    try:
+        disagg1 = DisaggregatedModel(model=model1, context_client=client1)
+        disagg2 = DisaggregatedModel(model=model2, context_client=client2)
+
+        assert disagg1.model_id != disagg2.model_id
+
+        prompt = torch.tensor([[5, 12, 19, 23]])
+
+        # Native generation for model 2
+        with torch.no_grad():
+            out2_native = []
+            cur = prompt
+            cache = DynamicCache()
+            for _ in range(4):
+                res = model2(cur, past_key_values=cache, use_cache=True)
+                tok = int(res.logits[:, -1, :].argmax(dim=-1).item())
+                out2_native.append(tok)
+                cur = torch.tensor([[tok]])
+
+        # Model 1 generates with release_on_completion=False so its prefix remains in ContextServer
+        disagg1.generate(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="sess-model1",
+            release_on_completion=False,
+            use_prefix_cache=False,
+        )
+
+        # Model 2 generates with the EXACT same prompt
+        out2_disagg = disagg2.generate(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="sess-model2",
+            release_on_completion=True,
+            use_prefix_cache=False,
+        )
+
+        # Model 2 MUST produce bit-for-bit identical tokens to its native output,
+        # and MUST NOT have its KV replaced or contaminated by Model 1's cached weights!
+        assert out2_disagg == out2_native
+    finally:
+        client1.close_sync()
+        client2.close_sync()
+        server.stop_thread()
+
+
+
 

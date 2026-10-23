@@ -300,9 +300,14 @@ def create_gateway_app(
         if tokenizer is None:
             return ""
         try:
-            return tokenizer.decode(token_ids, skip_special_tokens=True)
+            return tokenizer.decode(
+                token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
         except TypeError:
-            return tokenizer.decode(token_ids)
+            try:
+                return tokenizer.decode(token_ids, skip_special_tokens=True)
+            except TypeError:
+                return tokenizer.decode(token_ids)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
@@ -474,7 +479,7 @@ def create_gateway_app(
                             yield f"data: {json.dumps(role_chunk)}\n\n"
 
                             streamed_token_ids: list[int] = []
-                            emitted_len = 0
+                            emitted_text = ""
 
                             gen = disagg.generate_stream_async(
                                 input_ids=input_tensor,
@@ -496,17 +501,21 @@ def create_gateway_app(
                                         # Hold back trailing replacement char (\ufffd) until multi-token
                                         # UTF-8 character sequences complete.
                                         if decoded_so_far.endswith("\ufffd"):
-                                            stable_end = len(decoded_so_far.rstrip("\ufffd"))
+                                            stable_text = decoded_so_far.rstrip("\ufffd")
                                         else:
-                                            stable_end = len(decoded_so_far)
+                                            stable_text = decoded_so_far
 
-                                        if stable_end > emitted_len:
-                                            delta_text = decoded_so_far[emitted_len:stable_end]
-                                            emitted_len = stable_end
+                                        if stable_text.startswith(emitted_text):
+                                            delta_text = stable_text[len(emitted_text):]
+                                            emitted_text = stable_text
+                                        elif len(stable_text) > len(emitted_text):
+                                            delta_text = stable_text[len(emitted_text):]
+                                            emitted_text = stable_text
                                         else:
                                             delta_text = ""
                                     else:
                                         delta_text = str(token_id) + " "
+                                        emitted_text += delta_text
 
                                     if delta_text:
                                         chunk = {
@@ -528,7 +537,13 @@ def create_gateway_app(
 
                             if tok is not None and streamed_token_ids:
                                 final_decoded = _safe_decode(tok, streamed_token_ids)
-                                if len(final_decoded) > emitted_len:
+                                if final_decoded.startswith(emitted_text):
+                                    tail_text = final_decoded[len(emitted_text):]
+                                elif len(final_decoded) > len(emitted_text):
+                                    tail_text = final_decoded[len(emitted_text):]
+                                else:
+                                    tail_text = ""
+                                if tail_text:
                                     tail_chunk = {
                                         "id": req_id,
                                         "object": "chat.completion.chunk",
@@ -537,9 +552,7 @@ def create_gateway_app(
                                         "choices": [
                                             {
                                                 "index": 0,
-                                                "delta": {
-                                                    "content": final_decoded[emitted_len:]
-                                                },
+                                                "delta": {"content": tail_text},
                                                 "finish_reason": None,
                                             }
                                         ],
