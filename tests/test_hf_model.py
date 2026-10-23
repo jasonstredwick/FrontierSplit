@@ -646,3 +646,77 @@ def test_async_generation_does_not_block_event_loop(
         client.close_sync()
         server.stop_thread()
 
+
+def test_async_generation_cancellation_safety_and_cache_consistency(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify that cancelling during a forward pass cleanly finishes the thread and maintains consistent KV cache across layers."""
+    base_model, prompt, _ = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+    disagg = DisaggregatedModel(model=model, context_client=client)
+
+    # Injected sleep during layer 0 attention query to catch cancellation in mid-step
+    original_query = server.query_partial_attention
+
+    def delayed_query(session_id, layer_idx, *args, **kwargs):
+        import time
+
+        if layer_idx == 0:
+            time.sleep(0.03)  # 30ms delay on layer 0
+        return original_query(session_id, layer_idx, *args, **kwargs)
+
+    server.query_partial_attention = delayed_query
+
+    async def _run() -> None:
+        async def consume():
+            tokens = []
+            async for tok in disagg.generate_stream_async(
+                input_ids=prompt,
+                max_new_tokens=10,
+                session_id="cancel-sess",
+                release_on_completion=False,
+                reasoning_commit_threshold=2,
+            ):
+                tokens.append(tok)
+                if len(tokens) == 2:
+                    # Let the third token start, then pause slightly
+                    await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(consume())
+        # Wait until first 2 tokens are yielded and 3rd token forward is mid-flight
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Give background thread a moment to finish its shield wait
+        await asyncio.sleep(0.05)
+
+        # Verify that all layers in the session have consistent token counts
+        with server.store._lock:
+            sess = server.store._store.get("cancel-sess")
+            assert sess is not None, "Session should exist on server"
+            layer_lens = [
+                sum(k.shape[-2] for k, _ in chunks)
+                for layer_idx, chunks in sess.items()
+            ]
+            num_expected_layers = len(disagg.model.model.layers)
+            assert len(layer_lens) == num_expected_layers
+            assert all(l == layer_lens[0] for l in layer_lens), (
+                f"Layers desynchronized after cancellation: {layer_lens}"
+            )
+
+    try:
+        asyncio.run(_run())
+    finally:
+        client.close_sync()
+        server.stop_thread()
+
+

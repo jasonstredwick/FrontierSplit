@@ -8,6 +8,7 @@ and generate tokens using Online Softmax attention merging.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import contextvars
 import logging
@@ -177,35 +178,7 @@ class DisaggregatedAttentionPatcher:
         else:
             q_len = q.shape[-2]
             kv_len = k.shape[-2]
-            local_mask = attention_mask
-            if q_len > 1 or (sliding_window is not None and kv_len > sliding_window):
-                q_idx = torch.arange(kv_len - q_len, kv_len, device=q.device).unsqueeze(
-                    1
-                )
-                k_idx = torch.arange(0, kv_len, device=q.device).unsqueeze(0)
-                masked_out = k_idx > q_idx
-                if sliding_window is not None:
-                    masked_out = masked_out | (k_idx <= (q_idx - sliding_window))
-                if masked_out.any():
-                    built_mask = torch.where(
-                        masked_out,
-                        torch.full(
-                            (q_len, kv_len),
-                            float("-inf"),
-                            device=q.device,
-                            dtype=torch.float32,
-                        ),
-                        torch.zeros(
-                            (q_len, kv_len),
-                            device=q.device,
-                            dtype=torch.float32,
-                        ),
-                    ).view(1, 1, q_len, kv_len)
-                    local_mask = (
-                        built_mask
-                        if local_mask is None
-                        else local_mask.to(torch.float32) + built_mask
-                    )
+            is_causal = q_len > 1
 
             # Overlap remote TCP query with local partial attention compute
             sync_lock = getattr(client, "_sync_lock", contextlib.nullcontext())
@@ -225,7 +198,13 @@ class DisaggregatedAttentionPatcher:
                         )
                         # Compute local partial attention while Context Server computes remote chunk
                         local_chunk = compute_partial_attention(
-                            q, k, v, scale=scaling, attention_mask=local_mask
+                            q,
+                            k,
+                            v,
+                            scale=scaling,
+                            attention_mask=attention_mask,
+                            is_causal=is_causal,
+                            sliding_window=sliding_window,
                         )
                         prompt_chunk = client.recv_query_partial_sync(device=q.device)
                     except BaseException:
@@ -243,7 +222,13 @@ class DisaggregatedAttentionPatcher:
                     past_local_len=kv_len,
                 ).to(q.device)
                 local_chunk = compute_partial_attention(
-                    q, k, v, scale=scaling, attention_mask=local_mask
+                    q,
+                    k,
+                    v,
+                    scale=scaling,
+                    attention_mask=attention_mask,
+                    is_causal=is_causal,
+                    sliding_window=sliding_window,
                 )
 
             # Merge via Online Softmax
@@ -272,7 +257,14 @@ class DisaggregatedModel:
             f"frontiersplit_finish_reason_{id(self)}", default="stop"
         )
         self._patched = False
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="frontiersplit-forward"
+        )
         self._patch_layers()
+
+    def __del__(self) -> None:
+        if hasattr(self, "_executor"):
+            self._executor.shutdown(wait=False)
 
     def _set_finish_reason(self, reason: str) -> None:
         """Records the finish reason ('stop' or 'length') for the current generation."""
@@ -743,9 +735,18 @@ class DisaggregatedModel:
                 )
                 return outputs.past_key_values, tok
 
-        prompt_cache, next_token = await asyncio.to_thread(
+        active_prefill_fut = self._executor.submit(
             _run_prefill, input_ids, prompt_cache
         )
+        try:
+            prompt_cache, next_token = await asyncio.wrap_future(active_prefill_fut)
+        finally:
+            if not active_prefill_fut.done():
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(asyncio.wrap_future(active_prefill_fut))
+                if not active_prefill_fut.done():
+                    with contextlib.suppress(Exception):
+                        active_prefill_fut.result()
 
         prompt_len = input_ids.shape[1]
         tokens = input_ids[0].tolist()
@@ -816,6 +817,7 @@ class DisaggregatedModel:
         generated_tokens: list[int] = []
         local_cache: DynamicCache | None = None
         last_committed_idx = 0
+        active_forward_future: concurrent.futures.Future | None = None
 
         try:
             cache_hit = False
@@ -846,9 +848,11 @@ class DisaggregatedModel:
                             out_fast.logits, temperature=temperature, top_p=top_p
                         )
 
-                next_tok = await asyncio.to_thread(
+                active_forward_future = self._executor.submit(
                     _run_fast_prefill, last_tok, pos_tensor
                 )
+                next_tok = await asyncio.wrap_future(active_forward_future)
+                active_forward_future = None
             elif 0 < matched_len < base_prompt_len:
                 suffix_ids = input_ids[:, matched_len:]
                 suffix_pos = torch.arange(
@@ -876,9 +880,11 @@ class DisaggregatedModel:
                             top_p=top_p,
                         )
 
-                next_tok = await asyncio.to_thread(
+                active_forward_future = self._executor.submit(
                     _run_delta_prefill, suffix_ids, suffix_pos, suffix_cache
                 )
+                next_tok = await asyncio.wrap_future(active_forward_future)
+                active_forward_future = None
 
                 suffix_tokens = tokens[matched_len:]
                 num_layers = len(suffix_cache.layers)
@@ -940,9 +946,11 @@ class DisaggregatedModel:
                 position = base_prompt_len + step - 1
                 pos_tensor = torch.tensor([[position]], device=input_ids.device)
 
-                cur_tok = await asyncio.to_thread(
+                active_forward_future = self._executor.submit(
                     _run_decode_step, cur_tok, pos_tensor, local_cache
                 )
+                cur_tok = await asyncio.wrap_future(active_forward_future)
+                active_forward_future = None
                 tok_id = int(cur_tok.item())
                 generated_tokens.append(tok_id)
 
@@ -986,37 +994,55 @@ class DisaggregatedModel:
 
         finally:
             try:
+                # 1. If a forward worker thread is still executing, await it cleanly to completion
+                # so it does not mutate local_cache or query context servers concurrently.
+                if (
+                    active_forward_future is not None
+                    and not active_forward_future.done()
+                ):
+                    with contextlib.suppress(Exception):
+                        await asyncio.shield(asyncio.wrap_future(active_forward_future))
+                    if not active_forward_future.done():
+                        with contextlib.suppress(Exception):
+                            active_forward_future.result()
+
+                # 2. Consistent cache commit for retained sessions
                 if not release_on_completion:
                     total_generated = len(generated_tokens)
+                    completed_uncommitted = total_generated - last_committed_idx
                     if (
                         reasoning_commit_threshold > 0
                         and total_generated >= reasoning_commit_threshold
                         and local_cache is not None
                         and len(local_cache.layers) > 0
-                        and local_cache.layers[0].keys.shape[-2] > 0
+                        and completed_uncommitted > 0
                     ):
-                        rem_len = local_cache.layers[0].keys.shape[-2]
-                        chunk_tokens = generated_tokens[
-                            last_committed_idx : last_committed_idx + rem_len
-                        ]
-                        num_layers = len(local_cache.layers)
-                        upload_id = uuid.uuid4().hex
-                        tasks = [
-                            target_client.append_kv(
-                                session_id=session_id,
-                                layer_idx=l_idx,
-                                k_delta=layer.keys,
-                                v_delta=layer.values,
-                                token_ids=chunk_tokens
-                                if l_idx == num_layers - 1
-                                else None,
-                                num_layers=num_layers,
-                                upload_id=upload_id,
-                            )
-                            for l_idx, layer in enumerate(local_cache.layers)
-                        ]
-                        with contextlib.suppress(Exception):
-                            await asyncio.gather(*tasks)
+                        min_layer_len = min(
+                            layer.keys.shape[-2] for layer in local_cache.layers
+                        )
+                        valid_len = min(completed_uncommitted, min_layer_len)
+                        if valid_len > 0:
+                            chunk_tokens = generated_tokens[
+                                last_committed_idx : last_committed_idx + valid_len
+                            ]
+                            num_layers = len(local_cache.layers)
+                            upload_id = uuid.uuid4().hex
+                            tasks = [
+                                target_client.append_kv(
+                                    session_id=session_id,
+                                    layer_idx=l_idx,
+                                    k_delta=layer.keys[..., :valid_len, :],
+                                    v_delta=layer.values[..., :valid_len, :],
+                                    token_ids=chunk_tokens
+                                    if l_idx == num_layers - 1
+                                    else None,
+                                    num_layers=num_layers,
+                                    upload_id=upload_id,
+                                )
+                                for l_idx, layer in enumerate(local_cache.layers)
+                            ]
+                            with contextlib.suppress(Exception):
+                                await asyncio.gather(*tasks)
 
                 if release_on_completion:
                     with contextlib.suppress(Exception):

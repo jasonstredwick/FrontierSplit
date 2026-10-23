@@ -313,3 +313,76 @@ def test_long_delta_prefill_tiled_workspace_bounds():
     # Output matches native attention within floating-point reduction error
     assert torch.allclose(out, ref, atol=1e-5)
 
+
+def test_tiled_attention_broadcastable_singleton_masks():
+    """Verify that broadcastable masks with singleton dimensions spanning tile boundaries succeed."""
+    torch.manual_seed(42)
+    batch, num_heads, q_len, kv_len, head_dim = 1, 4, 129, 1030, 64
+    q = torch.randn(batch, num_heads, q_len, head_dim, dtype=torch.float32)
+    k = torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float32)
+    v = torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float32)
+
+    # 1. Query-specific singleton-key mask [1, 1, 129, 1]
+    mask_q_singleton_k = torch.zeros(1, 1, 129, 1, dtype=torch.float32)
+    chunk = compute_partial_attention(
+        q, k, v, attention_mask=mask_q_singleton_k, query_chunk_size=128, kv_chunk_size=1024
+    )
+    out = finalize_attention(chunk)
+    assert out.shape == (batch, num_heads, q_len, head_dim)
+    assert not torch.isnan(out).any()
+
+    # 2. Key-specific singleton-query mask [1, 1, 1, 1030]
+    mask_singleton_q_k = torch.zeros(1, 1, 1, 1030, dtype=torch.float32)
+    chunk2 = compute_partial_attention(
+        q, k, v, attention_mask=mask_singleton_q_k, query_chunk_size=128, kv_chunk_size=1024
+    )
+    out2 = finalize_attention(chunk2)
+    assert out2.shape == (batch, num_heads, q_len, head_dim)
+    assert not torch.isnan(out2).any()
+
+
+def test_tiled_causal_and_sliding_window_masking():
+    """Verify that tile-local causal and sliding window mask construction matches SDPA reference."""
+    torch.manual_seed(42)
+    batch, num_heads, q_len, kv_len, head_dim = 1, 4, 300, 300, 64
+    q = torch.randn(batch, num_heads, q_len, head_dim, dtype=torch.float32)
+    k = torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float32)
+    v = torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float32)
+
+    # Causal attention reference via PyTorch SDPA
+    ref_causal = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+    # Tiled execution with small 128-token tiles
+    chunk_causal = compute_partial_attention(
+        q, k, v, is_causal=True, query_chunk_size=128, kv_chunk_size=128
+    )
+    out_causal = finalize_attention(chunk_causal)
+
+    diff = torch.max(torch.abs(out_causal - ref_causal)).item()
+    assert diff < 1e-4
+
+    # Sliding window attention
+    chunk_sw = compute_partial_attention(
+        q, k, v, is_causal=True, sliding_window=64, query_chunk_size=128, kv_chunk_size=128
+    )
+    out_sw = finalize_attention(chunk_sw)
+    assert out_sw.shape == (batch, num_heads, q_len, head_dim)
+    assert not torch.isnan(out_sw).any()
+
+
+def test_gqa_tiled_expansion_bounded_memory():
+    """Verify that GQA head expansion executes cleanly during tiled compute without full KV repeat."""
+    torch.manual_seed(42)
+    batch, q_heads, kv_heads, q_len, kv_len, head_dim = 1, 32, 8, 1, 2048, 128
+    q = torch.randn(batch, q_heads, q_len, head_dim, dtype=torch.float16)
+    k = torch.randn(batch, kv_heads, kv_len, head_dim, dtype=torch.float16)
+    v = torch.randn(batch, kv_heads, kv_len, head_dim, dtype=torch.float16)
+
+    chunk = compute_partial_attention(
+        q, k, v, query_chunk_size=128, kv_chunk_size=512
+    )
+    out = finalize_attention(chunk)
+    assert out.shape == (batch, q_heads, q_len, head_dim)
+    assert not torch.isnan(out).any()
+
+

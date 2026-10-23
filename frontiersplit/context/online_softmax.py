@@ -96,6 +96,15 @@ def _compute_partial_attention_block(
     orig_dtype: torch.dtype,
 ) -> PartialAttentionChunk:
     """Computes partial attention over a single bounded workspace block."""
+    batch_size, num_heads, q_len, head_dim = q.shape
+    _, num_kv_heads, kv_len, _ = k.shape
+
+    # Expand KV heads for GQA locally on this block (bounded to block size, e.g. <=1024 tokens)
+    if num_heads != num_kv_heads:
+        n_rep = num_heads // num_kv_heads
+        k = repeat_kv(k, n_rep)
+        v = repeat_kv(v, n_rep)
+
     with _fp32_precision_guard(q.device):
         scores = (
             torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32))
@@ -129,20 +138,24 @@ def compute_partial_attention(
     v: torch.Tensor,
     scale: float | None = None,
     attention_mask: torch.Tensor | None = None,
+    is_causal: bool = False,
+    sliding_window: int | None = None,
     query_chunk_size: int = 128,
     kv_chunk_size: int = 1024,
 ) -> PartialAttentionChunk:
     """Computes partial attention against a chunk of keys and values.
 
     Tiles query and KV dimensions to ensure intermediate workspace matrices
-    (attention scores and softmax probabilities) remain bounded in memory.
+    (attention scores, GQA expansion, and causal masks) remain bounded in memory.
 
     Args:
         q: Query tensor of shape `[batch, num_heads, q_len, head_dim]`.
         k: Key tensor of shape `[batch, num_kv_heads, kv_len, head_dim]`.
         v: Value tensor of shape `[batch, num_kv_heads, kv_len, head_dim]`.
         scale: Softmax temperature scale factor (default: 1 / sqrt(head_dim)).
-        attention_mask: Optional mask of shape `[batch, 1, q_len, kv_len]`.
+        attention_mask: Optional mask broadcastable to `[batch, 1, q_len, kv_len]`.
+        is_causal: If True, applies causal lower-triangular masking within tiles.
+        sliding_window: Optional Mistral-style local attention window size.
         query_chunk_size: Maximum query tokens per tiled workspace block (default: 128).
         kv_chunk_size: Maximum KV tokens per tiled workspace block (default: 1024).
 
@@ -154,12 +167,6 @@ def compute_partial_attention(
 
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
-
-    # Support GQA: expand KV heads if num_heads != num_kv_heads
-    if num_heads != num_kv_heads:
-        n_rep = num_heads // num_kv_heads
-        k = repeat_kv(k, n_rep)
-        v = repeat_kv(v, n_rep)
 
     orig_dtype = q.dtype
 
@@ -187,8 +194,33 @@ def compute_partial_attention(
     # For bounded workloads (e.g. single decode query q_len=1 against <=1024 cache),
     # evaluate directly without tile iteration overhead.
     if q_len <= query_chunk_size and kv_len <= kv_chunk_size:
+        local_mask = attention_mask
+        if is_causal or sliding_window is not None:
+            q_pos = (kv_len - q_len) + torch.arange(
+                q_len, device=q.device
+            ).unsqueeze(1)
+            k_pos = torch.arange(kv_len, device=q.device).unsqueeze(0)
+            masked_out = None
+            if is_causal:
+                masked_out = k_pos > q_pos
+            if sliding_window is not None:
+                sw_masked = k_pos <= (q_pos - sliding_window)
+                masked_out = (
+                    sw_masked if masked_out is None else (masked_out | sw_masked)
+                )
+            if masked_out is not None and masked_out.any():
+                tile_mask = torch.where(
+                    masked_out,
+                    torch.tensor(float("-inf"), dtype=torch.float32, device=q.device),
+                    torch.tensor(0.0, dtype=torch.float32, device=q.device),
+                ).view(1, 1, q_len, kv_len)
+                local_mask = (
+                    tile_mask
+                    if local_mask is None
+                    else local_mask.to(torch.float32) + tile_mask
+                )
         return _compute_partial_attention_block(
-            q, k, v, scale, attention_mask, orig_dtype
+            q, k, v, scale, local_mask, orig_dtype
         )
 
     # Tile both query and KV dimensions to strictly bound intermediate memory workspace:
@@ -196,32 +228,147 @@ def compute_partial_attention(
     q_chunks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     for q_start in range(0, q_len, query_chunk_size):
         q_end = min(q_start + query_chunk_size, q_len)
+        q_block_len = q_end - q_start
         q_block = q[:, :, q_start:q_end, :]
 
         acc_q: torch.Tensor | None = None
         max_q: torch.Tensor | None = None
         sum_q: torch.Tensor | None = None
 
+        last_q_pos = (kv_len - q_len) + q_end - 1
+
         for kv_start in range(0, kv_len, kv_chunk_size):
             kv_end = min(kv_start + kv_chunk_size, kv_len)
+            kv_block_len = kv_end - kv_start
             k_block = k[:, :, kv_start:kv_end, :]
             v_block = v[:, :, kv_start:kv_end, :]
 
+            # Independent axis mask slicing preserving singleton dimensions
             mask_block: torch.Tensor | None = None
             if attention_mask is not None:
-                if (
-                    attention_mask.shape[-2] == q_len
-                    and attention_mask.shape[-1] == kv_len
-                ):
-                    mask_block = attention_mask[..., q_start:q_end, kv_start:kv_end]
-                elif attention_mask.shape[-1] == kv_len:
-                    mask_block = attention_mask[..., :, kv_start:kv_end]
+                if attention_mask.dim() >= 2:
+                    mask_q = attention_mask.shape[-2]
+                    mask_k = attention_mask.shape[-1]
+                    q_sl = slice(q_start, q_end) if mask_q == q_len else slice(None)
+                    k_sl = slice(kv_start, kv_end) if mask_k == kv_len else slice(None)
+                    mask_block = attention_mask[..., q_sl, k_sl]
+                elif attention_mask.dim() == 1:
+                    k_sl = (
+                        slice(kv_start, kv_end)
+                        if attention_mask.shape[-1] == kv_len
+                        else slice(None)
+                    )
+                    mask_block = attention_mask[k_sl]
                 else:
                     mask_block = attention_mask
 
-            block_res = _compute_partial_attention_block(
-                q_block, k_block, v_block, scale, mask_block, orig_dtype
-            )
+            # Fast check: if strictly upper triangular (all keys in tile are in the future of all queries in tile)
+            if is_causal and kv_start > last_q_pos:
+                block_res = PartialAttentionChunk(
+                    accumulator=torch.zeros(
+                        (batch_size, num_heads, q_block_len, head_dim),
+                        dtype=torch.float32,
+                        device=q.device,
+                    ),
+                    max_score=torch.full(
+                        (batch_size, num_heads, q_block_len, 1),
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=q.device,
+                    ),
+                    sum_exp=torch.zeros(
+                        (batch_size, num_heads, q_block_len, 1),
+                        dtype=torch.float32,
+                        device=q.device,
+                    ),
+                    dtype=orig_dtype,
+                )
+            else:
+                if is_causal or sliding_window is not None:
+                    q_pos = (kv_len - q_len + q_start) + torch.arange(
+                        q_block_len, device=q.device
+                    ).unsqueeze(1)
+                    k_pos = kv_start + torch.arange(
+                        kv_block_len, device=q.device
+                    ).unsqueeze(0)
+
+                    tile_masked_out = None
+                    if is_causal:
+                        tile_masked_out = k_pos > q_pos
+                    if sliding_window is not None:
+                        sw_masked = k_pos <= (q_pos - sliding_window)
+                        tile_masked_out = (
+                            sw_masked
+                            if tile_masked_out is None
+                            else (tile_masked_out | sw_masked)
+                        )
+
+                    if tile_masked_out is not None and tile_masked_out.any():
+                        if tile_masked_out.all():
+                            block_res = PartialAttentionChunk(
+                                accumulator=torch.zeros(
+                                    (batch_size, num_heads, q_block_len, head_dim),
+                                    dtype=torch.float32,
+                                    device=q.device,
+                                ),
+                                max_score=torch.full(
+                                    (batch_size, num_heads, q_block_len, 1),
+                                    float("-inf"),
+                                    dtype=torch.float32,
+                                    device=q.device,
+                                ),
+                                sum_exp=torch.zeros(
+                                    (batch_size, num_heads, q_block_len, 1),
+                                    dtype=torch.float32,
+                                    device=q.device,
+                                ),
+                                dtype=orig_dtype,
+                            )
+                        else:
+                            tile_mask = torch.where(
+                                tile_masked_out,
+                                torch.tensor(
+                                    float("-inf"),
+                                    dtype=torch.float32,
+                                    device=q.device,
+                                ),
+                                torch.tensor(
+                                    0.0,
+                                    dtype=torch.float32,
+                                    device=q.device,
+                                ),
+                            ).view(1, 1, q_block_len, kv_block_len)
+                            mask_block = (
+                                tile_mask
+                                if mask_block is None
+                                else mask_block.to(torch.float32) + tile_mask
+                            )
+                            block_res = _compute_partial_attention_block(
+                                q_block,
+                                k_block,
+                                v_block,
+                                scale,
+                                mask_block,
+                                orig_dtype,
+                            )
+                    else:
+                        block_res = _compute_partial_attention_block(
+                            q_block,
+                            k_block,
+                            v_block,
+                            scale,
+                            mask_block,
+                            orig_dtype,
+                        )
+                else:
+                    block_res = _compute_partial_attention_block(
+                        q_block,
+                        k_block,
+                        v_block,
+                        scale,
+                        mask_block,
+                        orig_dtype,
+                    )
 
             if acc_q is None or max_q is None or sum_q is None:
                 acc_q = block_res.accumulator

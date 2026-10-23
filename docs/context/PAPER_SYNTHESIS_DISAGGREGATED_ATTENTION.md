@@ -70,11 +70,12 @@ To preserve numerical stability and prevent exponent underflow/overflow during m
 | **Partial Accumulator ($A_p$)** | $[1, 32, 1, 128]$ | FP32 (4 bytes) | **$16{,}384\text{ bytes}$ ($16.0\text{ KB}$)** |
 | **Max Logit Vector ($m_p$)** | $[1, 32, 1, 1]$ | FP32 (4 bytes) | **$128\text{ bytes}$** |
 | **Sum-of-Exp Vector ($\ell_p$)** | $[1, 32, 1, 1]$ | FP32 (4 bytes) | **$128\text{ bytes}$** |
-| **Serialized Chunk Metadata** | Inner tensor descriptor JSON | — | **$\sim 79\text{ bytes}$** |
+| **Serialized Chunk Metadata** | Inner tensor descriptor headers | — | **$79\text{ bytes}$** |
 | **Inner Serialized Chunk Payload** | Tensors + chunk descriptor | — | **$16{,}719\text{ bytes}$ ($16.33\text{ KB}$)** |
-| **Outer TCP Frame Header & Framing** | 16-byte fixed binary header (`MAGIC`, `MSG_TYPE`, `PAYLOAD_LEN`) | — | **$16\text{ bytes}$** |
-| **Total RPC Response Wire Size** | Payload + outer framing | — | **$\approx 16{,}735\text{ bytes}$ ($16.34\text{ KB}$)** |
-| **Total Roundtrip Wire Footprint** | Send ($\approx 8{,}208\text{ B}$) + Receive ($\approx 16{,}735\text{ B}$) | | **$\approx 24{,}943\text{ bytes}$ ($24.36\text{ KB}$)** |
+| **Outer TCP Frame Header** | 16-byte fixed binary header (`MAGIC`, `MSG_TYPE`, `FLAGS`, `META_LEN`, `PAYLOAD_LEN`) | — | **$16\text{ bytes}$** |
+| **Outer Frame JSON Metadata** | Envelope metadata (`status`, `session_id`, `layer_idx`) | — | **$\approx 51\text{ bytes}$** (e.g. `session_id="s"`) |
+| **Total RPC Response Wire Size** | Outer header + JSON metadata + binary payload | — | **$\mathbf{16{,}786\text{ bytes}}$ ($16.39\text{ KB}$)** |
+| **Total Roundtrip Wire Footprint** | Send ($\approx 8{,}275\text{ B}$) + Receive ($16{,}786\text{ B}$) | — | **$\approx 25{,}061\text{ bytes}$ ($24.47\text{ KB}$)** |
 
 ### GQA KV Cache Sizing & Bandwidth Comparison
 
@@ -283,37 +284,38 @@ A critical operational principle of the distributed context fabric is the distin
    - **Intra-Message Layer Serialization**: In autoregressive transformers, layers are evaluated strictly sequentially ($L_0 \to \text{MLP}_0 \to L_1 \to \dots \to L_{L-1}$). While layer $i$ is computing, the remaining $L-1$ layer caches sit completely dormant in VRAM. Co-locating all $L$ layer caches for a session on the same Context Server consumes memory capacity but introduces **zero instantaneous compute contention**.
    - **Temporal Interleaving Across MLP Cycles**: During the compute worker's feed-forward MLP computation ($T_{\text{MLP}}$) and inter-stage activation transfers, the message's KV cache is idle. During this execution window, the Context Server interleaves attention queries from staggered message streams, achieving near-100% duty cycle of both the HBM memory bus and the systolic compute fabric.
 
-### 6.5 Multi-User Allocation: Compute Unit Saturation ($K_{\text{sat}}$) and Machine Sizing [Architectural Model]
+### 6.5 Multi-User Allocation: Compute Unit Saturation Proxy ($K_{\text{sat}}$) and Machine Sizing [Architectural Heuristic]
 
-The hardware saturation threshold, denoted $K_{\text{sat}}$, defines the total number of sequence tokens (and chunks) required to simultaneously saturate **all physical compute units on a single machine** in a single execution pass:
+To guide memory allocation across multi-tenant context shards, we define an empirical hardware-guided tuning threshold, denoted $K_{\text{sat}}$. It serves as an operational proxy for estimating the sequence context required to fill the parallel compute pipelines on a single accelerator:
 
-$$K_{\text{sat}} = T_{\text{line}} \times R_{\text{unit}} \times U_{\text{compute}}$$
+$$K_{\text{sat}} \approx T_{\text{tile}} \times R_{\text{unit}} \times U_{\text{compute}}$$
 
-where:
-- $T_{\text{line}} = 128$ tokens (Tier 1: inner contracting dimension / `head_dim`).
-- $R_{\text{unit}} = 128$ rows (Tier 2: rows per physical compute unit or systolic array).
-- $U_{\text{compute}}$ is the number of independent parallel compute units per chip/machine (Tier 3: physical hardware multiplier).
+> [!NOTE]
+> **Mathematical Distinction: Contracting vs. Sequence Dimensions**:
+> In attention score calculation ($S = Q K^T$), the head dimension $d = 128$ represents the inner *contracting* feature dimension along which dot products are accumulated ($[1, d] \times [d, N]$). The sequence length $N$, in contrast, spans the outer matrix dimension. Array geometry alone does not establish a theoretical guarantee of single-wave execution or full ALU saturation, as actual wave occupancy, memory stalls, and hardware duty cycles depend on compiler lowering (e.g., XLA, Triton), batching, head counts, and kernel fusion. Thus, $K_{\text{sat}}$ is treated as an **empirical scheduling heuristic and tuning assumption** rather than an analytical proof of hardware saturation.
 
-#### Hardware Instantiations:
+#### Hardware Architecture Mapping:
 - **Google TPU v2 / TPU v3**: Each chip hosts $2\text{ cores} \times 2\text{ MXUs} = 4\text{ MXUs}$ ($U_{\text{compute}} = 4$).
+  With $128 \times 128$ systolic arrays, nominal single-pass heuristic:
   $$K_{\text{sat}} = 128 \times 128 \times 4 = \mathbf{65{,}536\text{ tokens (512 chunks of 128)}}$$
-- **Google TPU v4**: Each chip hosts $2\text{ cores} \times 2\text{ dual-MXUs} = 4\text{ MXU equivalents}$ ($K_{\text{sat}} = 65{,}536\text{ tokens}$).
+- **Google TPU v4**: Google's TPU v4 architecture provisions **2 TensorCores per chip**, with **4 MXUs each** (total **8 MXUs** of $128 \times 128$ systolic arrays per chip, yielding 275 TFLOPS peak bf16/int8). At $U_{\text{compute}} = 8$, full-chip systolic tiling corresponds to nominal heuristic $K_{\text{sat}} = 128 \times 128 \times 8 = \mathbf{131{,}072\text{ tokens}}$.
 - **NVIDIA GPU (e.g. A100 / H100)**: With $N_{\text{SM}}$ Streaming Multiprocessors (108 SMs on A100, 132 SMs on H100) running 128-token chunk warps:
-  $$K_{\text{sat}} = 128 \times N_{\text{SM}} = \mathbf{13{,}824\text{ tokens (108 chunks per wave on A100)}}$$
+  $$K_{\text{sat}} \approx 128 \times N_{\text{SM}} = \mathbf{13{,}824\text{ tokens (108 chunks per wave on A100)}}$$
 
 #### Parallelism Modes Across $U_{\text{compute}}$:
-1. **Pure Sequence Parallelism (Split-K for $N \ge K_{\text{sat}}$)**: A single long context is partitioned across all $U_{\text{compute}}$ units simultaneously. For example, on a 4-MXU TPU, 512 chunks are mapped 128 chunks per MXU, executing in a single parallel sweep.
-2. **Hybrid Sequence + Head Parallelism ($N < K_{\text{sat}}$)**: When context length is below full-chip saturation, multi-head parallelism distributes Grouped-Query Attention (GQA) heads across idle compute units. For instance, in Mistral ($H_{\text{kv}} = 8$ heads) on a $16{,}384$-token prompt, each of the 4 MXUs evaluates 2 KV heads over 128 chunks, maintaining full hardware utilization without ALU idling.
+1. **Pure Sequence Parallelism (Split-K for $N \ge K_{\text{sat}}$)**: A single long context is partitioned across parallel compute units simultaneously (e.g., mapping chunk ranges to independent MXUs or SM thread blocks).
+2. **Hybrid Sequence + Head Parallelism ($N < K_{\text{sat}}$)**: When context length is below the nominal single-chip tuning threshold, multi-head parallelism distributes Grouped-Query Attention (GQA) heads across idle compute units (e.g., Mistral with $H_{\text{kv}} = 8$ heads evaluating 2 heads per MXU on a 4-MXU core) to maintain execution throughput.
 
 #### Machine VRAM Provisioning in Units of $K_{\text{sat}}$:
+While single-wave saturation thresholds serve as empirical heuristics, the **byte-capacity calculations stand independently and mathematically exact**:
 For a 32-layer transformer with GQA ($H_{\text{kv}} = 8$, $d = 128$, FP16 format = 4 KB per token across all layers):
-- One full $K_{\text{sat}}$ block ($65{,}536$ tokens) consumes:
+- A nominal $65{,}536$-token context block consumes:
   $$65{,}536 \text{ tokens} \times 4{,}096\text{ bytes/token} = \mathbf{268.4\text{ MB per layer}} \times 32\text{ layers} \approx \mathbf{8.59\text{ GB}}$$
-- On a 32 GB HBM/VRAM Context Server, the node cleanly provisions **3 full $K_{\text{sat}}$ blocks** ($\sim 25.8\text{ GB}$), leaving $\sim 6.2\text{ GB}$ of high-speed memory for operating system buffers, prefix trie lookup tables, and dynamic reasoning trace delta allocations.
+- On a 32 GB HBM/VRAM Context Server, the node cleanly provisions **3 full $65\text{k}$-token blocks** ($\sim 25.8\text{ GB}$), leaving $\sim 6.2\text{ GB}$ of high-speed memory for operating system buffers, prefix trie lookup tables, and dynamic reasoning trace delta allocations.
 - **Sizing Spectrum**:
-  1. **Under-Saturation ($< K_{\text{sat}}$ tokens per machine)**: Leaves compute units stranded unless head parallelism or multi-tenant interleaving fills vacant units.
-  2. **Saturated Allocation ($K_{\text{sat}}$ chunks per machine) — [Target Architecture]**: Context allocated in clean integer multiples of $K_{\text{sat}}$, guaranteeing single-wave execution efficiency and minimizing network RPC fan-out.
-  3. **Oversubscription ($> K_{\text{sat}}$ chunks per machine)**: Node holds multiple $K_{\text{sat}}$ waves, trading single-stream execution latency for consolidated memory density and zero network serialization.
+  1. **Under-Saturation ($< K_{\text{sat}}$ tokens per machine)**: Leaves compute units underutilized unless head parallelism or multi-tenant interleaving fills vacant execution slots.
+  2. **Saturated Allocation ($K_{\text{sat}}$ chunks per machine) — [Target Architecture]**: Context allocated in integer multiples of the tuning threshold to balance parallel efficiency and minimize network RPC fan-out.
+  3. **Oversubscription ($> K_{\text{sat}}$ chunks per machine)**: Node holds multiple context waves, trading single-stream execution latency for consolidated memory density and zero network serialization.
 
 ### 6.6 Hot Prefix Replication via Active Reader Counting [Proposed Architecture]
 - In high-concurrency environments, popular shared prefixes (system prompts, repository indexes) track an `active_reader_count`.
