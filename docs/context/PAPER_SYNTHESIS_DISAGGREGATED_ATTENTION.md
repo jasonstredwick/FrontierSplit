@@ -70,9 +70,11 @@ To preserve numerical stability and prevent exponent underflow/overflow during m
 | **Partial Accumulator ($A_p$)** | $[1, 32, 1, 128]$ | FP32 (4 bytes) | **$16{,}384\text{ bytes}$ ($16.0\text{ KB}$)** |
 | **Max Logit Vector ($m_p$)** | $[1, 32, 1, 1]$ | FP32 (4 bytes) | **$128\text{ bytes}$** |
 | **Sum-of-Exp Vector ($\ell_p$)** | $[1, 32, 1, 1]$ | FP32 (4 bytes) | **$128\text{ bytes}$** |
-| **Binary Protocol Header / Framing** | 16-byte fixed header + JSON metadata | — | **$\sim 79\text{ bytes}$** |
-| **Total RPC Response Wire Size** | | | **$\approx 16{,}719\text{ bytes}$ ($16.33\text{ KB}$)** |
-| **Total Roundtrip Wire Footprint** | Send + Receive | | **$\approx 24{,}991\text{ bytes}$ ($24.40\text{ KB}$)** |
+| **Serialized Chunk Metadata** | Inner tensor descriptor JSON | — | **$\sim 79\text{ bytes}$** |
+| **Inner Serialized Chunk Payload** | Tensors + chunk descriptor | — | **$16{,}719\text{ bytes}$ ($16.33\text{ KB}$)** |
+| **Outer TCP Frame Header & Framing** | 16-byte fixed binary header (`MAGIC`, `MSG_TYPE`, `PAYLOAD_LEN`) | — | **$16\text{ bytes}$** |
+| **Total RPC Response Wire Size** | Payload + outer framing | — | **$\approx 16{,}735\text{ bytes}$ ($16.34\text{ KB}$)** |
+| **Total Roundtrip Wire Footprint** | Send ($\approx 8{,}208\text{ B}$) + Receive ($\approx 16{,}735\text{ B}$) | | **$\approx 24{,}943\text{ bytes}$ ($24.36\text{ KB}$)** |
 
 ### GQA KV Cache Sizing & Bandwidth Comparison
 

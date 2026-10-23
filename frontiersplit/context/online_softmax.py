@@ -87,14 +87,55 @@ def _fp32_precision_guard(device: torch.device) -> Iterator[None]:
             yield
 
 
+def _compute_partial_attention_block(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    attention_mask: torch.Tensor | None,
+    orig_dtype: torch.dtype,
+) -> PartialAttentionChunk:
+    """Computes partial attention over a single bounded workspace block."""
+    with _fp32_precision_guard(q.device):
+        scores = (
+            torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32))
+            * scale
+        )
+        if attention_mask is not None:
+            scores = scores + attention_mask.to(torch.float32)
+
+        max_score = torch.max(scores, dim=-1, keepdim=True).values
+        safe_max = torch.where(
+            torch.isneginf(max_score), torch.zeros_like(max_score), max_score
+        )
+        p = torch.exp(scores - safe_max)
+        sum_exp = torch.sum(p, dim=-1, keepdim=True)
+        accumulator = torch.matmul(p, v.to(torch.float32))
+        accumulator = torch.where(
+            sum_exp == 0, torch.zeros_like(accumulator), accumulator
+        )
+
+    return PartialAttentionChunk(
+        accumulator=accumulator,
+        max_score=max_score,
+        sum_exp=sum_exp,
+        dtype=orig_dtype,
+    )
+
+
 def compute_partial_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float | None = None,
     attention_mask: torch.Tensor | None = None,
+    query_chunk_size: int = 128,
+    kv_chunk_size: int = 1024,
 ) -> PartialAttentionChunk:
     """Computes partial attention against a chunk of keys and values.
+
+    Tiles query and KV dimensions to ensure intermediate workspace matrices
+    (attention scores and softmax probabilities) remain bounded in memory.
 
     Args:
         q: Query tensor of shape `[batch, num_heads, q_len, head_dim]`.
@@ -102,6 +143,8 @@ def compute_partial_attention(
         v: Value tensor of shape `[batch, num_kv_heads, kv_len, head_dim]`.
         scale: Softmax temperature scale factor (default: 1 / sqrt(head_dim)).
         attention_mask: Optional mask of shape `[batch, 1, q_len, kv_len]`.
+        query_chunk_size: Maximum query tokens per tiled workspace block (default: 128).
+        kv_chunk_size: Maximum KV tokens per tiled workspace block (default: 1024).
 
     Returns:
         A PartialAttentionChunk containing (accumulator, max_score, sum_exp).
@@ -120,7 +163,7 @@ def compute_partial_attention(
 
     orig_dtype = q.dtype
 
-    if kv_len == 0:
+    if q_len == 0 or kv_len == 0:
         return PartialAttentionChunk(
             accumulator=torch.zeros(
                 (batch_size, num_heads, q_len, head_dim),
@@ -141,37 +184,80 @@ def compute_partial_attention(
             dtype=orig_dtype,
         )
 
-    with _fp32_precision_guard(q.device):
-        # Upcast Q and K to FP32 prior to matmul so unscaled dot products cannot overflow FP16:
-        # [batch, num_heads, q_len, kv_len]
-        scores = (
-            torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32))
-            * scale
+    # For bounded workloads (e.g. single decode query q_len=1 against <=1024 cache),
+    # evaluate directly without tile iteration overhead.
+    if q_len <= query_chunk_size and kv_len <= kv_chunk_size:
+        return _compute_partial_attention_block(
+            q, k, v, scale, attention_mask, orig_dtype
         )
 
-        if attention_mask is not None:
-            scores = scores + attention_mask.to(torch.float32)
+    # Tile both query and KV dimensions to strictly bound intermediate memory workspace:
+    # workspace tensor size is at most [batch, num_heads, query_chunk_size, kv_chunk_size].
+    q_chunks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for q_start in range(0, q_len, query_chunk_size):
+        q_end = min(q_start + query_chunk_size, q_len)
+        q_block = q[:, :, q_start:q_end, :]
 
-        # Numerically stable online softmax tracking in FP32
-        # 1. Local maximum per query: [batch, num_heads, q_len, 1]
-        max_score = torch.max(scores, dim=-1, keepdim=True).values
+        acc_q: torch.Tensor | None = None
+        max_q: torch.Tensor | None = None
+        sum_q: torch.Tensor | None = None
 
-        # Guard against (-inf) - (-inf) = NaN when an entire partition is masked out
-        safe_max = torch.where(
-            torch.isneginf(max_score), torch.zeros_like(max_score), max_score
-        )
+        for kv_start in range(0, kv_len, kv_chunk_size):
+            kv_end = min(kv_start + kv_chunk_size, kv_len)
+            k_block = k[:, :, kv_start:kv_end, :]
+            v_block = v[:, :, kv_start:kv_end, :]
 
-        # 2. Unnormalized exponentiated probabilities: [batch, num_heads, q_len, kv_len]
-        p = torch.exp(scores - safe_max)
+            mask_block: torch.Tensor | None = None
+            if attention_mask is not None:
+                if (
+                    attention_mask.shape[-2] == q_len
+                    and attention_mask.shape[-1] == kv_len
+                ):
+                    mask_block = attention_mask[..., q_start:q_end, kv_start:kv_end]
+                elif attention_mask.shape[-1] == kv_len:
+                    mask_block = attention_mask[..., :, kv_start:kv_end]
+                else:
+                    mask_block = attention_mask
 
-        # 3. Sum of exponentials (denominator): [batch, num_heads, q_len, 1]
-        sum_exp = torch.sum(p, dim=-1, keepdim=True)
+            block_res = _compute_partial_attention_block(
+                q_block, k_block, v_block, scale, mask_block, orig_dtype
+            )
 
-        # 4. Partial accumulator (numerator) in FP32: [batch, num_heads, q_len, head_dim]
-        accumulator = torch.matmul(p, v.to(torch.float32))
-        accumulator = torch.where(
-            sum_exp == 0, torch.zeros_like(accumulator), accumulator
-        )
+            if acc_q is None or max_q is None or sum_q is None:
+                acc_q = block_res.accumulator
+                max_q = block_res.max_score
+                sum_q = block_res.sum_exp
+            else:
+                with _fp32_precision_guard(q.device):
+                    new_max = torch.maximum(max_q, block_res.max_score)
+                    safe_new_max = torch.where(
+                        torch.isneginf(new_max), torch.zeros_like(new_max), new_max
+                    )
+                    alpha = torch.exp(
+                        torch.where(
+                            torch.isneginf(max_q),
+                            torch.full_like(max_q, -1e9),
+                            max_q - safe_new_max,
+                        )
+                    )
+                    beta = torch.exp(
+                        torch.where(
+                            torch.isneginf(block_res.max_score),
+                            torch.full_like(block_res.max_score, -1e9),
+                            block_res.max_score - safe_new_max,
+                        )
+                    )
+                    acc_q = acc_q * alpha + block_res.accumulator * beta
+                    sum_q = sum_q * alpha + block_res.sum_exp * beta
+                    max_q = new_max
+
+        assert acc_q is not None and max_q is not None and sum_q is not None
+        q_chunks.append((acc_q, max_q, sum_q))
+
+    # Concatenate across query blocks along sequence dimension (dim=2)
+    accumulator = torch.cat([c[0] for c in q_chunks], dim=2)
+    max_score = torch.cat([c[1] for c in q_chunks], dim=2)
+    sum_exp = torch.cat([c[2] for c in q_chunks], dim=2)
 
     return PartialAttentionChunk(
         accumulator=accumulator,

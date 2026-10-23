@@ -360,6 +360,27 @@ class DisaggregatedModel:
         for p in self._patchers:
             p.set_session(session_id, context_len=context_len)
 
+    @contextlib.contextmanager
+    def _scoped_forward_context(
+        self,
+        session_id: str | None,
+        context_len: int | None = None,
+        client: ContextClient | None = None,
+    ):
+        """Scopes task-bound ContextClient and active session strictly around a model forward pass."""
+        self.set_active_session(session_id, context_len)
+        token = (
+            _active_context_client_var.set(client)
+            if client is not None
+            else None
+        )
+        try:
+            yield
+        finally:
+            if token is not None:
+                _active_context_client_var.reset(token)
+            self.set_active_session(None)
+
     def _get_context_client(self) -> ContextClient:
         """Returns the task-bound ContextClient if set, else fallback to instance client."""
         c = _active_context_client_var.get()
@@ -456,11 +477,7 @@ class DisaggregatedModel:
             self._set_finish_reason("length")
             return
 
-        client_token = (
-            _active_context_client_var.set(context_client)
-            if context_client is not None
-            else None
-        )
+        target_client = context_client or self.context_client
         tokens = input_ids[0].tolist()
         base_prompt_len = len(tokens)
         remote_prompt_len = base_prompt_len
@@ -473,12 +490,13 @@ class DisaggregatedModel:
         last_committed_idx = 0
 
         try:
-            client = self._get_context_client()
             # Check for warm prefix cache hit on Context Server
             cache_hit = False
             matched_len = 0
             if use_prefix_cache:
-                matched_len, _ = client.match_prefix_sync(tokens, session_id=session_id)
+                matched_len, _ = target_client.match_prefix_sync(
+                    tokens, session_id=session_id
+                )
                 if matched_len == base_prompt_len:
                     cache_hit = True
 
@@ -488,8 +506,11 @@ class DisaggregatedModel:
                 pos_tensor = torch.tensor(
                     [[base_prompt_len - 1]], device=input_ids.device
                 )
-                with self._forward_lock, torch.no_grad():
-                    self.set_active_session(session_id)
+                with (
+                    self._forward_lock,
+                    torch.no_grad(),
+                    self._scoped_forward_context(session_id, None, target_client),
+                ):
                     out_fast = self.model(
                         last_tok, position_ids=pos_tensor, use_cache=False
                     )
@@ -505,8 +526,11 @@ class DisaggregatedModel:
                     matched_len, base_prompt_len, device=input_ids.device
                 ).unsqueeze(0)
                 suffix_cache = DynamicCache()
-                with self._forward_lock, torch.no_grad():
-                    self.set_active_session(session_id, context_len=matched_len)
+                with (
+                    self._forward_lock,
+                    torch.no_grad(),
+                    self._scoped_forward_context(session_id, matched_len, target_client),
+                ):
                     out_suffix = self.model(
                         suffix_ids,
                         past_key_values=suffix_cache,
@@ -522,7 +546,7 @@ class DisaggregatedModel:
                 num_layers = len(suffix_cache.layers)
                 upload_id = uuid.uuid4().hex
                 for l_idx, layer in enumerate(suffix_cache.layers):
-                    client.append_kv_sync(
+                    target_client.append_kv_sync(
                         session_id=session_id,
                         layer_idx=l_idx,
                         k_delta=layer.keys,
@@ -531,9 +555,6 @@ class DisaggregatedModel:
                         num_layers=num_layers,
                         upload_id=upload_id,
                     )
-
-                # Re-bind session with full context length for subsequent decode steps
-                self.set_active_session(session_id, context_len=None)
             else:
                 # 1. Prefill and offload prompt KV
                 next_tok, prompt_len = self.prefill_and_offload(
@@ -541,7 +562,7 @@ class DisaggregatedModel:
                     session_id,
                     temperature=temperature,
                     top_p=top_p,
-                    context_client=client,
+                    context_client=target_client,
                 )
                 base_prompt_len = prompt_len
                 remote_prompt_len = prompt_len
@@ -564,8 +585,11 @@ class DisaggregatedModel:
                 position = base_prompt_len + step - 1
                 pos_tensor = torch.tensor([[position]], device=input_ids.device)
 
-                with self._forward_lock, torch.no_grad():
-                    self.set_active_session(session_id, context_len=None)
+                with (
+                    self._forward_lock,
+                    torch.no_grad(),
+                    self._scoped_forward_context(session_id, None, target_client),
+                ):
                     out = self.model(
                         cur_tok,
                         past_key_values=local_cache,
@@ -592,7 +616,7 @@ class DisaggregatedModel:
                     num_layers = len(local_cache.layers)
                     upload_id = uuid.uuid4().hex
                     for l_idx, layer in enumerate(local_cache.layers):
-                        client.append_kv_sync(
+                        target_client.append_kv_sync(
                             session_id=session_id,
                             layer_idx=l_idx,
                             k_delta=layer.keys,
@@ -630,9 +654,8 @@ class DisaggregatedModel:
                         ]
                         num_layers = len(local_cache.layers)
                         upload_id = uuid.uuid4().hex
-                        client = self._get_context_client()
                         for l_idx, layer in enumerate(local_cache.layers):
-                            client.append_kv_sync(
+                            target_client.append_kv_sync(
                                 session_id=session_id,
                                 layer_idx=l_idx,
                                 k_delta=layer.keys,
@@ -648,12 +671,10 @@ class DisaggregatedModel:
 
                 if release_on_completion:
                     with contextlib.suppress(Exception):
-                        self._get_context_client().release_session_sync(session_id)
+                        target_client.release_session_sync(session_id)
             finally:
-                # Active session and context client token MUST be cleared unconditionally
+                # Active session MUST be cleared unconditionally
                 self.set_active_session(None)
-                if client_token is not None:
-                    _active_context_client_var.reset(client_token)
 
     def generate(
         self,
@@ -708,17 +729,23 @@ class DisaggregatedModel:
     ) -> tuple[torch.Tensor, int]:
         """Asynchronously runs prefill on the prompt and offloads KV caches."""
         self._validate_sampling_params(temperature, top_p)
-        client = context_client or self._get_context_client()
+        client = context_client or self.context_client
         prompt_cache = DynamicCache()
-        with self._forward_lock, torch.no_grad():
-            self.set_active_session(None)
-            outputs = self.model(
-                input_ids, past_key_values=prompt_cache, use_cache=True
-            )
-            prompt_cache = outputs.past_key_values
-            next_token = self._sample_next_token(
-                outputs.logits, temperature=temperature, top_p=top_p
-            )
+
+        def _run_prefill(ids_in, cache_in):
+            with self._forward_lock, torch.no_grad():
+                self.set_active_session(None)
+                outputs = self.model(
+                    ids_in, past_key_values=cache_in, use_cache=True
+                )
+                tok = self._sample_next_token(
+                    outputs.logits, temperature=temperature, top_p=top_p
+                )
+                return outputs.past_key_values, tok
+
+        prompt_cache, next_token = await asyncio.to_thread(
+            _run_prefill, input_ids, prompt_cache
+        )
 
         prompt_len = input_ids.shape[1]
         tokens = input_ids[0].tolist()
@@ -742,7 +769,6 @@ class DisaggregatedModel:
             )
         await asyncio.gather(*tasks)
 
-        self.set_active_session(session_id)
         return next_token, prompt_len
 
     async def generate_stream_async(
@@ -779,11 +805,7 @@ class DisaggregatedModel:
             self._set_finish_reason("length")
             return
 
-        client_token = (
-            _active_context_client_var.set(context_client)
-            if context_client is not None
-            else None
-        )
+        target_client = context_client or self.context_client
         tokens = input_ids[0].tolist()
         base_prompt_len = len(tokens)
         remote_prompt_len = base_prompt_len
@@ -796,11 +818,10 @@ class DisaggregatedModel:
         last_committed_idx = 0
 
         try:
-            client = self._get_context_client()
             cache_hit = False
             matched_len = 0
             if use_prefix_cache:
-                matched_len, _ = await client.match_prefix(
+                matched_len, _ = await target_client.match_prefix(
                     tokens, session_id=session_id
                 )
                 if matched_len == base_prompt_len:
@@ -811,37 +832,59 @@ class DisaggregatedModel:
                 pos_tensor = torch.tensor(
                     [[base_prompt_len - 1]], device=input_ids.device
                 )
-                with self._forward_lock, torch.no_grad():
-                    self.set_active_session(session_id)
-                    out_fast = self.model(
-                        last_tok, position_ids=pos_tensor, use_cache=False
-                    )
-                    next_tok = self._sample_next_token(
-                        out_fast.logits, temperature=temperature, top_p=top_p
-                    )
+
+                def _run_fast_prefill(last_tok_in, pos_in):
+                    with (
+                        self._forward_lock,
+                        torch.no_grad(),
+                        self._scoped_forward_context(session_id, None, target_client),
+                    ):
+                        out_fast = self.model(
+                            last_tok_in, position_ids=pos_in, use_cache=False
+                        )
+                        return self._sample_next_token(
+                            out_fast.logits, temperature=temperature, top_p=top_p
+                        )
+
+                next_tok = await asyncio.to_thread(
+                    _run_fast_prefill, last_tok, pos_tensor
+                )
             elif 0 < matched_len < base_prompt_len:
                 suffix_ids = input_ids[:, matched_len:]
                 suffix_pos = torch.arange(
                     matched_len, base_prompt_len, device=input_ids.device
                 ).unsqueeze(0)
                 suffix_cache = DynamicCache()
-                with self._forward_lock, torch.no_grad():
-                    self.set_active_session(session_id, context_len=matched_len)
-                    out_suffix = self.model(
-                        suffix_ids,
-                        past_key_values=suffix_cache,
-                        position_ids=suffix_pos,
-                        use_cache=True,
-                    )
-                    next_tok = self._sample_next_token(
-                        out_suffix.logits, temperature=temperature, top_p=top_p
-                    )
+
+                def _run_delta_prefill(s_ids_in, s_pos_in, s_cache_in):
+                    with (
+                        self._forward_lock,
+                        torch.no_grad(),
+                        self._scoped_forward_context(
+                            session_id, matched_len, target_client
+                        ),
+                    ):
+                        out_suffix = self.model(
+                            s_ids_in,
+                            past_key_values=s_cache_in,
+                            position_ids=s_pos_in,
+                            use_cache=True,
+                        )
+                        return self._sample_next_token(
+                            out_suffix.logits,
+                            temperature=temperature,
+                            top_p=top_p,
+                        )
+
+                next_tok = await asyncio.to_thread(
+                    _run_delta_prefill, suffix_ids, suffix_pos, suffix_cache
+                )
 
                 suffix_tokens = tokens[matched_len:]
                 num_layers = len(suffix_cache.layers)
                 upload_id = uuid.uuid4().hex
                 tasks = [
-                    client.append_kv(
+                    target_client.append_kv(
                         session_id=session_id,
                         layer_idx=l_idx,
                         k_delta=layer.keys,
@@ -853,14 +896,13 @@ class DisaggregatedModel:
                     for l_idx, layer in enumerate(suffix_cache.layers)
                 ]
                 await asyncio.gather(*tasks)
-                self.set_active_session(session_id, context_len=None)
             else:
                 next_tok, prompt_len = await self.prefill_and_offload_async(
                     input_ids,
                     session_id,
                     temperature=temperature,
                     top_p=top_p,
-                    context_client=client,
+                    context_client=target_client,
                 )
                 base_prompt_len = prompt_len
                 remote_prompt_len = prompt_len
@@ -877,22 +919,30 @@ class DisaggregatedModel:
             yield first_tok_id
             cur_tok = next_tok
 
+            def _run_decode_step(cur_tok_in, pos_in, cache_in):
+                with (
+                    self._forward_lock,
+                    torch.no_grad(),
+                    self._scoped_forward_context(session_id, None, target_client),
+                ):
+                    out = self.model(
+                        cur_tok_in,
+                        past_key_values=cache_in,
+                        use_cache=True,
+                        position_ids=pos_in,
+                    )
+                    return self._sample_next_token(
+                        out.logits, temperature=temperature, top_p=top_p
+                    )
+
             for step in range(1, max_new_tokens):
                 # Decode positions are strictly contiguous based on immutable base prompt length:
                 position = base_prompt_len + step - 1
                 pos_tensor = torch.tensor([[position]], device=input_ids.device)
 
-                with self._forward_lock, torch.no_grad():
-                    self.set_active_session(session_id, context_len=None)
-                    out = self.model(
-                        cur_tok,
-                        past_key_values=local_cache,
-                        use_cache=True,
-                        position_ids=pos_tensor,
-                    )
-                    cur_tok = self._sample_next_token(
-                        out.logits, temperature=temperature, top_p=top_p
-                    )
+                cur_tok = await asyncio.to_thread(
+                    _run_decode_step, cur_tok, pos_tensor, local_cache
+                )
                 tok_id = int(cur_tok.item())
                 generated_tokens.append(tok_id)
 
@@ -910,12 +960,14 @@ class DisaggregatedModel:
                     num_layers = len(local_cache.layers)
                     upload_id = uuid.uuid4().hex
                     tasks = [
-                        client.append_kv(
+                        target_client.append_kv(
                             session_id=session_id,
                             layer_idx=l_idx,
                             k_delta=layer.keys,
                             v_delta=layer.values,
-                            token_ids=chunk_tokens if l_idx == num_layers - 1 else None,
+                            token_ids=chunk_tokens
+                            if l_idx == num_layers - 1
+                            else None,
                             num_layers=num_layers,
                             upload_id=upload_id,
                         )
@@ -949,9 +1001,8 @@ class DisaggregatedModel:
                         ]
                         num_layers = len(local_cache.layers)
                         upload_id = uuid.uuid4().hex
-                        client = self._get_context_client()
                         tasks = [
-                            client.append_kv(
+                            target_client.append_kv(
                                 session_id=session_id,
                                 layer_idx=l_idx,
                                 k_delta=layer.keys,
@@ -969,12 +1020,10 @@ class DisaggregatedModel:
 
                 if release_on_completion:
                     with contextlib.suppress(Exception):
-                        await self._get_context_client().release_session(session_id)
+                        await target_client.release_session(session_id)
             finally:
-                # Active session and context client token MUST be cleared unconditionally
+                # Active session MUST be cleared unconditionally
                 self.set_active_session(None)
-                if client_token is not None:
-                    _active_context_client_var.reset(client_token)
 
     async def generate_async(
         self,

@@ -226,6 +226,14 @@ def create_gateway_app(
             ),
         }
 
+    def _safe_decode(tokenizer, token_ids: list[int]) -> str:
+        if tokenizer is None:
+            return ""
+        try:
+            return tokenizer.decode(token_ids, skip_special_tokens=True)
+        except TypeError:
+            return tokenizer.decode(token_ids)
+
     @app.post("/v1/chat/completions")
     async def chat_completions(
         req: ChatCompletionRequest,
@@ -261,9 +269,19 @@ def create_gateway_app(
                         msgs = [
                             {"role": m.role, "content": m.content} for m in req.messages
                         ]
-                        token_ids = tok.apply_chat_template(
-                            msgs, add_generation_prompt=True, tokenize=True
-                        )
+                        try:
+                            token_ids = tok.apply_chat_template(
+                                msgs,
+                                add_generation_prompt=True,
+                                tokenize=True,
+                                return_dict=False,
+                            )
+                        except TypeError:
+                            token_ids = tok.apply_chat_template(
+                                msgs,
+                                add_generation_prompt=True,
+                                tokenize=True,
+                            )
                     except Exception:
                         text = (
                             "\n".join(f"{m.role}: {m.content}" for m in req.messages)
@@ -276,6 +294,24 @@ def create_gateway_app(
                         + "\nassistant:"
                     )
                     token_ids = tok.encode(text)
+
+                # Normalize token_ids to a flat list[int] regardless of tokenizer return type
+                # (BatchEncoding, dict, torch.Tensor, nested list)
+                if hasattr(token_ids, "data") and isinstance(token_ids.data, dict):
+                    token_ids = token_ids.data.get("input_ids", token_ids)
+                elif isinstance(token_ids, dict) or hasattr(token_ids, "get"):
+                    token_ids = token_ids.get("input_ids", token_ids)
+                if hasattr(token_ids, "tolist"):
+                    token_ids = token_ids.tolist()
+                if (
+                    isinstance(token_ids, (list, tuple))
+                    and token_ids
+                    and isinstance(token_ids[0], (list, tuple))
+                ):
+                    token_ids = list(token_ids[0])
+                elif isinstance(token_ids, (list, tuple)):
+                    token_ids = list(token_ids)
+                token_ids = [int(t) for t in token_ids]
             else:
                 raw_text = req.messages[-1].content
                 try:
@@ -333,6 +369,18 @@ def create_gateway_app(
             created_time = int(time.time())
             max_new_tokens = req.max_tokens if req.max_tokens is not None else 32
 
+            eos_ids: set[int] = set()
+            if tok is not None:
+                if hasattr(tok, "eos_token_id"):
+                    if isinstance(tok.eos_token_id, int):
+                        eos_ids.add(tok.eos_token_id)
+                    elif isinstance(tok.eos_token_id, (list, tuple, set)):
+                        eos_ids.update(tok.eos_token_id)
+                if hasattr(tok, "all_special_ids") and tok.all_special_ids:
+                    eos_ids.update(tok.all_special_ids)
+            if hasattr(disagg, "_get_eos_token_ids"):
+                eos_ids.update(disagg._get_eos_token_ids())
+
             if req.stream:
 
                 async def event_generator():
@@ -355,7 +403,7 @@ def create_gateway_app(
                     streamed_token_ids: list[int] = []
                     emitted_len = 0
 
-                    async for token_id in disagg.generate_stream_async(
+                    gen = disagg.generate_stream_async(
                         input_ids=input_tensor,
                         max_new_tokens=max_new_tokens,
                         session_id=session_id,
@@ -364,43 +412,49 @@ def create_gateway_app(
                         temperature=req.temperature,
                         top_p=req.top_p,
                         context_client=routed_client,
-                    ):
-                        streamed_token_ids.append(token_id)
-                        if tok is not None:
-                            decoded_so_far = tok.decode(streamed_token_ids)
-                            # Hold back trailing replacement char (\ufffd) until multi-token
-                            # UTF-8 character sequences complete.
-                            if decoded_so_far.endswith("\ufffd"):
-                                stable_end = len(decoded_so_far.rstrip("\ufffd"))
-                            else:
-                                stable_end = len(decoded_so_far)
+                    )
+                    try:
+                        async for token_id in gen:
+                            if token_id in eos_ids:
+                                continue
+                            streamed_token_ids.append(token_id)
+                            if tok is not None:
+                                decoded_so_far = _safe_decode(tok, streamed_token_ids)
+                                # Hold back trailing replacement char (\ufffd) until multi-token
+                                # UTF-8 character sequences complete.
+                                if decoded_so_far.endswith("\ufffd"):
+                                    stable_end = len(decoded_so_far.rstrip("\ufffd"))
+                                else:
+                                    stable_end = len(decoded_so_far)
 
-                            if stable_end > emitted_len:
-                                delta_text = decoded_so_far[emitted_len:stable_end]
-                                emitted_len = stable_end
+                                if stable_end > emitted_len:
+                                    delta_text = decoded_so_far[emitted_len:stable_end]
+                                    emitted_len = stable_end
+                                else:
+                                    delta_text = ""
                             else:
-                                delta_text = ""
-                        else:
-                            delta_text = str(token_id) + " "
+                                delta_text = str(token_id) + " "
 
-                        if delta_text:
-                            chunk = {
-                                "id": req_id,
-                                "object": "chat.completion.chunk",
-                                "created": created_time,
-                                "model": active_model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": delta_text},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
+                            if delta_text:
+                                chunk = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_time,
+                                    "model": active_model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": delta_text},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                    finally:
+                        await gen.aclose()
 
                     if tok is not None and streamed_token_ids:
-                        final_decoded = tok.decode(streamed_token_ids)
+                        final_decoded = _safe_decode(tok, streamed_token_ids)
                         if len(final_decoded) > emitted_len:
                             tail_chunk = {
                                 "id": req_id,
@@ -458,10 +512,11 @@ def create_gateway_app(
                 top_p=req.top_p,
                 context_client=routed_client,
             )
+            display_tokens = [t for t in generated_token_ids if t not in eos_ids]
             content = (
-                tok.decode(generated_token_ids)
+                _safe_decode(tok, display_tokens)
                 if tok is not None
-                else " ".join(str(t) for t in generated_token_ids)
+                else " ".join(str(t) for t in display_tokens)
             )
             prompt_count = len(token_ids)
             comp_count = len(generated_token_ids)

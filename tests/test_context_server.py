@@ -27,6 +27,7 @@ from frontiersplit.context.online_softmax import (
     finalize_attention,
     merge_two_partial_attentions,
 )
+from frontiersplit.context.prefix_cache import RadixPrefixCache
 
 
 def get_free_port() -> int:
@@ -454,3 +455,34 @@ def test_context_server_zero_copy_radix_match_and_chunk_attention():
     assert torch.allclose(sw_res.accumulator, expected_sw.accumulator, atol=1e-5)
     assert torch.allclose(sw_res.max_score, expected_sw.max_score, atol=1e-5)
     assert torch.allclose(sw_res.sum_exp, expected_sw.sum_exp, atol=1e-5)
+
+
+def test_context_server_delta_eviction_does_not_publish_orphan_prefix():
+    """Verify that after eviction, appending to an evicted session never publishes suffix under an unrelated prefix."""
+    server = ContextServer(max_cached_tokens=5)
+
+    k1 = torch.randn(1, 2, 3, 16)
+    v1 = torch.randn(1, 2, 3, 16)
+    # Session 1: [6, 7, 8] (3 tokens)
+    server.register_prompt("sess-1", 0, k1, v1, token_ids=[6, 7, 8], num_layers=1)
+    # Unpin sess-1 so it can be evicted
+    server._clear_session_pin("sess-1")
+
+    # Session 2: [1, 2, 3, 4, 5] (5 tokens). Evicts sess-1 from prefix cache
+    k2 = torch.randn(1, 2, 5, 16)
+    v2 = torch.randn(1, 2, 5, 16)
+    server.register_prompt("sess-2", 0, k2, v2, token_ids=[1, 2, 3, 4, 5], num_layers=1)
+
+    # Verify [6, 7, 8] is evicted from prefix cache
+    m_len, _ = server.match_prefix([6, 7, 8])
+    assert m_len == 0
+
+    # Session 1 appends [9]
+    k_delta = torch.randn(1, 2, 1, 16)
+    v_delta = torch.randn(1, 2, 1, 16)
+    server.append_kv("sess-1", 0, k_delta, v_delta, token_ids=[9], num_layers=1)
+
+    # An unrelated prompt [9] MUST NOT match!
+    orphan_len, _ = server.match_prefix([9])
+    assert orphan_len == 0
+

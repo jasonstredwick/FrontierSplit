@@ -289,3 +289,27 @@ def test_autocast_fp16_does_not_defeat_fp32_safeguards():
     assert out.dtype == torch.float16
     assert not torch.isnan(out).any()
     assert torch.allclose(out, torch.full_like(out, 1.75), atol=1e-3)
+
+
+def test_long_delta_prefill_tiled_workspace_bounds():
+    """Verify that multi-token query (delta prefill) against long KV cache tiles cleanly with bounded workspace."""
+    torch.manual_seed(42)
+    batch, num_heads, q_len, kv_len, head_dim = 1, 4, 256, 1024, 64
+    q = torch.randn(batch, num_heads, q_len, head_dim, dtype=torch.float32)
+    k = torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float32)
+    v = torch.randn(batch, num_heads, kv_len, head_dim, dtype=torch.float32)
+
+    # Reference computation using native scaled dot product attention
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    # Tiled execution with small block sizes (64 query tokens, 256 KV tokens)
+    chunk = compute_partial_attention(
+        q, k, v, query_chunk_size=64, kv_chunk_size=256
+    )
+    out = finalize_attention(chunk)
+
+    assert out.shape == (batch, num_heads, q_len, head_dim)
+    assert not torch.isnan(out).any()
+    # Output matches native attention within floating-point reduction error
+    assert torch.allclose(out, ref, atol=1e-5)
+

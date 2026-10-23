@@ -278,29 +278,25 @@ class RadixPrefixCache:
         if matched_len >= base_len:
             delta_offset = matched_len - base_len
             rem_tokens = full_seq[matched_len:]
-            rem_k = {
-                l_i: k[..., delta_offset:, :].contiguous().clone()
-                for l_i, k in k_delta_by_layer.items()
-            }
-            rem_v = {
-                l_i: v[..., delta_offset:, :].contiguous().clone()
-                for l_i, v in v_delta_by_layer.items()
-            }
-            new_node = RadixNode(rem_tokens, rem_k, rem_v)
-            curr.children[rem_tokens[0]] = new_node
-            nodes.append(new_node)
-            self.evict_if_needed()
+            if rem_tokens:
+                rem_k = {
+                    l_i: k[..., delta_offset:, :].contiguous().clone()
+                    for l_i, k in k_delta_by_layer.items()
+                }
+                rem_v = {
+                    l_i: v[..., delta_offset:, :].contiguous().clone()
+                    for l_i, v in v_delta_by_layer.items()
+                }
+                new_node = RadixNode(rem_tokens, rem_k, rem_v)
+                curr.children[rem_tokens[0]] = new_node
+                nodes.append(new_node)
+                self.evict_if_needed()
             return nodes
 
-        # Fallback if base prefix was evicted from the Radix tree
-        rem_tokens = tuple(suffix_tokens)
-        rem_k = {l_i: k.contiguous().clone() for l_i, k in k_delta_by_layer.items()}
-        rem_v = {l_i: v.contiguous().clone() for l_i, v in v_delta_by_layer.items()}
-        new_node = RadixNode(rem_tokens, rem_k, rem_v)
-        curr.children[rem_tokens[0]] = new_node
-        nodes.append(new_node)
-        self.evict_if_needed()
-        return nodes
+        # If base prefix was evicted from the Radix tree, NEVER attach suffix to curr or root!
+        # Those KV tensors were computed with the missing preceding tokens and their original positions,
+        # so publishing the suffix as an orphaned prefix would corrupt the cache for unrelated queries.
+        return None
 
     def _find_unpinned_leaves(
         self,

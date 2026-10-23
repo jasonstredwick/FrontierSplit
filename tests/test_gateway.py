@@ -490,3 +490,94 @@ def test_concurrent_gateway_requests_isolated_shards():
         node_b.close()
         server_a.stop_thread()
         server_b.stop_thread()
+
+
+def test_gateway_with_real_chat_tokenizer_and_eos_filtering():
+    """Verify that gateway handles real PreTrainedTokenizerFast (BatchEncoding) and filters EOS tokens."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    # Construct a real fast BPE tokenizer with vocabulary
+    raw_tok = Tokenizer(models.BPE())
+    raw_tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    vocab = {"<eos>": 0, "hello": 1, "world": 2, "user:": 3, "assistant:": 4}
+    raw_tok.add_tokens(list(vocab.keys()))
+
+    fast_tok = PreTrainedTokenizerFast(
+        tokenizer_object=raw_tok,
+        eos_token="<eos>",
+    )
+    fast_tok.chat_template = (
+        "{% for m in messages %}{{ m.role + ': ' + m.content + '\n' }}{% endfor %}"
+        "{% if add_generation_prompt %}assistant:\n{% endif %}"
+    )
+
+    # Tiny Llama model with vocab_size 128
+    torch.manual_seed(42)
+    cfg = LlamaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        eos_token_id=0,
+    )
+    model = LlamaForCausalLM(cfg)
+    model.eval()
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+    disagg_model = DisaggregatedModel(model=model, context_client=client)
+
+    app = create_gateway_app(
+        model_name="test-fast-tok-llama",
+        disaggregated_model=disagg_model,
+        context_client=client,
+        tokenizer=fast_tok,
+    )
+    test_client = TestClient(app)
+
+    try:
+        # 1. Non-streaming request
+        resp = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-fast-tok-llama",
+                "messages": [{"role": "user", "content": "hello world"}],
+                "max_tokens": 8,
+                "temperature": 0.0,
+                "stream": False,
+            },
+        )
+        assert resp.status_code == 200, f"Failed: {resp.text}"
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        # Special token "<eos>" MUST NOT appear in the user-visible content
+        assert "<eos>" not in content
+
+        # 2. Streaming request
+        stream_resp = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-fast-tok-llama",
+                "messages": [{"role": "user", "content": "hello world"}],
+                "max_tokens": 8,
+                "temperature": 0.0,
+                "stream": True,
+            },
+        )
+        assert stream_resp.status_code == 200
+        # Parse streaming SSE chunks
+        for line in stream_resp.text.split("\n"):
+            if line.startswith("data: ") and not line.endswith("[DONE]"):
+                chunk = json.loads(line[6:])
+                delta = chunk["choices"][0].get("delta", {})
+                delta_content = delta.get("content", "")
+                assert "<eos>" not in delta_content
+
+    finally:
+        client.close_sync()
+        server.stop_thread()
+

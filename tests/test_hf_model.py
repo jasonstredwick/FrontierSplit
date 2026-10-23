@@ -519,3 +519,130 @@ def test_retained_session_first_token_eos_and_early_close(
             server.stop_thread()
 
     asyncio.run(_run())
+
+
+def test_multiplexed_generators_isolated_client_bindings(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify that two streams multiplexed on one thread (next(A), next(B), next(A)) do not cross-bleed clients."""
+    base_model, prompt, _ = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+
+    server_a = ContextServer()
+    port_a = server_a.start_in_thread(host="127.0.0.1", port=0)
+    client_a = ContextClient(host="127.0.0.1", port=port_a)
+
+    server_b = ContextServer()
+    port_b = server_b.start_in_thread(host="127.0.0.1", port=0)
+    client_b = ContextClient(host="127.0.0.1", port=port_b)
+
+    disagg = DisaggregatedModel(model=model, context_client=client_a)
+
+    try:
+        # Start generator A bound to client_a
+        gen_a = disagg.generate_stream(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="stream-a",
+            context_client=client_a,
+            release_on_completion=False,
+        )
+        # Start generator B bound to client_b
+        gen_b = disagg.generate_stream(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="stream-b",
+            context_client=client_b,
+            release_on_completion=False,
+        )
+
+        # Interleave execution: next(A) -> next(B) -> next(A) -> next(B)
+        tok_a1 = next(gen_a)
+        assert isinstance(tok_a1, int)
+        tok_b1 = next(gen_b)
+        assert isinstance(tok_b1, int)
+        tok_a2 = next(gen_a)
+        assert isinstance(tok_a2, int)
+        tok_b2 = next(gen_b)
+        assert isinstance(tok_b2, int)
+
+        # Verify that session-a is strictly on server_a, session-b is strictly on server_b
+        assert server_a.store.has_session("stream-a")
+        assert not server_a.store.has_session("stream-b")
+        assert server_b.store.has_session("stream-b")
+        assert not server_b.store.has_session("stream-a")
+
+        # Explicitly close generators (triggers finally blocks)
+        gen_a.close()
+        gen_b.close()
+
+    finally:
+        client_a.close_sync()
+        client_b.close_sync()
+        server_a.stop_thread()
+        server_b.stop_thread()
+
+
+def test_async_generation_does_not_block_event_loop(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify that model execution runs off the event loop thread, allowing asyncio heartbeats to tick."""
+    base_model, prompt, _ = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+    disagg = DisaggregatedModel(model=model, context_client=client)
+
+    # Wrap the original query_partial_attention on server with a 10ms injected delay
+    original_query = server.query_partial_attention
+
+    def delayed_query(*args, **kwargs):
+        import time
+
+        time.sleep(0.01)  # 10ms artificial delay
+        return original_query(*args, **kwargs)
+
+    server.query_partial_attention = delayed_query
+
+    async def _run() -> None:
+        heartbeat_delays: list[float] = []
+        stop_heartbeat = asyncio.Event()
+
+        async def heartbeat():
+            import time
+
+            while not stop_heartbeat.is_set():
+                t0 = time.monotonic()
+                await asyncio.sleep(0.005)
+                dt = time.monotonic() - t0
+                heartbeat_delays.append(dt)
+
+        hb_task = asyncio.create_task(heartbeat())
+        try:
+            tokens: list[int] = []
+            async for tok in disagg.generate_stream_async(
+                input_ids=prompt,
+                max_new_tokens=6,
+                session_id="heartbeat-sess",
+                release_on_completion=True,
+            ):
+                tokens.append(tok)
+            assert len(tokens) == 6
+        finally:
+            stop_heartbeat.set()
+            await hb_task
+
+        # If the event loop was blocked during the 6 decode steps (6 x 10ms = 60ms),
+        # a heartbeat would be stalled for > 50ms.
+        # Since model runs in asyncio.to_thread, max heartbeat delay should remain small (< 40ms).
+        max_delay = max(heartbeat_delays) if heartbeat_delays else 0.0
+        assert max_delay < 0.05, f"Event loop was blocked: max heartbeat delay was {max_delay * 1000:.1f}ms"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        client.close_sync()
+        server.stop_thread()
+

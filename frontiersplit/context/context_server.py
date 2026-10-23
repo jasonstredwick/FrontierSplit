@@ -527,12 +527,30 @@ class ContextServer:
             assert state.base_tokens is not None
             k_dict = {l_i: kv[0].clone() for l_i, kv in ready_layers.items()}
             v_dict = {l_i: kv[1].clone() for l_i, kv in ready_layers.items()}
-            self.prefix_cache.insert_delta(
+            inserted = self.prefix_cache.insert_delta(
                 base_tokens=state.base_tokens,
                 suffix_tokens=state.token_ids,
                 k_delta_by_layer=k_dict,
                 v_delta_by_layer=v_dict,
             )
+            if inserted is None:
+                # The base prefix was evicted from the Radix tree.
+                # Reconstruct the complete path from the session's retained store chunks if possible,
+                # but never publish the suffix as an orphaned standalone prefix.
+                if self.store.has_session(session_id):
+                    full_k: dict[int, torch.Tensor] = {}
+                    full_v: dict[int, torch.Tensor] = {}
+                    can_reconstruct = True
+                    for l_i in ready_layers:
+                        res = self.store.get_prompt(session_id, l_i)
+                        if res is not None:
+                            full_k[l_i] = res[0].clone()
+                            full_v[l_i] = res[1].clone()
+                        else:
+                            can_reconstruct = False
+                            break
+                    if can_reconstruct:
+                        self.prefix_cache.insert(full_tokens, full_k, full_v)
         self._set_session_pin(session_id, full_tokens)
 
         # Backfill any active prefix-bound sessions that matched a prefix of `full_tokens`

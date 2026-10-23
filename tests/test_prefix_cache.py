@@ -208,3 +208,41 @@ def test_insert_delta_preserves_canonical_prefix_storage_sharing():
     nodes_branch, _ = cache.match(prefix_tokens)
     assert nodes_branch[0].k_cache[0] is canonical_k_node0
     assert nodes_branch[0].v_cache[0] is canonical_v_node0
+
+
+def test_insert_delta_evicted_base_does_not_publish_orphan_suffix():
+    """Verify that when base prefix is evicted, insert_delta never publishes suffix under root."""
+    cache = RadixPrefixCache(max_cached_tokens=5)
+
+    # 1. Insert session A: [6, 7, 8] (3 tokens)
+    cache.insert(
+        [6, 7, 8],
+        {0: torch.randn(1, 2, 3, 16)},
+        {0: torch.randn(1, 2, 3, 16)},
+    )
+    assert cache.total_tokens == 3
+
+    # 2. Insert session B: [1, 2, 3, 4, 5] (5 tokens). This evicts [6, 7, 8].
+    cache.insert(
+        [1, 2, 3, 4, 5],
+        {0: torch.randn(1, 2, 5, 16)},
+        {0: torch.randn(1, 2, 5, 16)},
+    )
+    # [6, 7, 8] should now be evicted
+    _, match_a = cache.match([6, 7, 8])
+    assert match_a == 0
+
+    # 3. Now try to append suffix [9] to evicted base [6, 7, 8]
+    res = cache.insert_delta(
+        base_tokens=[6, 7, 8],
+        suffix_tokens=[9],
+        k_delta_by_layer={0: torch.randn(1, 2, 1, 16)},
+        v_delta_by_layer={0: torch.randn(1, 2, 1, 16)},
+    )
+    # MUST return None and NEVER attach [9] to root
+    assert res is None
+
+    # Querying unrelated prompt [9] MUST NOT produce a cache hit!
+    _, match_orphan = cache.match([9])
+    assert match_orphan == 0
+
