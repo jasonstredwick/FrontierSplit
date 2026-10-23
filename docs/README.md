@@ -38,7 +38,8 @@ The table below maps every architectural specification directly to its productio
 docs/
 ├── README.md                              # This master index and traceability matrix
 ├── context/                               # Technique 2: Disaggregated Context Engine Design
-│   └── DESIGN_CLOUD_ARCHITECTURE.md       # Full architecture: Online Softmax, Delta Prefill, Sharding
+│   ├── DESIGN_CLOUD_ARCHITECTURE.md       # Full architecture: Online Softmax, Delta Prefill, Sharding
+│   └── PAPER_SYNTHESIS_DISAGGREGATED_ATTENTION.md # Foundations, hardware mapping & multi-tier chunking
 └── pipeline/                              # Technique 1: Pipeline Parallel Engine Design
     ├── DESIGN_MIXTRAL_8X7B.md             # 8-stage Mixtral 8x7B MoE pipeline slicing specification
     └── DESIGN_KV_CACHE.md                 # Tile-aligned bounded KV cache allocation for pipeline workers

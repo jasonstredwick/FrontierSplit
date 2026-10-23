@@ -315,3 +315,41 @@ def test_async_rpc_cancellation_does_not_corrupt_subsequent_calls():
             await server.stop_server()
 
     asyncio.run(_run())
+
+
+def test_context_client_sync_and_async_timeout():
+    """Verify ContextClient.timeout is enforced on stalled sync and async connections."""
+    import time
+
+    stalled_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    stalled_server.bind(("127.0.0.1", 0))
+    stalled_server.listen(4)
+    port = stalled_server.getsockname()[1]
+
+    accepted_socks: list[socket.socket] = []
+
+    async def _run() -> None:
+        client = ContextClient(host="127.0.0.1", port=port, timeout=0.03)
+        try:
+            t0 = time.monotonic()
+            with pytest.raises((TimeoutError, OSError)):
+                client.match_prefix_sync([1, 2, 3])
+            elapsed_sync = time.monotonic() - t0
+            assert elapsed_sync < 0.5
+            assert client._sync_sock is None
+
+            t1 = time.monotonic()
+            with pytest.raises(TimeoutError):
+                await client.match_prefix([1, 2, 3])
+            elapsed_async = time.monotonic() - t1
+            assert elapsed_async < 0.5
+            assert client.writer is None
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        for s in accepted_socks:
+            s.close()
+        stalled_server.close()

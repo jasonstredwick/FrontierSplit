@@ -252,3 +252,89 @@ def test_eos_early_termination_and_first_token_stream_cleanup(
     finally:
         client.close_sync()
         server.stop_thread()
+
+
+def test_reusing_retained_session_does_not_corrupt_cached_prompt(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify reusing a retained session for a different same-length prompt does not corrupt the first prompt's cache."""
+    base_model, prompt_a, expected_a = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+    prompt_b = torch.tensor(
+        [[7, 14, 21, 28, 35]],
+        dtype=torch.long,
+    )
+    assert prompt_a.shape == prompt_b.shape
+    num_tokens = len(expected_a)
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    try:
+        disagg = DisaggregatedModel(model=model, context_client=client)
+
+        # 1. Run original prompt_a and retain session "reused-sess"
+        out_a1 = disagg.generate(
+            input_ids=prompt_a,
+            max_new_tokens=num_tokens,
+            session_id="reused-sess",
+            release_on_completion=False,
+        )
+        assert out_a1 == expected_a
+
+        # 2. Reuse "reused-sess" for same-length prompt_b
+        out_b = disagg.generate(
+            input_ids=prompt_b,
+            max_new_tokens=num_tokens,
+            session_id="reused-sess",
+            release_on_completion=False,
+        )
+        assert len(out_b) == num_tokens
+
+        # 3. Fresh cache hit on original prompt_a must still produce exact expected_a
+        out_a2 = disagg.generate(
+            input_ids=prompt_a,
+            max_new_tokens=num_tokens,
+            session_id="fresh-sess",
+            use_prefix_cache=True,
+        )
+        assert out_a2 == expected_a
+    finally:
+        client.close_sync()
+        server.stop_thread()
+
+
+def test_disaggregated_model_temperature_and_top_p_sampling(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify temperature and top_p sampling controls and validation."""
+    base_model, prompt, expected_greedy = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+    num_tokens = len(expected_greedy)
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    try:
+        disagg = DisaggregatedModel(model=model, context_client=client)
+
+        # Very small top_p (1e-6) restricts nucleus to top-1 token even with temperature > 0
+        out_top1 = disagg.generate(
+            input_ids=prompt,
+            max_new_tokens=num_tokens,
+            session_id="top1-sess",
+            temperature=0.8,
+            top_p=1e-6,
+        )
+        assert out_top1 == expected_greedy
+
+        with pytest.raises(ValueError, match="temperature"):
+            disagg.generate(input_ids=prompt, max_new_tokens=2, temperature=-0.1)
+
+        with pytest.raises(ValueError, match="top_p"):
+            disagg.generate(input_ids=prompt, max_new_tokens=2, top_p=0.0)
+    finally:
+        client.close_sync()
+        server.stop_thread()

@@ -15,6 +15,7 @@ import socket
 import struct
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -344,6 +345,19 @@ class ContextStore:
             self._session_last_access.clear()
 
 
+@dataclass
+class _StagedUpload:
+    """Tracks an in-progress multi-layer upload transaction for a session."""
+
+    upload_id: str
+    op: str  # "register" or "append"
+    seq_len: int
+    layers: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    token_ids: list[int] | None = None
+    base_tokens: list[int] | None = None
+    expected_layers: int | None = None
+
+
 class ContextServer:
     """Server that computes partial attention against stored prompt KV caches."""
 
@@ -365,6 +379,7 @@ class ContextServer:
         )
         self._session_expected_layers: dict[str, int] = {}
         self._session_tokens: dict[str, list[int]] = {}
+        self._staged_uploads: dict[str, _StagedUpload] = {}
         self._pinned_sessions: dict[str, tuple[int, ...]] = {}
         self._server: asyncio.Server | None = None
         self._ttl_task: asyncio.Task[None] | None = None
@@ -420,45 +435,53 @@ class ContextServer:
             required |= set(range(exp))
         return required
 
-    def _try_publish_session_prefix(self, session_id: str) -> None:
-        """Atomically publishes a session's KV cache to RadixPrefixCache once all expected layers are uploaded."""
-        toks = self._session_tokens.get(session_id)
-        if not toks:
+    def _try_publish_staged_upload(self, session_id: str, state: _StagedUpload) -> None:
+        """Atomically publishes a staged upload to RadixPrefixCache once all expected layers and token_ids are present."""
+        if state.token_ids is None or not state.token_ids:
             return
-        target_len = len(toks)
-        layers = self.store.get_session_layers(session_id) or {}
-        if not layers:
+        if state.op == "register":
+            full_tokens = list(state.token_ids)
+        else:
+            if state.base_tokens is None:
+                return
+            full_tokens = list(state.base_tokens) + list(state.token_ids)
+
+        target_len = len(full_tokens)
+        if not state.layers:
             return
 
         ready_layers = {
             l_i: kv
-            for l_i, kv in layers.items()
+            for l_i, kv in state.layers.items()
             if kv[0].shape[-2] == target_len and kv[1].shape[-2] == target_len
         }
-        required = self._required_layers_for_session(session_id, layers)
+        required = self._required_layers_for_session(session_id, state.layers)
+        if state.expected_layers is not None and state.expected_layers > 0:
+            required |= set(range(state.expected_layers))
         if not required or not required.issubset(ready_layers.keys()):
             return
 
-        k_dict = {l_i: kv[0] for l_i, kv in ready_layers.items()}
-        v_dict = {l_i: kv[1] for l_i, kv in ready_layers.items()}
-        self.prefix_cache.insert(toks, k_dict, v_dict)
-        self._set_session_pin(session_id, toks)
+        self._session_tokens[session_id] = full_tokens
+        k_dict = {l_i: kv[0].clone() for l_i, kv in ready_layers.items()}
+        v_dict = {l_i: kv[1].clone() for l_i, kv in ready_layers.items()}
+        self.prefix_cache.insert(full_tokens, k_dict, v_dict)
+        self._set_session_pin(session_id, full_tokens)
 
-        # Backfill any active prefix-bound sessions that matched a prefix of `toks`
+        # Backfill any active prefix-bound sessions that matched a prefix of `full_tokens`
         # before later layers were discovered.
         for other_sid, other_toks in list(self._session_tokens.items()):
             if other_sid == session_id or not self.store.has_session(other_sid):
                 continue
             other_len = len(other_toks)
-            if 0 < other_len <= target_len and other_toks == toks[:other_len]:
+            if 0 < other_len <= target_len and other_toks == full_tokens[:other_len]:
                 other_layers = self.store.get_session_layers(other_sid) or {}
                 for l_i, (k_full, v_full) in ready_layers.items():
                     if l_i not in other_layers:
                         self.store.register_prompt(
                             other_sid,
                             l_i,
-                            k_full[:, :, :other_len, :].contiguous(),
-                            v_full[:, :, :other_len, :].contiguous(),
+                            k_full[:, :, :other_len, :].contiguous().clone(),
+                            v_full[:, :, :other_len, :].contiguous().clone(),
                         )
 
     def register_prompt(
@@ -469,6 +492,7 @@ class ContextServer:
         v: torch.Tensor,
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
+        upload_id: str | None = None,
     ) -> None:
         """Registers a static prompt KV cache in memory and indexes into prefix cache."""
         self._known_layers.add(layer_idx)
@@ -478,6 +502,41 @@ class ContextServer:
 
         k_dev = k.to(self.device)
         v_dev = v.to(self.device)
+        seq_len = int(k_dev.shape[-2])
+
+        state = self._staged_uploads.get(session_id)
+        eff_upload_id = upload_id or "__implicit__"
+        is_new_upload = (
+            state is None
+            or state.op != "register"
+            or state.upload_id != eff_upload_id
+            or layer_idx in state.layers
+            or state.seq_len != seq_len
+            or (
+                token_ids is not None
+                and state.token_ids is not None
+                and list(token_ids) != state.token_ids
+            )
+        )
+        if is_new_upload:
+            self._clear_session_pin(session_id)
+            self._session_tokens.pop(session_id, None)
+            self.store.release_session(session_id)
+            state = _StagedUpload(
+                upload_id=eff_upload_id,
+                op="register",
+                seq_len=seq_len,
+                expected_layers=num_layers,
+            )
+            self._staged_uploads[session_id] = state
+
+        assert state is not None
+        if num_layers is not None and num_layers > 0:
+            state.expected_layers = num_layers
+        if token_ids is not None:
+            state.token_ids = list(token_ids)
+        state.layers[layer_idx] = (k_dev, v_dev)
+
         self.store.register_prompt(
             session_id=session_id,
             layer_idx=layer_idx,
@@ -485,10 +544,7 @@ class ContextServer:
             v=v_dev,
         )
 
-        if token_ids is not None and self._session_tokens.get(session_id) != token_ids:
-            self._session_tokens[session_id] = list(token_ids)
-
-        self._try_publish_session_prefix(session_id)
+        self._try_publish_staged_upload(session_id, state)
 
     def append_kv(
         self,
@@ -498,6 +554,7 @@ class ContextServer:
         v_delta: torch.Tensor,
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
+        upload_id: str | None = None,
     ) -> int:
         """Appends a delta KV tensor slice to an active session cache."""
         self._known_layers.add(layer_idx)
@@ -505,19 +562,56 @@ class ContextServer:
             self._session_expected_layers[session_id] = num_layers
             self._known_layers.update(range(num_layers))
 
+        k_dev = k_delta.to(self.device)
+        v_dev = v_delta.to(self.device)
+        delta_len = int(k_dev.shape[-2])
+
+        state = self._staged_uploads.get(session_id)
+        eff_upload_id = upload_id or "__implicit__"
+        is_new_upload = (
+            state is None
+            or state.op != "append"
+            or state.upload_id != eff_upload_id
+            or layer_idx in state.layers
+            or state.seq_len != delta_len
+            or (
+                token_ids is not None
+                and state.token_ids is not None
+                and list(token_ids) != state.token_ids
+            )
+        )
+        if is_new_upload:
+            base_toks = (
+                list(self._session_tokens[session_id])
+                if session_id in self._session_tokens
+                else None
+            )
+            state = _StagedUpload(
+                upload_id=eff_upload_id,
+                op="append",
+                seq_len=delta_len,
+                base_tokens=base_toks,
+                expected_layers=num_layers,
+            )
+            self._staged_uploads[session_id] = state
+
+        assert state is not None
         new_len = self.store.append_kv(
             session_id=session_id,
             layer_idx=layer_idx,
-            k_delta=k_delta.to(self.device),
-            v_delta=v_delta.to(self.device),
+            k_delta=k_dev,
+            v_delta=v_dev,
         )
 
+        kv_full = self.store.get_prompt(session_id, layer_idx)
+        if kv_full is not None:
+            state.layers[layer_idx] = kv_full
+        if num_layers is not None and num_layers > 0:
+            state.expected_layers = num_layers
         if token_ids is not None:
-            prev = self._session_tokens.get(session_id, [])
-            if len(prev) < new_len:
-                self._session_tokens[session_id] = prev + list(token_ids)
+            state.token_ids = list(token_ids)
 
-        self._try_publish_session_prefix(session_id)
+        self._try_publish_staged_upload(session_id, state)
         return new_len
 
     def evict_expired_sessions(
@@ -527,6 +621,7 @@ class ContextServer:
         evicted = self.store.evict_expired(max_idle_seconds=max_idle_seconds)
         for sid in evicted:
             self._clear_session_pin(sid)
+            self._staged_uploads.pop(sid, None)
             self._session_tokens.pop(sid, None)
             self._session_expected_layers.pop(sid, None)
         return evicted
@@ -559,9 +654,13 @@ class ContextServer:
             target_session_id or f"prefix-{abs(hash(tuple(token_ids[:matched_len]))):x}"
         )
         matched_tokens = list(token_ids[:matched_len])
+        self._staged_uploads.pop(session_id, None)
+        self.store.release_session(session_id)
         self._session_tokens[session_id] = matched_tokens
         for layer_idx, k in k_by_layer.items():
-            self.store.register_prompt(session_id, layer_idx, k, v_by_layer[layer_idx])
+            self.store.register_prompt(
+                session_id, layer_idx, k.clone(), v_by_layer[layer_idx].clone()
+            )
         self._set_session_pin(session_id, matched_tokens)
 
         return matched_len, session_id
@@ -667,6 +766,7 @@ class ContextServer:
     def release_session(self, session_id: str) -> bool:
         """Evicts a session's static prompt KV cache."""
         self._clear_session_pin(session_id)
+        self._staged_uploads.pop(session_id, None)
         self._session_tokens.pop(session_id, None)
         self._session_expected_layers.pop(session_id, None)
         return self.store.release_session(session_id)
@@ -741,6 +841,7 @@ class ContextServer:
                     layer_idx = meta["layer_idx"]
                     token_ids = meta.get("token_ids")
                     num_layers = meta.get("num_layers")
+                    upload_id = meta.get("upload_id")
                     k_delta, v_delta = _deserialize_kv_pair(payload)
                     new_len = self.append_kv(
                         session_id=session_id,
@@ -749,6 +850,7 @@ class ContextServer:
                         v_delta=v_delta,
                         token_ids=token_ids,
                         num_layers=num_layers,
+                        upload_id=upload_id,
                     )
                     resp = pack_context_frame(
                         MSG_APPEND_KV_RESP,
@@ -768,6 +870,7 @@ class ContextServer:
                     layer_idx = meta["layer_idx"]
                     token_ids = meta.get("token_ids")
                     num_layers = meta.get("num_layers")
+                    upload_id = meta.get("upload_id")
                     k_tensor, v_tensor = _deserialize_kv_pair(payload)
                     self.register_prompt(
                         session_id,
@@ -776,6 +879,7 @@ class ContextServer:
                         v_tensor,
                         token_ids=token_ids,
                         num_layers=num_layers,
+                        upload_id=upload_id,
                     )
 
                     resp = pack_context_frame(
@@ -1014,20 +1118,21 @@ class ContextClient:
         meta: dict[str, Any],
         payload: bytes,
     ) -> tuple[dict[str, Any], bytes]:
-        """Performs a cancellation-safe async request/response exchange over TCP."""
+        """Performs a cancellation- and timeout-safe async request/response exchange over TCP."""
         async with self._get_lock():
-            await self.connect()
-            assert self.writer is not None and self.reader is not None
-            frame = pack_context_frame(req_msg_type, meta, payload)
             try:
-                self.writer.write(frame)
-                await self.writer.drain()
-                resp_type, resp_meta, resp_payload = await read_context_frame_async(
-                    self.reader
-                )
-                self._validate_response_meta(
-                    meta, resp_meta, expected_resp_type, resp_type
-                )
+                async with asyncio.timeout(self.timeout):
+                    await self.connect()
+                    assert self.writer is not None and self.reader is not None
+                    frame = pack_context_frame(req_msg_type, meta, payload)
+                    self.writer.write(frame)
+                    await self.writer.drain()
+                    resp_type, resp_meta, resp_payload = await read_context_frame_async(
+                        self.reader
+                    )
+                    self._validate_response_meta(
+                        meta, resp_meta, expected_resp_type, resp_type
+                    )
             except BaseException:
                 self._reset_async_transport()
                 raise
@@ -1058,12 +1163,21 @@ class ContextClient:
             return resp_meta, resp_payload
 
     def connect_sync(self) -> socket.socket:
-        """Establishes or returns a synchronous persistent TCP socket."""
+        """Establishes or returns a synchronous persistent TCP socket with configured timeout."""
         with self._sync_lock:
             if self._sync_sock is None or self._sync_sock.fileno() == -1:
-                self._sync_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._sync_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self._sync_sock.connect((self.host, self.port))
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(self.timeout)
+                try:
+                    sock.connect((self.host, self.port))
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        sock.close()
+                    raise
+                self._sync_sock = sock
+            else:
+                self._sync_sock.settimeout(self.timeout)
             return self._sync_sock
 
     async def connect(self) -> None:
@@ -1078,7 +1192,14 @@ class ContextClient:
 
         self._reset_async_transport()
 
-        self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+        try:
+            async with asyncio.timeout(self.timeout):
+                self.reader, self.writer = await asyncio.open_connection(
+                    self.host, self.port
+                )
+        except BaseException:
+            self._reset_async_transport()
+            raise
         sock = self.writer.get_extra_info("socket")
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -1102,6 +1223,7 @@ class ContextClient:
         v: torch.Tensor,
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
+        upload_id: str | None = None,
     ) -> bool:
         """Registers a static prompt KV cache on the remote Context Server."""
         payload = _serialize_kv_pair(k, v)
@@ -1110,6 +1232,8 @@ class ContextClient:
             meta["token_ids"] = token_ids
         if num_layers is not None:
             meta["num_layers"] = num_layers
+        if upload_id is not None:
+            meta["upload_id"] = upload_id
 
         resp_meta, _ = await self._exchange_async(
             MSG_REGISTER_PROMPT_REQ, MSG_REGISTER_PROMPT_RESP, meta, payload
@@ -1245,6 +1369,7 @@ class ContextClient:
         v_delta: torch.Tensor,
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
+        upload_id: str | None = None,
     ) -> int:
         """Appends delta KV tensors to an active session cache on the Context Server."""
         payload = _serialize_kv_pair(k_delta, v_delta)
@@ -1253,6 +1378,8 @@ class ContextClient:
             meta["token_ids"] = token_ids
         if num_layers is not None:
             meta["num_layers"] = num_layers
+        if upload_id is not None:
+            meta["upload_id"] = upload_id
 
         resp_meta, _ = await self._exchange_async(
             MSG_APPEND_KV_REQ, MSG_APPEND_KV_RESP, meta, payload
@@ -1271,6 +1398,7 @@ class ContextClient:
         v_delta: torch.Tensor,
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
+        upload_id: str | None = None,
     ) -> int:
         """Synchronously appends delta KV tensors over TCP."""
         payload = _serialize_kv_pair(k_delta, v_delta)
@@ -1279,6 +1407,8 @@ class ContextClient:
             meta["token_ids"] = token_ids
         if num_layers is not None:
             meta["num_layers"] = num_layers
+        if upload_id is not None:
+            meta["upload_id"] = upload_id
 
         resp_meta, _ = self._exchange_sync(
             MSG_APPEND_KV_REQ, MSG_APPEND_KV_RESP, meta, payload
@@ -1306,6 +1436,7 @@ class ContextClient:
         v: torch.Tensor,
         token_ids: list[int] | None = None,
         num_layers: int | None = None,
+        upload_id: str | None = None,
     ) -> bool:
         """Synchronously registers static prompt KV cache for a layer over TCP."""
         payload = _serialize_kv_pair(k, v)
@@ -1314,6 +1445,8 @@ class ContextClient:
             meta["token_ids"] = token_ids
         if num_layers is not None:
             meta["num_layers"] = num_layers
+        if upload_id is not None:
+            meta["upload_id"] = upload_id
 
         resp_meta, _ = self._exchange_sync(
             MSG_REGISTER_PROMPT_REQ, MSG_REGISTER_PROMPT_RESP, meta, payload

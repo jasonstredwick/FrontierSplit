@@ -208,12 +208,14 @@ class RadixPrefixCache:
             for node in nodes:
                 node_len = node.num_tokens
                 for layer, k in k_by_layer.items():
-                    node.k_cache[layer] = k[
-                        ..., offset : offset + node_len, :
-                    ].contiguous()
-                    node.v_cache[layer] = v_by_layer[layer][
-                        ..., offset : offset + node_len, :
-                    ].contiguous()
+                    node.k_cache[layer] = (
+                        k[..., offset : offset + node_len, :].contiguous().clone()
+                    )
+                    node.v_cache[layer] = (
+                        v_by_layer[layer][..., offset : offset + node_len, :]
+                        .contiguous()
+                        .clone()
+                    )
                 offset += node_len
 
         if matched_len == len(seq):
@@ -223,11 +225,11 @@ class RadixPrefixCache:
         rem_tokens = seq[matched_len:]
 
         rem_k = {
-            layer: k[..., matched_len:, :].contiguous()
+            layer: k[..., matched_len:, :].contiguous().clone()
             for layer, k in k_by_layer.items()
         }
         rem_v = {
-            layer: v[..., matched_len:, :].contiguous()
+            layer: v[..., matched_len:, :].contiguous().clone()
             for layer, v in v_by_layer.items()
         }
 

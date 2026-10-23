@@ -264,3 +264,28 @@ def test_all_neg_inf_masked_partition_merge():
     out_ba = finalize_attention(merged_ba)
     assert not torch.isnan(out_ba).any()
     assert torch.allclose(out_ba, torch.full_like(out_ba, 2.0))
+
+
+def test_autocast_fp16_does_not_defeat_fp32_safeguards():
+    """Verify enclosing torch.autocast('cpu', dtype=torch.float16) does not downcast FP32 accumulators or overflow."""
+    batch, num_heads, q_len, kv_len, head_dim = 1, 2, 1, 8, 128
+    q = torch.full((batch, num_heads, q_len, head_dim), 32.0, dtype=torch.float16)
+    k = torch.full((batch, num_heads, kv_len, head_dim), 32.0, dtype=torch.float16)
+    v = torch.full((batch, num_heads, kv_len, head_dim), 1.75, dtype=torch.float16)
+
+    with torch.autocast("cpu", dtype=torch.float16):
+        chunk_a = compute_partial_attention(q, k[:, :, :4, :], v[:, :, :4, :])
+        chunk_b = compute_partial_attention(q, k[:, :, 4:, :], v[:, :, 4:, :])
+        assert chunk_a.accumulator.dtype == torch.float32
+        assert chunk_a.max_score.dtype == torch.float32
+        assert chunk_a.sum_exp.dtype == torch.float32
+
+        merged = merge_two_partial_attentions(chunk_a, chunk_b)
+        assert merged.accumulator.dtype == torch.float32
+        assert merged.sum_exp.dtype == torch.float32
+
+        out = finalize_attention(merged)
+
+    assert out.dtype == torch.float16
+    assert not torch.isnan(out).any()
+    assert torch.allclose(out, torch.full_like(out, 1.75), atol=1e-3)

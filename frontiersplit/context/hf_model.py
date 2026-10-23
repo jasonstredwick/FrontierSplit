@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import logging
 import threading
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -291,6 +292,47 @@ class DisaggregatedModel:
                 eos_ids.update(int(x) for x in val if x is not None)
         return eos_ids
 
+    @staticmethod
+    def _validate_sampling_params(temperature: float, top_p: float) -> None:
+        """Validates temperature and top_p sampling parameters."""
+        if temperature < 0.0:
+            raise ValueError(f"temperature must be >= 0.0, got {temperature}")
+        if not (0.0 < top_p <= 1.0):
+            raise ValueError(f"top_p must be in (0.0, 1.0], got {top_p}")
+
+    def _sample_next_token(
+        self,
+        logits: torch.Tensor,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+    ) -> torch.Tensor:
+        """Selects the next token ID from final-position logits using greedy or nucleus sampling."""
+        self._validate_sampling_params(temperature, top_p)
+        next_logits = logits[:, -1, :].float()
+        if temperature == 0.0:
+            return next_logits.argmax(dim=-1, keepdim=True)
+
+        scaled_logits = next_logits / temperature
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(
+                scaled_logits, descending=True, dim=-1
+            )
+            cumulative_probs = torch.cumsum(
+                torch.softmax(sorted_logits, dim=-1), dim=-1
+            )
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                ..., :-1
+            ].clone()
+            sorted_indices_to_remove[..., 0] = False
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+            )
+            scaled_logits = scaled_logits.masked_fill(indices_to_remove, float("-inf"))
+
+        probs = torch.softmax(scaled_logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
     def _patch_layers(self) -> None:
         """Installs disaggregated attention patchers across all model layers."""
         layers = getattr(self.model.model, "layers", [])
@@ -315,16 +357,21 @@ class DisaggregatedModel:
         self,
         input_ids: torch.Tensor,
         session_id: str,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ) -> tuple[torch.Tensor, int]:
         """Runs prefill on the prompt and offloads static prompt KV caches to Context Server.
 
         Args:
             input_ids: Prompt token tensor of shape `[1, prompt_len]`.
             session_id: Unique session identifier.
+            temperature: Sampling temperature (0.0 for greedy decoding).
+            top_p: Nucleus sampling probability threshold in (0.0, 1.0].
 
         Returns:
             Tuple of (first_generated_token_id, prompt_length).
         """
+        self._validate_sampling_params(temperature, top_p)
         prompt_cache = DynamicCache()
         with self._forward_lock, torch.no_grad():
             self.set_active_session(None)
@@ -332,11 +379,14 @@ class DisaggregatedModel:
                 input_ids, past_key_values=prompt_cache, use_cache=True
             )
             prompt_cache = outputs.past_key_values
-            next_token = outputs.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+            next_token = self._sample_next_token(
+                outputs.logits, temperature=temperature, top_p=top_p
+            )
 
         prompt_len = input_ids.shape[1]
         tokens = input_ids[0].tolist()
         num_layers = len(prompt_cache.layers)
+        upload_id = uuid.uuid4().hex
 
         # Offload each layer's static prompt KV cache to the remote Context Server
         for l_idx, layer in enumerate(prompt_cache.layers):
@@ -349,6 +399,7 @@ class DisaggregatedModel:
                 v=v_prompt,
                 token_ids=tokens if l_idx == num_layers - 1 else None,
                 num_layers=num_layers,
+                upload_id=upload_id,
             )
 
         # Bind session to all patchers for subsequent decode steps
@@ -362,6 +413,8 @@ class DisaggregatedModel:
         session_id: str = "default-session",
         use_prefix_cache: bool = True,
         release_on_completion: bool = True,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ) -> Iterator[int]:
         """Synchronously streams generated tokens one by one as they are produced.
 
@@ -372,10 +425,13 @@ class DisaggregatedModel:
             use_prefix_cache: If True, checks for existing prefix cache on Context Server.
             release_on_completion: If True, evicts session KV cache on completion.
                 Set to False for multi-turn sessions with sliding TTL.
+            temperature: Sampling temperature (0.0 for greedy decoding).
+            top_p: Nucleus sampling probability threshold in (0.0, 1.0].
 
         Yields:
             Generated token IDs one by one (including the first generated token).
         """
+        self._validate_sampling_params(temperature, top_p)
         if max_new_tokens <= 0:
             self._set_finish_reason("length")
             return
@@ -405,8 +461,8 @@ class DisaggregatedModel:
                     out_fast = self.model(
                         last_tok, position_ids=pos_tensor, use_cache=False
                     )
-                    next_tok = (
-                        out_fast.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                    next_tok = self._sample_next_token(
+                        out_fast.logits, temperature=temperature, top_p=top_p
                     )
             elif 0 < matched_len < prompt_len:
                 # Disaggregated Delta Prefill:
@@ -425,13 +481,14 @@ class DisaggregatedModel:
                         position_ids=suffix_pos,
                         use_cache=True,
                     )
-                    next_tok = (
-                        out_suffix.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                    next_tok = self._sample_next_token(
+                        out_suffix.logits, temperature=temperature, top_p=top_p
                     )
 
                 # Append suffix KV activations to the Context Server
                 suffix_tokens = tokens[matched_len:]
                 num_layers = len(suffix_cache.layers)
+                upload_id = uuid.uuid4().hex
                 for l_idx, layer in enumerate(suffix_cache.layers):
                     self.context_client.append_kv_sync(
                         session_id=session_id,
@@ -440,13 +497,19 @@ class DisaggregatedModel:
                         v_delta=layer.values,
                         token_ids=suffix_tokens if l_idx == num_layers - 1 else None,
                         num_layers=num_layers,
+                        upload_id=upload_id,
                     )
 
                 # Re-bind session with full context length for subsequent decode steps
                 self.set_active_session(session_id, context_len=None)
             else:
                 # 1. Prefill and offload prompt KV
-                next_tok, prompt_len = self.prefill_and_offload(input_ids, session_id)
+                next_tok, prompt_len = self.prefill_and_offload(
+                    input_ids,
+                    session_id,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
 
             first_tok_id = int(next_tok.item())
             if first_tok_id in eos_ids:
@@ -473,7 +536,9 @@ class DisaggregatedModel:
                         use_cache=True,
                         position_ids=pos_tensor,
                     )
-                    cur_tok = out.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                    cur_tok = self._sample_next_token(
+                        out.logits, temperature=temperature, top_p=top_p
+                    )
                 tok_id = int(cur_tok.item())
                 if tok_id in eos_ids:
                     self._set_finish_reason("stop")
@@ -494,6 +559,8 @@ class DisaggregatedModel:
         session_id: str = "default-session",
         use_prefix_cache: bool = True,
         release_on_completion: bool = True,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ) -> list[int]:
         """Generates tokens synchronously using disaggregated attention merging.
 
@@ -503,6 +570,8 @@ class DisaggregatedModel:
             session_id: Session identifier.
             use_prefix_cache: If True, checks for existing prefix cache on Context Server.
             release_on_completion: If True, releases session KV cache on completion.
+            temperature: Sampling temperature (0.0 for greedy decoding).
+            top_p: Nucleus sampling probability threshold in (0.0, 1.0].
 
         Returns:
             List of generated token IDs (including the first generated token).
@@ -514,6 +583,8 @@ class DisaggregatedModel:
                 session_id=session_id,
                 use_prefix_cache=use_prefix_cache,
                 release_on_completion=release_on_completion,
+                temperature=temperature,
+                top_p=top_p,
             )
         )
 
@@ -521,8 +592,11 @@ class DisaggregatedModel:
         self,
         input_ids: torch.Tensor,
         session_id: str,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ) -> tuple[torch.Tensor, int]:
         """Asynchronously runs prefill on the prompt and offloads KV caches."""
+        self._validate_sampling_params(temperature, top_p)
         prompt_cache = DynamicCache()
         with self._forward_lock, torch.no_grad():
             self.set_active_session(None)
@@ -530,11 +604,14 @@ class DisaggregatedModel:
                 input_ids, past_key_values=prompt_cache, use_cache=True
             )
             prompt_cache = outputs.past_key_values
-            next_token = outputs.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+            next_token = self._sample_next_token(
+                outputs.logits, temperature=temperature, top_p=top_p
+            )
 
         prompt_len = input_ids.shape[1]
         tokens = input_ids[0].tolist()
         num_layers = len(prompt_cache.layers)
+        upload_id = uuid.uuid4().hex
 
         tasks = []
         for l_idx, layer in enumerate(prompt_cache.layers):
@@ -548,6 +625,7 @@ class DisaggregatedModel:
                     v=v_prompt,
                     token_ids=tokens if l_idx == num_layers - 1 else None,
                     num_layers=num_layers,
+                    upload_id=upload_id,
                 )
             )
         await asyncio.gather(*tasks)
@@ -562,6 +640,8 @@ class DisaggregatedModel:
         session_id: str = "default-session",
         use_prefix_cache: bool = True,
         release_on_completion: bool = True,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ) -> AsyncIterator[int]:
         """Asynchronously streams generated tokens one by one as they are produced.
 
@@ -571,10 +651,13 @@ class DisaggregatedModel:
             session_id: Session identifier.
             use_prefix_cache: If True, checks for existing prefix cache on Context Server.
             release_on_completion: If True, evicts session KV cache on completion.
+            temperature: Sampling temperature (0.0 for greedy decoding).
+            top_p: Nucleus sampling probability threshold in (0.0, 1.0].
 
         Yields:
             Generated token IDs one by one (including the first generated token).
         """
+        self._validate_sampling_params(temperature, top_p)
         if max_new_tokens <= 0:
             self._set_finish_reason("length")
             return
@@ -602,8 +685,8 @@ class DisaggregatedModel:
                     out_fast = self.model(
                         last_tok, position_ids=pos_tensor, use_cache=False
                     )
-                    next_tok = (
-                        out_fast.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                    next_tok = self._sample_next_token(
+                        out_fast.logits, temperature=temperature, top_p=top_p
                     )
             elif 0 < matched_len < prompt_len:
                 suffix_ids = input_ids[:, matched_len:]
@@ -619,12 +702,13 @@ class DisaggregatedModel:
                         position_ids=suffix_pos,
                         use_cache=True,
                     )
-                    next_tok = (
-                        out_suffix.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                    next_tok = self._sample_next_token(
+                        out_suffix.logits, temperature=temperature, top_p=top_p
                     )
 
                 suffix_tokens = tokens[matched_len:]
                 num_layers = len(suffix_cache.layers)
+                upload_id = uuid.uuid4().hex
                 tasks = [
                     self.context_client.append_kv(
                         session_id=session_id,
@@ -633,6 +717,7 @@ class DisaggregatedModel:
                         v_delta=layer.values,
                         token_ids=suffix_tokens if l_idx == num_layers - 1 else None,
                         num_layers=num_layers,
+                        upload_id=upload_id,
                     )
                     for l_idx, layer in enumerate(suffix_cache.layers)
                 ]
@@ -640,7 +725,10 @@ class DisaggregatedModel:
                 self.set_active_session(session_id, context_len=None)
             else:
                 next_tok, prompt_len = await self.prefill_and_offload_async(
-                    input_ids, session_id
+                    input_ids,
+                    session_id,
+                    temperature=temperature,
+                    top_p=top_p,
                 )
 
             first_tok_id = int(next_tok.item())
@@ -665,7 +753,9 @@ class DisaggregatedModel:
                         use_cache=True,
                         position_ids=pos_tensor,
                     )
-                    cur_tok = out.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+                    cur_tok = self._sample_next_token(
+                        out.logits, temperature=temperature, top_p=top_p
+                    )
                 tok_id = int(cur_tok.item())
                 if tok_id in eos_ids:
                     self._set_finish_reason("stop")
@@ -686,6 +776,8 @@ class DisaggregatedModel:
         session_id: str = "default-session",
         use_prefix_cache: bool = True,
         release_on_completion: bool = True,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ) -> list[int]:
         """Asynchronously generates tokens using disaggregated attention merging.
 
@@ -695,6 +787,8 @@ class DisaggregatedModel:
             session_id: Session identifier.
             use_prefix_cache: If True, checks for existing prefix cache on Context Server.
             release_on_completion: If True, releases session KV cache on completion.
+            temperature: Sampling temperature (0.0 for greedy decoding).
+            top_p: Nucleus sampling probability threshold in (0.0, 1.0].
 
         Returns:
             List of generated token IDs (including the first generated token).
@@ -706,6 +800,8 @@ class DisaggregatedModel:
             session_id=session_id,
             use_prefix_cache=use_prefix_cache,
             release_on_completion=release_on_completion,
+            temperature=temperature,
+            top_p=top_p,
         ):
             generated.append(tok)
         return generated

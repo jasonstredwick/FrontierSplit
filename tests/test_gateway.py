@@ -160,6 +160,7 @@ def test_gateway_disaggregated_prefix_cache_reuse(disagg_cluster):
         "model": "test-disagg-llama",
         "messages": [{"role": "user", "content": shared_prompt}],
         "max_tokens": 4,
+        "temperature": 0.0,
         "stream": False,
     }
     resp_1 = test_client.post("/v1/chat/completions", json=req_1)
@@ -176,6 +177,7 @@ def test_gateway_disaggregated_prefix_cache_reuse(disagg_cluster):
         "model": "test-disagg-llama",
         "messages": [{"role": "user", "content": shared_prompt}],
         "max_tokens": 4,
+        "temperature": 0.0,
         "stream": False,
     }
     resp_2 = test_client.post("/v1/chat/completions", json=req_2)
@@ -184,3 +186,96 @@ def test_gateway_disaggregated_prefix_cache_reuse(disagg_cluster):
 
     # Both requests must produce bit-for-bit identical content
     assert tokens_1 == tokens_2
+
+
+def test_gateway_streaming_multitoken_utf8_and_sampling():
+    """Verify streaming SSE buffers multi-token UTF-8 characters (e.g. '€') without replacement chars."""
+
+    class ByteFallbackTokenizer:
+        """Tokenizer mapping token IDs to UTF-8 bytes so multi-byte chars span multiple tokens."""
+
+        def __init__(self, seq_bytes: bytes) -> None:
+            self._seq_bytes = seq_bytes
+
+        def encode(self, text: str) -> list[int]:
+            return [1, 2, 3, 4]
+
+        def decode(self, token_ids: list[int]) -> str:
+            # Map generated token index order onto the multi-byte UTF-8 sequence for "€" (0xE2 0x82 0xAC)
+            raw = bytes(self._seq_bytes[: len(token_ids)])
+            return raw.decode("utf-8", errors="replace")
+
+    torch.manual_seed(42)
+    cfg = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+    )
+    model = LlamaForCausalLM(cfg)
+    model.eval()
+
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+    disagg_model = DisaggregatedModel(model=model, context_client=client)
+    tok = ByteFallbackTokenizer("€".encode())  # 3 bytes: 0xE2, 0x82, 0xAC
+
+    app = create_gateway_app(
+        model_name="test-utf8-llama",
+        disaggregated_model=disagg_model,
+        context_client=client,
+        tokenizer=tok,
+    )
+    test_client = TestClient(app)
+
+    try:
+        # 1. Non-streaming returns "€"
+        resp_non_stream = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-utf8-llama",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 3,
+                "temperature": 0.0,
+                "stream": False,
+            },
+        )
+        assert resp_non_stream.status_code == 200
+        assert resp_non_stream.json()["choices"][0]["message"]["content"] == "€"
+
+        # 2. Streaming reconstructs "€" without emitting '\ufffd'
+        resp_stream = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-utf8-llama",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 3,
+                "temperature": 0.0,
+                "stream": True,
+            },
+        )
+        assert resp_stream.status_code == 200
+        lines = [line.strip() for line in resp_stream.text.split("\n") if line.strip()]
+        chunks = [json.loads(line.removeprefix("data: ")) for line in lines[:-1]]
+        streamed_text = "".join(
+            c["choices"][0]["delta"].get("content", "") for c in chunks
+        )
+        assert streamed_text == "€"
+        assert "\ufffd" not in streamed_text
+
+        # 3. Invalid sampling parameters are rejected with HTTP 400
+        bad_resp = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-utf8-llama",
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": -1.0,
+            },
+        )
+        assert bad_resp.status_code == 400
+    finally:
+        client.close_sync()
+        server.stop_thread()

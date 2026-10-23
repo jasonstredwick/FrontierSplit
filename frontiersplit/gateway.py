@@ -216,6 +216,17 @@ def create_gateway_app(
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         """OpenAI-compatible chat completion endpoint."""
+        if req.temperature < 0.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"temperature must be >= 0.0, got {req.temperature}",
+            )
+        if not (0.0 < req.top_p <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail=f"top_p must be in (0.0, 1.0], got {req.top_p}",
+            )
+
         # 1. Disaggregated Model Execution Path
         if app.state.disaggregated_model is not None:
             disagg = app.state.disaggregated_model
@@ -280,31 +291,70 @@ def create_gateway_app(
                     }
                     yield f"data: {json.dumps(role_chunk)}\n\n"
 
+                    streamed_token_ids: list[int] = []
+                    emitted_len = 0
+
                     async for token_id in disagg.generate_stream_async(
                         input_ids=input_tensor,
                         max_new_tokens=max_new_tokens,
                         session_id=session_id,
                         use_prefix_cache=req.use_prefix_cache,
+                        temperature=req.temperature,
+                        top_p=req.top_p,
                     ):
-                        delta_text = (
-                            tok.decode([token_id])
-                            if tok is not None
-                            else str(token_id) + " "
-                        )
-                        chunk = {
-                            "id": req_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": active_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": delta_text},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
+                        streamed_token_ids.append(token_id)
+                        if tok is not None:
+                            decoded_so_far = tok.decode(streamed_token_ids)
+                            # Hold back trailing replacement char (\ufffd) until multi-token
+                            # UTF-8 character sequences complete.
+                            if decoded_so_far.endswith("\ufffd"):
+                                stable_end = len(decoded_so_far.rstrip("\ufffd"))
+                            else:
+                                stable_end = len(decoded_so_far)
+
+                            if stable_end > emitted_len:
+                                delta_text = decoded_so_far[emitted_len:stable_end]
+                                emitted_len = stable_end
+                            else:
+                                delta_text = ""
+                        else:
+                            delta_text = str(token_id) + " "
+
+                        if delta_text:
+                            chunk = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": active_model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": delta_text},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+
+                    if tok is not None and streamed_token_ids:
+                        final_decoded = tok.decode(streamed_token_ids)
+                        if len(final_decoded) > emitted_len:
+                            tail_chunk = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": active_model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "content": final_decoded[emitted_len:]
+                                        },
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(tail_chunk)}\n\n"
 
                     # Final finish reason chunk
                     finish_reason = (
@@ -338,6 +388,8 @@ def create_gateway_app(
                 max_new_tokens=max_new_tokens,
                 session_id=session_id,
                 use_prefix_cache=req.use_prefix_cache,
+                temperature=req.temperature,
+                top_p=req.top_p,
             )
             content = (
                 tok.decode(generated_token_ids)
