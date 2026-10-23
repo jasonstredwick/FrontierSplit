@@ -9,6 +9,7 @@ precomputed KV cache on the Context Server with zero redundant prefill compute.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 import torch
 
@@ -124,6 +125,7 @@ class RadixPrefixCache:
         """
         self.root = RadixNode()
         self.max_cached_tokens = max_cached_tokens
+        self.on_compact: Callable[[], None] | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -143,17 +145,21 @@ class RadixPrefixCache:
 
     @property
     def total_backing_tokens(self) -> int:
-        """Calculates total number of tokens physically allocated in unique backing tensor storages."""
-        seen_ptrs: set[int] = set()
-        total_tokens = 0
+        """Calculates total number of sequence tokens physically allocated in unique backing tensor storages.
+
+        Normalizes backing sequence capacity per layer to compare consistently against
+        the sequence-token budget, rather than summing across all model layers.
+        """
+        seen_ptrs_by_layer: dict[int, set[int]] = {}
+        layer_backing_tokens: dict[int, int] = {}
 
         def _traverse(node: RadixNode) -> None:
-            nonlocal total_tokens
-            for t in list(node.k_cache.values()):
+            for l_idx, t in node.k_cache.items():
                 if t is not None:
+                    seen = seen_ptrs_by_layer.setdefault(l_idx, set())
                     ptr = t.untyped_storage().data_ptr()
-                    if ptr not in seen_ptrs:
-                        seen_ptrs.add(ptr)
+                    if ptr not in seen:
+                        seen.add(ptr)
                         token_dim = t.shape[-2]
                         logical_bytes = t.numel() * t.element_size()
                         storage_bytes = t.untyped_storage().nbytes()
@@ -161,13 +167,18 @@ class RadixPrefixCache:
                             backing_tokens = int(
                                 token_dim * (storage_bytes / logical_bytes)
                             )
-                            total_tokens += backing_tokens
+                            layer_backing_tokens[l_idx] = (
+                                layer_backing_tokens.get(l_idx, 0) + backing_tokens
+                            )
             for child in node.children.values():
                 _traverse(child)
 
         for child in self.root.children.values():
             _traverse(child)
-        return total_tokens
+
+        if not layer_backing_tokens:
+            return 0
+        return max(layer_backing_tokens.values())
 
     def compact_all(self, node: RadixNode | None = None) -> int:
         """Compacts all nodes in the tree whose backing allocation exceeds logical shape.
@@ -175,11 +186,20 @@ class RadixPrefixCache:
         Returns:
             Number of nodes compacted.
         """
+        is_top_level = node is None or node is self.root
         target = node or self.root
         compacted_count = 1 if target.compact() else 0
         for child in list(target.children.values()):
-            compacted_count += self.compact_all(child)
+            compacted_count += self._compact_subtree(child)
+        if is_top_level and compacted_count > 0 and self.on_compact is not None:
+            self.on_compact()
         return compacted_count
+
+    def _compact_subtree(self, node: RadixNode) -> int:
+        count = 1 if node.compact() else 0
+        for child in list(node.children.values()):
+            count += self._compact_subtree(child)
+        return count
 
     def match(
         self,
@@ -399,7 +419,7 @@ class RadixPrefixCache:
             evicted_tokens += victim.num_tokens
 
             # Selective compaction on eviction: compact surviving nodes to release dead backing slabs
-            self.compact_all(self.root)
+            self.compact_all()
 
         return evicted_tokens
 

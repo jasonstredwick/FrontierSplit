@@ -1151,6 +1151,119 @@ def test_bf16_model_fingerprint_and_generation():
         server.stop_thread()
 
 
+def test_model_identity_distinguishes_variants_sharing_commit_hash():
+    """Verify fine-tuned or adapter variants sharing base commit hash receive distinct IDs."""
+    cfg = LlamaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+    )
+    # Set identical base metadata on config
+    cfg._commit_hash = "base-commit-hash-abc123"
+    cfg._name_or_path = "meta-llama/Llama-3-8B"
+
+    torch.manual_seed(42)
+    model_base = LlamaForCausalLM(cfg).eval()
+    torch.manual_seed(42)
+    model_variant = LlamaForCausalLM(cfg).eval()
+
+    # Modify variant's weights (simulating fine-tuning or merged adapter)
+    with torch.no_grad():
+        for p in model_variant.parameters():
+            p.add_(torch.randn_like(p) * 0.1)
+            break
+
+    from frontiersplit.context.hf_model import _compute_model_id
+
+    id_base = _compute_model_id(model_base)
+    id_var = _compute_model_id(model_variant)
+
+    assert id_base != id_var
+
+    # In TCP reproduction, warming cache with model_base must not affect model_variant
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client_base = ContextClient("127.0.0.1", port)
+    client_var = ContextClient("127.0.0.1", port)
+
+    try:
+        disagg_base = DisaggregatedModel(model_base, context_client=client_base)
+        disagg_var = DisaggregatedModel(model_variant, context_client=client_var)
+        assert disagg_base.model_id != disagg_var.model_id
+
+        prompt = torch.tensor([[5, 10, 15, 20]])
+
+        # Native generation for variant
+        with torch.no_grad():
+            var_native = []
+            cur = prompt
+            cache = DynamicCache()
+            for _ in range(4):
+                res = model_variant(cur, past_key_values=cache, use_cache=True)
+                tok = int(res.logits[:, -1, :].argmax(dim=-1).item())
+                var_native.append(tok)
+                cur = torch.tensor([[tok]])
+
+        # Warm cache with model_base
+        disagg_base.generate(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="warm-base",
+            release_on_completion=False,
+            use_prefix_cache=False,
+        )
+
+        # Variant generates with same prompt over TCP
+        var_disagg = disagg_var.generate(
+            input_ids=prompt,
+            max_new_tokens=4,
+            session_id="sess-var",
+            release_on_completion=True,
+            use_prefix_cache=False,
+        )
+        assert var_disagg == var_native
+    finally:
+        client_base.close_sync()
+        client_var.close_sync()
+        server.stop_thread()
+
+
+def test_bulk_weight_fingerprint_performance():
+    """Verify bulk uint8 buffer fingerprinting executes in milliseconds without UntypedStorage conversion lag."""
+    import time
+
+    from frontiersplit.context.hf_model import _compute_model_id
+
+    # Create a model with ~1M parameters (several megabytes)
+    cfg = LlamaConfig(
+        vocab_size=1024,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=4,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+    )
+    model = LlamaForCausalLM(cfg).eval()
+    total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    assert total_bytes > 2_000_000  # > 2 MB
+
+    t0 = time.time()
+    mid = _compute_model_id(model)
+    elapsed = time.time() - t0
+
+    assert mid is not None
+    # Bulk view must complete in well under 0.1 seconds (previously took > 1.5s for 2MB)
+    assert elapsed < 0.1, f"Fingerprinting took too long: {elapsed:.3f}s"
+
+
+
+
+
+
+
 
 
 

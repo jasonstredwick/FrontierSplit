@@ -338,4 +338,39 @@ def test_eviction_compacts_split_nodes_and_frees_backing_allocation():
     assert cache.total_backing_tokens == 2
 
 
+def test_cache_capacity_normalized_across_layers():
+    """Verify that multi-layer KV caches are counted as sequence tokens rather than multiplied by num_layers."""
+    # Cache configured for 100 sequence tokens
+    cache = RadixPrefixCache(max_cached_tokens=100)
+
+    # Insert a 60-token prompt with 4 layers
+    toks = list(range(60))
+    k = {
+        0: torch.randn(1, 2, 60, 16),
+        1: torch.randn(1, 2, 60, 16),
+        2: torch.randn(1, 2, 60, 16),
+        3: torch.randn(1, 2, 60, 16),
+    }
+    v = {
+        0: torch.randn(1, 2, 60, 16),
+        1: torch.randn(1, 2, 60, 16),
+        2: torch.randn(1, 2, 60, 16),
+        3: torch.randn(1, 2, 60, 16),
+    }
+    cache.insert(toks, k, v)
+
+    # Sequence tokens stored must be 60
+    assert cache.total_tokens == 60
+
+    # Backing capacity must be normalized to sequence tokens (60), NOT summed across layers (240)!
+    assert cache.total_backing_tokens == 60
+
+    # Eviction must NOT evict this 60-token sequence under a 100-token quota
+    evicted = cache.evict_if_needed()
+    assert evicted == 0
+    nodes, matched = cache.match(toks)
+    assert matched == 60
+
+
+
 

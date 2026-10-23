@@ -55,9 +55,9 @@ _active_model_id_var: contextvars.ContextVar[str | None] = (
 def _compute_model_id(model: Any, model_id: str | None = None) -> str:
     """Computes a deterministic model identifier based on model architecture and weights.
 
-    Uses immutable commit hash if available, or computes a SHA-256 digest over model
-    parameters without relying on numpy. Raises ValueError if automatic identification
-    cannot establish a trustworthy identity.
+    Hashes parameter tensors using a contiguous uint8 bulk byte-buffer view,
+    distinguishing effective model weights, fine-tuned variants, and configurations.
+    Raises ValueError if automatic identification cannot establish a trustworthy identity.
     """
     if model_id is not None:
         return model_id
@@ -70,10 +70,6 @@ def _compute_model_id(model: Any, model_id: str | None = None) -> str:
         or model.__class__.__name__
     )
 
-    commit_hash = getattr(config, "_commit_hash", None)
-    if commit_hash:
-        return f"{base_name}:{commit_hash}"
-
     try:
         params = list(model.named_parameters())
     except Exception as e:
@@ -82,17 +78,36 @@ def _compute_model_id(model: Any, model_id: str | None = None) -> str:
         ) from e
 
     if not params:
+        commit_hash = getattr(config, "_commit_hash", None)
+        if commit_hash:
+            return f"{base_name}:{commit_hash}"
         raise ValueError(
             f"Could not establish a trustworthy model identity for {base_name}: "
             "model has no parameters and no immutable commit hash. Please specify 'model_id' explicitly."
         )
 
     h = hashlib.sha256(str(base_name).encode())
+    commit_hash = getattr(config, "_commit_hash", None)
+    if commit_hash:
+        h.update(str(commit_hash).encode())
+
+    if config is not None:
+        for attr in (
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+        ):
+            val = getattr(config, attr, None)
+            if val is not None:
+                h.update(f"{attr}={val}".encode())
+
     for name, p in params:
         h.update(name.encode())
         if p is not None and p.numel() > 0:
-            # Access raw untyped storage bytes directly, supporting BF16, FP16, FP32, etc.
-            h.update(bytes(p.detach().cpu().untyped_storage()))
+            cpu_t = p.detach().cpu().contiguous()
+            raw_view = cpu_t.view(torch.uint8).numpy()
+            h.update(raw_view)
 
     return f"{base_name}:{h.hexdigest()[:16]}"
 

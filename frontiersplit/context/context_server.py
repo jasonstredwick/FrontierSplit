@@ -370,6 +370,26 @@ class ContextStore:
                 return True
             return False
 
+    def compact(self) -> int:
+        """Compacts all chunk tensors in the store whose backing storage exceeds logical shape."""
+        with self._lock:
+            compacted_count = 0
+            for session_id, layers in self._store.items():
+                for layer_idx, chunks in layers.items():
+                    new_chunks = []
+                    for k, v in chunks:
+                        new_k = k
+                        new_v = v
+                        if k.untyped_storage().nbytes() > (k.numel() * k.element_size()):
+                            new_k = k.clone()
+                            compacted_count += 1
+                        if v.untyped_storage().nbytes() > (v.numel() * v.element_size()):
+                            new_v = v.clone()
+                            compacted_count += 1
+                        new_chunks.append((new_k, new_v))
+                    layers[layer_idx] = new_chunks
+            return compacted_count
+
     def evict_expired(self, max_idle_seconds: float | None = None) -> list[str]:
         """Evicts all sessions that have exceeded their sliding TTL window.
 
@@ -514,10 +534,31 @@ class ContextServer:
         effective_id: str,
     ) -> RadixPrefixCache:
         if effective_id not in self._prefix_caches:
-            self._prefix_caches[effective_id] = RadixPrefixCache(
+            cache = RadixPrefixCache(
                 max_cached_tokens=self.max_cached_tokens,
             )
+            cache.on_compact = self._sync_compacted_sessions
+            self._prefix_caches[effective_id] = cache
         return self._prefix_caches[effective_id]
+
+    def _sync_compacted_sessions(self) -> None:
+        """Synchronizes ContextStore session chunks with compacted RadixNode tensors."""
+        for session_id, (eff_model_id, seq) in list(self._pinned_sessions.items()):
+            if not self.store.has_session(session_id):
+                continue
+            nodes = self._walk_prefix_nodes(seq, model_id=eff_model_id)
+            if not nodes:
+                continue
+            existing_layers = self.store.get_session_layers(session_id) or {}
+            for l_i in existing_layers:
+                c_chunks = [
+                    (n.k_cache[l_i], n.v_cache[l_i])
+                    for n in nodes
+                    if l_i in n.k_cache and l_i in n.v_cache
+                ]
+                if c_chunks:
+                    self.store.register_chunks(session_id, l_i, c_chunks)
+        self.store.compact()
 
     def _get_prefix_cache(
         self,
@@ -559,9 +600,9 @@ class ContextServer:
     def acquire_lease(self, session_id: str, lease_id: str) -> bool:
         """Acquires exclusive ownership of session_id for generation lease_id."""
         with self._session_leases_lock:
+            self._purge_expired_lease_locked(session_id)
             if lease_id in self._expired_leases:
                 return False
-            self._purge_expired_lease_locked(session_id)
             current = self._session_leases.get(session_id)
             if current is not None and current != lease_id:
                 return False
@@ -573,6 +614,8 @@ class ContextServer:
         """Releases ownership of session_id if held by lease_id."""
         with self._session_leases_lock:
             self._purge_expired_lease_locked(session_id)
+            if lease_id in self._expired_leases:
+                return False
             current = self._session_leases.get(session_id)
             if current == lease_id:
                 self._session_leases.pop(session_id, None)
@@ -583,12 +626,12 @@ class ContextServer:
     def _verify_lease(self, session_id: str, lease_id: str | None) -> None:
         """Verifies that lease_id holds ownership of session_id, or claims it."""
         with self._session_leases_lock:
+            self._purge_expired_lease_locked(session_id)
             if lease_id is not None and lease_id in self._expired_leases:
                 raise RuntimeError(
                     f"Lease '{lease_id}' for session '{session_id}' has expired. "
                     f"Expired workers cannot perform operations or reclaim sessions."
                 )
-            self._purge_expired_lease_locked(session_id)
             current = self._session_leases.get(session_id)
             if current is not None:
                 if lease_id != current:

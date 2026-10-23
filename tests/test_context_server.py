@@ -769,3 +769,58 @@ def test_prefix_cache_property_reentrancy_no_deadlock():
     assert server2.prefix_cache is cache2
 
 
+def test_expired_lease_first_operation_fails_without_third_party_purge():
+    """Verify that an expired lease cannot succeed on its first operation even without third-party intervention."""
+    import time
+    server = ContextServer(session_ttl_seconds=0.1, lease_ttl_seconds=0.1)
+
+    # 1. Prompt registration on expired lease without third-party intervention
+    assert server.acquire_lease("s-direct", "lease-alpha") is True
+    time.sleep(0.15)
+    k = torch.randn(1, 2, 4, 16)
+    v = torch.randn(1, 2, 4, 16)
+    with pytest.raises(RuntimeError, match="has expired"):
+        server.register_prompt("s-direct", 0, k, v, lease_id="lease-alpha")
+
+    # 2. Re-acquisition on expired lease without third-party intervention
+    assert server.acquire_lease("s-direct2", "lease-beta") is True
+    time.sleep(0.15)
+    assert server.acquire_lease("s-direct2", "lease-beta") is False
+
+
+def test_compaction_updates_active_session_chunks_in_store():
+    """Verify that radix node compaction updates ContextStore chunks so active sessions don't retain old slabs."""
+    server = ContextServer(max_cached_tokens=200)
+
+    # 1. Register 100 tokens under base session
+    tokens_100 = list(range(1, 101))
+    k100 = torch.randn(1, 2, 100, 16)  # 1 * 2 * 100 * 16 * 4 = 12,800 bytes
+    v100 = torch.randn(1, 2, 100, 16)
+    server.register_prompt("sess-base", 0, k100, v100, token_ids=tokens_100)
+
+    # 2. Bind active session to prefix of length 1 (splits node into 1 token and 99 tokens)
+    matched_len, bound_sid = server.match_prefix([1], target_session_id="sess-active")
+    assert matched_len == 1
+    assert bound_sid == "sess-active"
+
+    # Before eviction: session store chunk references the shared 100-token backing slab (12,800 bytes)
+    chunks_before = server.store.get_chunks("sess-active", 0)
+    assert chunks_before is not None and len(chunks_before) == 1
+    assert chunks_before[0][0].untyped_storage().nbytes() == 12800
+
+    # 3. Release unpinned base session and force eviction of the unpinned 99-token suffix
+    server.release_session("sess-base")
+    server.prefix_cache.max_cached_tokens = 2
+    evicted = server.prefix_cache.evict_if_needed()
+    assert evicted == 99
+
+    # 4. Compaction must update active session chunks in ContextStore:
+    # Storage of sess-active's chunk MUST now occupy only 128 bytes (compacted)!
+    # The 12,800-byte slab must NOT be retained by the active session!
+    chunks_after = server.store.get_chunks("sess-active", 0)
+    assert chunks_after is not None and len(chunks_after) == 1
+    assert chunks_after[0][0].untyped_storage().nbytes() == 128
+    assert chunks_after[0][1].untyped_storage().nbytes() == 128
+
+
+
