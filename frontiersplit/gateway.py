@@ -305,6 +305,7 @@ def create_gateway_app(
                 release_on_completion = True
 
             routed_shard_id: str | None = None
+            routed_client = None
             if (
                 app.state.prefix_router is not None
                 and app.state.disaggregated_model is not None
@@ -317,9 +318,6 @@ def create_gateway_app(
                     )
                     routed_shard_id = decision.shard.shard_id
                     routed_client = decision.shard.get_client()
-                    disagg.context_client = routed_client
-                    for patcher in getattr(disagg, "_patchers", []):
-                        patcher.context_client = routed_client
                 except Exception as e:
                     logger.warning(
                         "PrefixRouter routing failed, falling back to default client: %s",
@@ -365,6 +363,7 @@ def create_gateway_app(
                         release_on_completion=release_on_completion,
                         temperature=req.temperature,
                         top_p=req.top_p,
+                        context_client=routed_client,
                     ):
                         streamed_token_ids.append(token_id)
                         if tok is not None:
@@ -457,6 +456,7 @@ def create_gateway_app(
                 release_on_completion=release_on_completion,
                 temperature=req.temperature,
                 top_p=req.top_p,
+                context_client=routed_client,
             )
             content = (
                 tok.decode(generated_token_ids)

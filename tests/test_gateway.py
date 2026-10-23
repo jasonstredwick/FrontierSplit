@@ -389,3 +389,104 @@ def test_gateway_multi_shard_prefix_routing():
         node_b.close()
         server_a.stop_thread()
         server_b.stop_thread()
+
+
+def test_concurrent_gateway_requests_isolated_shards():
+    """Verify that concurrent requests routed to different shards do not overwrite each other's client.
+
+    Review finding P1.1: Concurrent requests rewrote context_client on the shared model and patchers,
+    causing request A to resume on request B's shard, resulting in 'No prompt KV cache found'
+    and uncleaned sessions on the wrong shard.
+    """
+    import concurrent.futures
+
+    from frontiersplit.context.routing import PrefixRouter
+
+    torch.manual_seed(42)
+    cfg = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+    )
+    model = LlamaForCausalLM(cfg)
+    model.eval()
+
+    server_a = ContextServer()
+    port_a = server_a.start_in_thread(host="127.0.0.1", port=0)
+    server_b = ContextServer()
+    port_b = server_b.start_in_thread(host="127.0.0.1", port=0)
+
+    router = PrefixRouter()
+    node_a = router.add_shard("shard-alpha", "127.0.0.1", port_a)
+    node_b = router.add_shard("shard-beta", "127.0.0.1", port_b)
+
+    disagg = DisaggregatedModel(model=model, context_client=node_a.get_client())
+
+    app = create_gateway_app(
+        model_name="test-concurrent-llama",
+        disaggregated_model=disagg,
+        context_client=node_a.get_client(),
+        prefix_router=router,
+    )
+    test_client = TestClient(app)
+
+    try:
+        # Find two session IDs that naturally hash to shard-alpha and shard-beta
+        session_a: str | None = None
+        session_b: str | None = None
+        for i in range(200):
+            sid = f"concurrent-session-{i}"
+            shard = router.ring.get_node(f"session:{sid}").shard_id
+            if shard == "shard-alpha" and session_a is None:
+                session_a = sid
+            elif shard == "shard-beta" and session_b is None:
+                session_b = sid
+            if session_a and session_b:
+                break
+
+        assert session_a is not None and session_b is not None
+
+        def make_request(session_id: str, content: str):
+            return test_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-concurrent-llama",
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": 4,
+                    "temperature": 0.0,
+                    "stream": True,
+                },
+                headers={
+                    "X-FrontierSplit-Session-ID": session_id,
+                },
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fut_a = executor.submit(make_request, session_a, "1 2 3 4 5")
+            fut_b = executor.submit(make_request, session_b, "10 20 30 40 50")
+            resp_a = fut_a.result()
+            resp_b = fut_b.result()
+
+        assert resp_a.status_code == 200, f"Request A failed: {resp_a.text}"
+        assert resp_b.status_code == 200, f"Request B failed: {resp_b.text}"
+        assert resp_a.headers.get("X-FrontierSplit-Shard-ID") == "shard-alpha"
+        assert resp_b.headers.get("X-FrontierSplit-Shard-ID") == "shard-beta"
+
+        # Verify stream content contains chunks without error
+        assert "data: [DONE]" in resp_a.text
+        assert "data: [DONE]" in resp_b.text
+
+        # Verify session_a is retained on server_a only, and session_b on server_b only
+        assert server_a.store.has_session(session_a)
+        assert not server_a.store.has_session(session_b)
+        assert server_b.store.has_session(session_b)
+        assert not server_b.store.has_session(session_a)
+
+    finally:
+        node_a.close()
+        node_b.close()
+        server_a.stop_thread()
+        server_b.stop_thread()

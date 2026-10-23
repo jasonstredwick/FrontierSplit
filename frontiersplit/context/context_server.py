@@ -490,22 +490,28 @@ class ContextServer:
         """Atomically publishes a staged upload to RadixPrefixCache once all expected layers and token_ids are present."""
         if state.token_ids is None or not state.token_ids:
             return
+        if not state.layers:
+            return
+
         if state.op == "register":
             full_tokens = list(state.token_ids)
+            target_len = len(full_tokens)
+            ready_layers = {
+                l_i: kv
+                for l_i, kv in state.layers.items()
+                if kv[0].shape[-2] == target_len and kv[1].shape[-2] == target_len
+            }
         else:
             if state.base_tokens is None:
                 return
             full_tokens = list(state.base_tokens) + list(state.token_ids)
+            delta_len = len(state.token_ids)
+            ready_layers = {
+                l_i: kv
+                for l_i, kv in state.layers.items()
+                if kv[0].shape[-2] == delta_len and kv[1].shape[-2] == delta_len
+            }
 
-        target_len = len(full_tokens)
-        if not state.layers:
-            return
-
-        ready_layers = {
-            l_i: kv
-            for l_i, kv in state.layers.items()
-            if kv[0].shape[-2] == target_len and kv[1].shape[-2] == target_len
-        }
         required = self._required_layers_for_session(session_id, state.layers)
         if state.expected_layers is not None and state.expected_layers > 0:
             required |= set(range(state.expected_layers))
@@ -513,31 +519,46 @@ class ContextServer:
             return
 
         self._session_tokens[session_id] = full_tokens
-        k_dict = {l_i: kv[0].clone() for l_i, kv in ready_layers.items()}
-        v_dict = {l_i: kv[1].clone() for l_i, kv in ready_layers.items()}
-        self.prefix_cache.insert(full_tokens, k_dict, v_dict)
+        if state.op == "register":
+            k_dict = {l_i: kv[0].clone() for l_i, kv in ready_layers.items()}
+            v_dict = {l_i: kv[1].clone() for l_i, kv in ready_layers.items()}
+            self.prefix_cache.insert(full_tokens, k_dict, v_dict)
+        else:
+            assert state.base_tokens is not None
+            k_dict = {l_i: kv[0].clone() for l_i, kv in ready_layers.items()}
+            v_dict = {l_i: kv[1].clone() for l_i, kv in ready_layers.items()}
+            self.prefix_cache.insert_delta(
+                base_tokens=state.base_tokens,
+                suffix_tokens=state.token_ids,
+                k_delta_by_layer=k_dict,
+                v_delta_by_layer=v_dict,
+            )
         self._set_session_pin(session_id, full_tokens)
 
         # Backfill any active prefix-bound sessions that matched a prefix of `full_tokens`
-        # before later layers were discovered.
-        for other_sid, other_toks in list(self._session_tokens.items()):
-            if other_sid == session_id or not self.store.has_session(other_sid):
-                continue
-            other_len = len(other_toks)
-            if 0 < other_len <= target_len and other_toks == full_tokens[:other_len]:
-                other_layers = self.store.get_session_layer_chunks(other_sid) or {}
-                for l_i, (k_full, v_full) in ready_layers.items():
-                    if l_i not in other_layers:
-                        self.store.register_chunks(
-                            other_sid,
-                            l_i,
-                            [
-                                (
-                                    k_full[:, :, :other_len, :],
-                                    v_full[:, :, :other_len, :],
-                                )
-                            ],
-                        )
+        # before later layers were discovered (applicable during register).
+        if state.op == "register":
+            for other_sid, other_toks in list(self._session_tokens.items()):
+                if other_sid == session_id or not self.store.has_session(other_sid):
+                    continue
+                other_len = len(other_toks)
+                if (
+                    0 < other_len <= target_len
+                    and other_toks == full_tokens[:other_len]
+                ):
+                    other_layers = self.store.get_session_layer_chunks(other_sid) or {}
+                    for l_i, (k_full, v_full) in ready_layers.items():
+                        if l_i not in other_layers:
+                            self.store.register_chunks(
+                                other_sid,
+                                l_i,
+                                [
+                                    (
+                                        k_full[:, :, :other_len, :],
+                                        v_full[:, :, :other_len, :],
+                                    )
+                                ],
+                            )
 
     def register_prompt(
         self,
@@ -658,9 +679,7 @@ class ContextServer:
             v_delta=v_dev,
         )
 
-        kv_full = self.store.get_prompt(session_id, layer_idx)
-        if kv_full is not None:
-            state.layers[layer_idx] = kv_full
+        state.layers[layer_idx] = (k_dev, v_dev)
         if num_layers is not None and num_layers > 0:
             state.expected_layers = num_layers
         if token_ids is not None:

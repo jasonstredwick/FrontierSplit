@@ -33,6 +33,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("frontiersplit.hf_model")
 
+_active_context_client_var: contextvars.ContextVar[ContextClient | None] = (
+    contextvars.ContextVar("frontiersplit_active_context_client", default=None)
+)
+
 
 def _apply_rotary_pos_emb(
     q: torch.Tensor,
@@ -78,6 +82,12 @@ class DisaggregatedAttentionPatcher:
         ] = contextvars.ContextVar(
             f"frontiersplit_attn_session_{id(self)}", default=None
         )
+
+    @property
+    def client(self) -> ContextClient:
+        """Returns the task-bound ContextClient if set, else fallback to instance client."""
+        c = _active_context_client_var.get()
+        return c if c is not None else self.context_client
 
     def set_session(
         self, session_id: str | None, context_len: int | None = None
@@ -149,11 +159,12 @@ class DisaggregatedAttentionPatcher:
             k, v = past_key_values.update(k, v, self.layer_idx)
 
         # 4. Execute disaggregated attention merge over TCP
+        client = self.client
         scaling = getattr(self.original_attn, "scaling", 1.0 / (head_dim**0.5))
         sliding_window = self._get_sliding_window()
 
         if past_key_values is None:
-            prompt_chunk = self.context_client.query_partial_attention_sync(
+            prompt_chunk = client.query_partial_attention_sync(
                 session_id=session_id,
                 layer_idx=self.layer_idx,
                 q=q,
@@ -197,15 +208,13 @@ class DisaggregatedAttentionPatcher:
                     )
 
             # Overlap remote TCP query with local partial attention compute
-            sync_lock = getattr(
-                self.context_client, "_sync_lock", contextlib.nullcontext()
-            )
-            if hasattr(self.context_client, "send_query_partial_sync") and hasattr(
-                self.context_client, "recv_query_partial_sync"
+            sync_lock = getattr(client, "_sync_lock", contextlib.nullcontext())
+            if hasattr(client, "send_query_partial_sync") and hasattr(
+                client, "recv_query_partial_sync"
             ):
                 with sync_lock:
                     try:
-                        self.context_client.send_query_partial_sync(
+                        client.send_query_partial_sync(
                             session_id=session_id,
                             layer_idx=self.layer_idx,
                             q=q,
@@ -218,15 +227,13 @@ class DisaggregatedAttentionPatcher:
                         local_chunk = compute_partial_attention(
                             q, k, v, scale=scaling, attention_mask=local_mask
                         )
-                        prompt_chunk = self.context_client.recv_query_partial_sync(
-                            device=q.device
-                        )
+                        prompt_chunk = client.recv_query_partial_sync(device=q.device)
                     except BaseException:
-                        if hasattr(self.context_client, "close_sync"):
-                            self.context_client.close_sync()
+                        if hasattr(client, "close_sync"):
+                            client.close_sync()
                         raise
             else:
-                prompt_chunk = self.context_client.query_partial_attention_sync(
+                prompt_chunk = client.query_partial_attention_sync(
                     session_id=session_id,
                     layer_idx=self.layer_idx,
                     q=q,
@@ -353,12 +360,18 @@ class DisaggregatedModel:
         for p in self._patchers:
             p.set_session(session_id, context_len=context_len)
 
+    def _get_context_client(self) -> ContextClient:
+        """Returns the task-bound ContextClient if set, else fallback to instance client."""
+        c = _active_context_client_var.get()
+        return c if c is not None else self.context_client
+
     def prefill_and_offload(
         self,
         input_ids: torch.Tensor,
         session_id: str,
         temperature: float = 0.0,
         top_p: float = 1.0,
+        context_client: ContextClient | None = None,
     ) -> tuple[torch.Tensor, int]:
         """Runs prefill on the prompt and offloads static prompt KV caches to Context Server.
 
@@ -367,11 +380,13 @@ class DisaggregatedModel:
             session_id: Unique session identifier.
             temperature: Sampling temperature (0.0 for greedy decoding).
             top_p: Nucleus sampling probability threshold in (0.0, 1.0].
+            context_client: Optional request-bound ContextClient.
 
         Returns:
             Tuple of (first_generated_token_id, prompt_length).
         """
         self._validate_sampling_params(temperature, top_p)
+        client = context_client or self._get_context_client()
         prompt_cache = DynamicCache()
         with self._forward_lock, torch.no_grad():
             self.set_active_session(None)
@@ -392,7 +407,7 @@ class DisaggregatedModel:
         for l_idx, layer in enumerate(prompt_cache.layers):
             k_prompt = layer.keys.clone()
             v_prompt = layer.values.clone()
-            self.context_client.register_prompt_sync(
+            client.register_prompt_sync(
                 session_id=session_id,
                 layer_idx=l_idx,
                 k=k_prompt,
@@ -416,6 +431,7 @@ class DisaggregatedModel:
         temperature: float = 0.0,
         top_p: float = 1.0,
         reasoning_commit_threshold: int = 4000,
+        context_client: ContextClient | None = None,
     ) -> Iterator[int]:
         """Synchronously streams generated tokens one by one as they are produced.
 
@@ -430,6 +446,7 @@ class DisaggregatedModel:
             top_p: Nucleus sampling probability threshold in (0.0, 1.0].
             reasoning_commit_threshold: Token count threshold above which generated reasoning
                 tokens are committed to the Context Server (Review 4.3).
+            context_client: Optional request-bound ContextClient.
 
         Yields:
             Generated token IDs one by one (including the first generated token).
@@ -439,26 +456,38 @@ class DisaggregatedModel:
             self._set_finish_reason("length")
             return
 
+        client_token = (
+            _active_context_client_var.set(context_client)
+            if context_client is not None
+            else None
+        )
         tokens = input_ids[0].tolist()
-        prompt_len = len(tokens)
+        base_prompt_len = len(tokens)
+        remote_prompt_len = base_prompt_len
         eos_ids = self._get_eos_token_ids()
         self._set_finish_reason("length")
 
+        # Initialize lifecycle state BEFORE try: so finally block is always safe
+        generated_tokens: list[int] = []
+        local_cache: DynamicCache | None = None
+        last_committed_idx = 0
+
         try:
+            client = self._get_context_client()
             # Check for warm prefix cache hit on Context Server
             cache_hit = False
             matched_len = 0
             if use_prefix_cache:
-                matched_len, _ = self.context_client.match_prefix_sync(
-                    tokens, session_id=session_id
-                )
-                if matched_len == prompt_len:
+                matched_len, _ = client.match_prefix_sync(tokens, session_id=session_id)
+                if matched_len == base_prompt_len:
                     cache_hit = True
 
             if cache_hit:
                 # 100% prefix cache hit: skip full prefill compute
                 last_tok = input_ids[:, -1:]
-                pos_tensor = torch.tensor([[prompt_len - 1]], device=input_ids.device)
+                pos_tensor = torch.tensor(
+                    [[base_prompt_len - 1]], device=input_ids.device
+                )
                 with self._forward_lock, torch.no_grad():
                     self.set_active_session(session_id)
                     out_fast = self.model(
@@ -467,13 +496,13 @@ class DisaggregatedModel:
                     next_tok = self._sample_next_token(
                         out_fast.logits, temperature=temperature, top_p=top_p
                     )
-            elif 0 < matched_len < prompt_len:
+            elif 0 < matched_len < base_prompt_len:
                 # Disaggregated Delta Prefill:
                 # Tokens [0..matched_len] are already warm on Context Server.
                 # Suffix tokens [matched_len..prompt_len] run forward pass with disaggregated attention.
                 suffix_ids = input_ids[:, matched_len:]
                 suffix_pos = torch.arange(
-                    matched_len, prompt_len, device=input_ids.device
+                    matched_len, base_prompt_len, device=input_ids.device
                 ).unsqueeze(0)
                 suffix_cache = DynamicCache()
                 with self._forward_lock, torch.no_grad():
@@ -493,7 +522,7 @@ class DisaggregatedModel:
                 num_layers = len(suffix_cache.layers)
                 upload_id = uuid.uuid4().hex
                 for l_idx, layer in enumerate(suffix_cache.layers):
-                    self.context_client.append_kv_sync(
+                    client.append_kv_sync(
                         session_id=session_id,
                         layer_idx=l_idx,
                         k_delta=layer.keys,
@@ -512,9 +541,15 @@ class DisaggregatedModel:
                     session_id,
                     temperature=temperature,
                     top_p=top_p,
+                    context_client=client,
                 )
+                base_prompt_len = prompt_len
+                remote_prompt_len = prompt_len
 
             first_tok_id = int(next_tok.item())
+            generated_tokens.append(first_tok_id)
+            local_cache = DynamicCache()
+
             if first_tok_id in eos_ids:
                 self._set_finish_reason("stop")
                 yield first_tok_id
@@ -523,14 +558,10 @@ class DisaggregatedModel:
             yield first_tok_id
             cur_tok = next_tok
 
-            # 2. Local volatile output cache (starts empty; never holds prompt tokens)
-            local_cache = DynamicCache()
-            generated_tokens = [first_tok_id]
-            last_committed_idx = 0
-
             # 3. Autoregressive decode loop
             for step in range(1, max_new_tokens):
-                position = prompt_len + step - 1
+                # Decode positions are strictly contiguous based on immutable base prompt length:
+                position = base_prompt_len + step - 1
                 pos_tensor = torch.tensor([[position]], device=input_ids.device)
 
                 with self._forward_lock, torch.no_grad():
@@ -561,7 +592,7 @@ class DisaggregatedModel:
                     num_layers = len(local_cache.layers)
                     upload_id = uuid.uuid4().hex
                     for l_idx, layer in enumerate(local_cache.layers):
-                        self.context_client.append_kv_sync(
+                        client.append_kv_sync(
                             session_id=session_id,
                             layer_idx=l_idx,
                             k_delta=layer.keys,
@@ -571,7 +602,7 @@ class DisaggregatedModel:
                             upload_id=upload_id,
                         )
                     last_committed_idx += local_len
-                    prompt_len += local_len
+                    remote_prompt_len += local_len
                     local_cache = DynamicCache()
 
                 if tok_id in eos_ids:
@@ -581,37 +612,48 @@ class DisaggregatedModel:
                 yield tok_id
 
         finally:
-            if not release_on_completion:
-                # Turn-boundary reasoning trace commit policy (Review 4.3):
-                # If generated reasoning tokens reach threshold, commit them to the Context Server.
-                total_generated = len(generated_tokens)
-                if (
-                    reasoning_commit_threshold > 0
-                    and total_generated >= reasoning_commit_threshold
-                    and len(local_cache.layers) > 0
-                    and local_cache.layers[0].keys.shape[-2] > 0
-                ):
-                    rem_len = local_cache.layers[0].keys.shape[-2]
-                    chunk_tokens = generated_tokens[
-                        last_committed_idx : last_committed_idx + rem_len
-                    ]
-                    num_layers = len(local_cache.layers)
-                    upload_id = uuid.uuid4().hex
-                    for l_idx, layer in enumerate(local_cache.layers):
-                        self.context_client.append_kv_sync(
-                            session_id=session_id,
-                            layer_idx=l_idx,
-                            k_delta=layer.keys,
-                            v_delta=layer.values,
-                            token_ids=chunk_tokens if l_idx == num_layers - 1 else None,
-                            num_layers=num_layers,
-                            upload_id=upload_id,
-                        )
+            try:
+                if not release_on_completion:
+                    # Turn-boundary reasoning trace commit policy (Review 4.3):
+                    # If generated reasoning tokens reach threshold, commit them to the Context Server.
+                    total_generated = len(generated_tokens)
+                    if (
+                        reasoning_commit_threshold > 0
+                        and total_generated >= reasoning_commit_threshold
+                        and local_cache is not None
+                        and len(local_cache.layers) > 0
+                        and local_cache.layers[0].keys.shape[-2] > 0
+                    ):
+                        rem_len = local_cache.layers[0].keys.shape[-2]
+                        chunk_tokens = generated_tokens[
+                            last_committed_idx : last_committed_idx + rem_len
+                        ]
+                        num_layers = len(local_cache.layers)
+                        upload_id = uuid.uuid4().hex
+                        client = self._get_context_client()
+                        for l_idx, layer in enumerate(local_cache.layers):
+                            client.append_kv_sync(
+                                session_id=session_id,
+                                layer_idx=l_idx,
+                                k_delta=layer.keys,
+                                v_delta=layer.values,
+                                token_ids=chunk_tokens
+                                if l_idx == num_layers - 1
+                                else None,
+                                num_layers=num_layers,
+                                upload_id=upload_id,
+                            )
+                        last_committed_idx += rem_len
+                        remote_prompt_len += rem_len
 
-            if release_on_completion:
-                with contextlib.suppress(Exception):
-                    self.context_client.release_session_sync(session_id)
-            self.set_active_session(None)
+                if release_on_completion:
+                    with contextlib.suppress(Exception):
+                        self._get_context_client().release_session_sync(session_id)
+            finally:
+                # Active session and context client token MUST be cleared unconditionally
+                self.set_active_session(None)
+                if client_token is not None:
+                    _active_context_client_var.reset(client_token)
 
     def generate(
         self,
@@ -623,6 +665,7 @@ class DisaggregatedModel:
         temperature: float = 0.0,
         top_p: float = 1.0,
         reasoning_commit_threshold: int = 4000,
+        context_client: ContextClient | None = None,
     ) -> list[int]:
         """Generates tokens synchronously using disaggregated attention merging.
 
@@ -636,6 +679,7 @@ class DisaggregatedModel:
             top_p: Nucleus sampling probability threshold in (0.0, 1.0].
             reasoning_commit_threshold: Token count threshold above which generated reasoning
                 tokens are committed to the Context Server (Review 4.3).
+            context_client: Optional request-bound ContextClient.
 
         Returns:
             List of generated token IDs (including the first generated token).
@@ -650,6 +694,7 @@ class DisaggregatedModel:
                 temperature=temperature,
                 top_p=top_p,
                 reasoning_commit_threshold=reasoning_commit_threshold,
+                context_client=context_client,
             )
         )
 
@@ -659,9 +704,11 @@ class DisaggregatedModel:
         session_id: str,
         temperature: float = 0.0,
         top_p: float = 1.0,
+        context_client: ContextClient | None = None,
     ) -> tuple[torch.Tensor, int]:
         """Asynchronously runs prefill on the prompt and offloads KV caches."""
         self._validate_sampling_params(temperature, top_p)
+        client = context_client or self._get_context_client()
         prompt_cache = DynamicCache()
         with self._forward_lock, torch.no_grad():
             self.set_active_session(None)
@@ -683,7 +730,7 @@ class DisaggregatedModel:
             k_prompt = layer.keys.clone()
             v_prompt = layer.values.clone()
             tasks.append(
-                self.context_client.register_prompt(
+                client.register_prompt(
                     session_id=session_id,
                     layer_idx=l_idx,
                     k=k_prompt,
@@ -708,6 +755,7 @@ class DisaggregatedModel:
         temperature: float = 0.0,
         top_p: float = 1.0,
         reasoning_commit_threshold: int = 4000,
+        context_client: ContextClient | None = None,
     ) -> AsyncIterator[int]:
         """Asynchronously streams generated tokens one by one as they are produced.
 
@@ -721,6 +769,7 @@ class DisaggregatedModel:
             top_p: Nucleus sampling probability threshold in (0.0, 1.0].
             reasoning_commit_threshold: Token count threshold above which generated reasoning
                 tokens are committed to the Context Server (Review 4.3).
+            context_client: Optional request-bound ContextClient.
 
         Yields:
             Generated token IDs one by one (including the first generated token).
@@ -730,24 +779,38 @@ class DisaggregatedModel:
             self._set_finish_reason("length")
             return
 
+        client_token = (
+            _active_context_client_var.set(context_client)
+            if context_client is not None
+            else None
+        )
         tokens = input_ids[0].tolist()
-        prompt_len = len(tokens)
+        base_prompt_len = len(tokens)
+        remote_prompt_len = base_prompt_len
         eos_ids = self._get_eos_token_ids()
         self._set_finish_reason("length")
 
+        # Initialize lifecycle state BEFORE try: so finally block is always safe
+        generated_tokens: list[int] = []
+        local_cache: DynamicCache | None = None
+        last_committed_idx = 0
+
         try:
+            client = self._get_context_client()
             cache_hit = False
             matched_len = 0
             if use_prefix_cache:
-                matched_len, _ = await self.context_client.match_prefix(
+                matched_len, _ = await client.match_prefix(
                     tokens, session_id=session_id
                 )
-                if matched_len == prompt_len:
+                if matched_len == base_prompt_len:
                     cache_hit = True
 
             if cache_hit:
                 last_tok = input_ids[:, -1:]
-                pos_tensor = torch.tensor([[prompt_len - 1]], device=input_ids.device)
+                pos_tensor = torch.tensor(
+                    [[base_prompt_len - 1]], device=input_ids.device
+                )
                 with self._forward_lock, torch.no_grad():
                     self.set_active_session(session_id)
                     out_fast = self.model(
@@ -756,10 +819,10 @@ class DisaggregatedModel:
                     next_tok = self._sample_next_token(
                         out_fast.logits, temperature=temperature, top_p=top_p
                     )
-            elif 0 < matched_len < prompt_len:
+            elif 0 < matched_len < base_prompt_len:
                 suffix_ids = input_ids[:, matched_len:]
                 suffix_pos = torch.arange(
-                    matched_len, prompt_len, device=input_ids.device
+                    matched_len, base_prompt_len, device=input_ids.device
                 ).unsqueeze(0)
                 suffix_cache = DynamicCache()
                 with self._forward_lock, torch.no_grad():
@@ -778,7 +841,7 @@ class DisaggregatedModel:
                 num_layers = len(suffix_cache.layers)
                 upload_id = uuid.uuid4().hex
                 tasks = [
-                    self.context_client.append_kv(
+                    client.append_kv(
                         session_id=session_id,
                         layer_idx=l_idx,
                         k_delta=layer.keys,
@@ -797,9 +860,15 @@ class DisaggregatedModel:
                     session_id,
                     temperature=temperature,
                     top_p=top_p,
+                    context_client=client,
                 )
+                base_prompt_len = prompt_len
+                remote_prompt_len = prompt_len
 
             first_tok_id = int(next_tok.item())
+            generated_tokens.append(first_tok_id)
+            local_cache = DynamicCache()
+
             if first_tok_id in eos_ids:
                 self._set_finish_reason("stop")
                 yield first_tok_id
@@ -807,12 +876,10 @@ class DisaggregatedModel:
 
             yield first_tok_id
             cur_tok = next_tok
-            local_cache = DynamicCache()
-            generated_tokens = [first_tok_id]
-            last_committed_idx = 0
 
             for step in range(1, max_new_tokens):
-                position = prompt_len + step - 1
+                # Decode positions are strictly contiguous based on immutable base prompt length:
+                position = base_prompt_len + step - 1
                 pos_tensor = torch.tensor([[position]], device=input_ids.device)
 
                 with self._forward_lock, torch.no_grad():
@@ -843,7 +910,7 @@ class DisaggregatedModel:
                     num_layers = len(local_cache.layers)
                     upload_id = uuid.uuid4().hex
                     tasks = [
-                        self.context_client.append_kv(
+                        client.append_kv(
                             session_id=session_id,
                             layer_idx=l_idx,
                             k_delta=layer.keys,
@@ -856,7 +923,7 @@ class DisaggregatedModel:
                     ]
                     await asyncio.gather(*tasks)
                     last_committed_idx += local_len
-                    prompt_len += local_len
+                    remote_prompt_len += local_len
                     local_cache = DynamicCache()
 
                 if tok_id in eos_ids:
@@ -866,39 +933,48 @@ class DisaggregatedModel:
                 yield tok_id
 
         finally:
-            if not release_on_completion:
-                total_generated = len(generated_tokens)
-                if (
-                    reasoning_commit_threshold > 0
-                    and total_generated >= reasoning_commit_threshold
-                    and len(local_cache.layers) > 0
-                    and local_cache.layers[0].keys.shape[-2] > 0
-                ):
-                    rem_len = local_cache.layers[0].keys.shape[-2]
-                    chunk_tokens = generated_tokens[
-                        last_committed_idx : last_committed_idx + rem_len
-                    ]
-                    num_layers = len(local_cache.layers)
-                    upload_id = uuid.uuid4().hex
-                    tasks = [
-                        self.context_client.append_kv(
-                            session_id=session_id,
-                            layer_idx=l_idx,
-                            k_delta=layer.keys,
-                            v_delta=layer.values,
-                            token_ids=chunk_tokens if l_idx == num_layers - 1 else None,
-                            num_layers=num_layers,
-                            upload_id=upload_id,
-                        )
-                        for l_idx, layer in enumerate(local_cache.layers)
-                    ]
-                    with contextlib.suppress(Exception):
-                        await asyncio.gather(*tasks)
+            try:
+                if not release_on_completion:
+                    total_generated = len(generated_tokens)
+                    if (
+                        reasoning_commit_threshold > 0
+                        and total_generated >= reasoning_commit_threshold
+                        and local_cache is not None
+                        and len(local_cache.layers) > 0
+                        and local_cache.layers[0].keys.shape[-2] > 0
+                    ):
+                        rem_len = local_cache.layers[0].keys.shape[-2]
+                        chunk_tokens = generated_tokens[
+                            last_committed_idx : last_committed_idx + rem_len
+                        ]
+                        num_layers = len(local_cache.layers)
+                        upload_id = uuid.uuid4().hex
+                        client = self._get_context_client()
+                        tasks = [
+                            client.append_kv(
+                                session_id=session_id,
+                                layer_idx=l_idx,
+                                k_delta=layer.keys,
+                                v_delta=layer.values,
+                                token_ids=chunk_tokens
+                                if l_idx == num_layers - 1
+                                else None,
+                                num_layers=num_layers,
+                                upload_id=upload_id,
+                            )
+                            for l_idx, layer in enumerate(local_cache.layers)
+                        ]
+                        with contextlib.suppress(Exception):
+                            await asyncio.gather(*tasks)
 
-            if release_on_completion:
-                with contextlib.suppress(Exception):
-                    await self.context_client.release_session(session_id)
-            self.set_active_session(None)
+                if release_on_completion:
+                    with contextlib.suppress(Exception):
+                        await self._get_context_client().release_session(session_id)
+            finally:
+                # Active session and context client token MUST be cleared unconditionally
+                self.set_active_session(None)
+                if client_token is not None:
+                    _active_context_client_var.reset(client_token)
 
     async def generate_async(
         self,
@@ -910,6 +986,7 @@ class DisaggregatedModel:
         temperature: float = 0.0,
         top_p: float = 1.0,
         reasoning_commit_threshold: int = 4000,
+        context_client: ContextClient | None = None,
     ) -> list[int]:
         """Asynchronously generates tokens using disaggregated attention merging.
 
@@ -923,6 +1000,7 @@ class DisaggregatedModel:
             top_p: Nucleus sampling probability threshold in (0.0, 1.0].
             reasoning_commit_threshold: Token count threshold above which generated reasoning
                 tokens are committed to the Context Server (Review 4.3).
+            context_client: Optional request-bound ContextClient.
 
         Returns:
             List of generated token IDs (including the first generated token).
@@ -937,6 +1015,7 @@ class DisaggregatedModel:
             temperature=temperature,
             top_p=top_p,
             reasoning_commit_threshold=reasoning_commit_threshold,
+            context_client=context_client,
         ):
             generated.append(tok)
         return generated

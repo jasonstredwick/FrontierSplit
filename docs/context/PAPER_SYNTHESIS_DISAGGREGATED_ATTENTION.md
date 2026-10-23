@@ -42,41 +42,67 @@ $$O = \frac{A_{\text{global}}}{\ell_{\text{global}}}$$
 
 ### Properties of the $\oplus$ Operator
 1. **Associativity**: $(X \oplus Y) \oplus Z = X \oplus (Y \oplus Z)$. Partitions can be grouped and reduced in arbitrary order or tree hierarchies.
-2. **Commutativity**: $X \oplus Y = Y \oplus X$. Physical storage ordering across shards or blocks does not alter numerical output.
-3. **Bit-for-Bit Exactness**: When computed in identical floating-point precision (FP32), $O$ matches monolithic single-pass attention with zero mathematical approximation.
+2. **Commutativity**: $X \oplus Y = Y \oplus X$. Physical storage ordering across shards or blocks does not alter numerical output in real arithmetic.
+3. **Exact Mathematical Decomposition with Floating-Point Numerical Precision**: In real arithmetic, the $\oplus$ reduction operator is strictly exact with zero theoretical approximation error. However, when evaluated in IEEE 754 floating-point arithmetic (FP32), altering the reduction order across sequence partitions introduces slight non-associative floating-point summation rounding errors (e.g. maximum absolute differences on the order of $\sim 2.98 \times 10^{-7}$). Consequently, `torch.equal` is false while `torch.allclose` passes with standard tolerance ($\text{atol} = 10^{-5}$). As explicitly documented in the [PyTorch Numerical Accuracy Notes](https://docs.pytorch.org/docs/main/notes/numerical_accuracy.html), mathematically equivalent operations evaluated in different summation orders are not guaranteed to be bitwise identical.
 
 ---
 
-## 2. Communication Complexity: The 8.25 KB Derivation
+## 2. Communication Complexity: The 16.7 KB Response & GQA KV Bandwidth
 
 In modern open-weights architectures (e.g., Llama 3 8B, Mistral 7B, Mixtral 8x7B):
 - Number of Query Heads ($H_q$): $32$
-- Head Dimension ($d_k = d_v$): $128$
+- Number of Key-Value Heads ($H_{\text{kv}}$): $8$ (Grouped-Query Attention with $4:1$ ratio)
+- Head Dimension ($d = d_k = d_v$): $128$
 - Total Model Hidden Size: $H_q \times d = 32 \times 128 = 4{,}096$
 
-### Why the Partial Attention Response is 8.25 KB (Not 32 Bytes)
+### Why the Partial Attention Response is ~16.7 KB (Not 32 Bytes or 8.25 KB)
 If a remote context machine only returned the softmax normalizers ($m_p$ and $\ell_p$), the decode worker would still require the raw Value vectors $V_p$ to compute $\sum \text{softmax}(S) \cdot V$. But $V_p$ is the multi-gigabyte cache.
 
 By executing the contraction with $V$ **remotely on the Context Server**, the $N$-token sequence collapses into a single 1-token output vector:
 
 $$\underbrace{S_p}_{[32, 1, N]} \times \underbrace{V_p}_{[32, N, 128]} = \underbrace{A_p}_{[32, 1, 128]}$$
 
+To preserve numerical stability and prevent exponent underflow/overflow during multi-chunk online softmax reductions, the Context Server returns the partial accumulator $A_p$ in **FP32** (4 bytes per element) rather than FP16:
+
 | Payload Component | Tensor Dimensions | Precision | Size |
 | :--- | :--- | :--- | :--- |
 | **Query Request ($Q$)** | $[1, 32, 1, 128]$ | FP16 (2 bytes) | **$8{,}192\text{ bytes}$ ($8.0\text{ KB}$)** |
-| **Partial Accumulator ($A_p$)** | $[1, 32, 1, 128]$ | FP16 (2 bytes) | **$8{,}192\text{ bytes}$ ($8.0\text{ KB}$)** |
+| **Partial Accumulator ($A_p$)** | $[1, 32, 1, 128]$ | FP32 (4 bytes) | **$16{,}384\text{ bytes}$ ($16.0\text{ KB}$)** |
 | **Max Logit Vector ($m_p$)** | $[1, 32, 1, 1]$ | FP32 (4 bytes) | **$128\text{ bytes}$** |
 | **Sum-of-Exp Vector ($\ell_p$)** | $[1, 32, 1, 1]$ | FP32 (4 bytes) | **$128\text{ bytes}$** |
-| **Frame Framing / Metadata** | Struct header | — | **$\sim 64\text{ bytes}$** |
-| **Total RPC Response** | | | **$\approx 8{,}512\text{ bytes}$ ($8.25\text{ KB}$)** |
+| **Binary Protocol Header / Framing** | 16-byte fixed header + JSON metadata | — | **$\sim 79\text{ bytes}$** |
+| **Total RPC Response Wire Size** | | | **$\approx 16{,}719\text{ bytes}$ ($16.33\text{ KB}$)** |
+| **Total Roundtrip Wire Footprint** | Send + Receive | | **$\approx 24{,}991\text{ bytes}$ ($24.40\text{ KB}$)** |
 
-### Bandwidth Compression Ratio
+### GQA KV Cache Sizing & Bandwidth Comparison
+
+In Grouped-Query Attention (GQA), the memory footprint of Key and Value caches depends on $H_{\text{kv}}$ ($8$ heads), not $H_q$ ($32$ heads):
+
+$$\text{KV footprint per token per layer} = 2 \times H_{\text{kv}} \times d \times 2\text{ bytes (FP16)} = 2 \times 8 \times 128 \times 2 = 4{,}096\text{ bytes} = \mathbf{4.0\text{ KB}}$$
+
 For a 100,000-token prompt:
-- **Raw KV Migration (vLLM / Mooncake / LMCache)**:
-  $$100{,}000\text{ tokens} \times 4{,}096\text{ dim} \times 2 \times 2\text{ (K and V)} = \mathbf{1{,}600\text{ MB (1.6 GB)}}$$
-- **FrontierSplit Compute-to-Data RPC**:
-  $$8.0\text{ KB (Send)} + 8.25\text{ KB (Receive)} = \mathbf{16.25\text{ KB}}$$
-- **Compression Advantage**: $\mathbf{98{,}461\times}$ reduction in wire bandwidth.
+- **Raw KV Cache per Layer**:
+  $$100{,}000\text{ tokens} \times 4{,}096\text{ bytes} = \mathbf{409.6\text{ MB per layer}}$$
+- **Full Model Raw KV Cache (32 layers)**:
+  $$32 \times 409.6\text{ MB} = \mathbf{13.11\text{ GB}}$$
+
+### Traffic Comparison Formulation: Single-Step vs. Total Workload
+Comparing a single decode RPC against a full cache migration illustrates the instantaneous transfer compression, but full workload bandwidth depends on generated tokens ($T_{\text{gen}}$), layer count ($L$), initial uploads, commits, and prefix cache hits:
+
+1. **Full-Cache Migration (e.g. vLLM / Mooncake / LMCache)**:
+   $$\text{Traffic}_{\text{mig}} = L \times (2 \times H_{\text{kv}} \times d \times 2) \times N_{\text{prompt}}$$
+   Migrating the entire 100k cache once transfers **$13.11\text{ GB}$**.
+
+2. **FrontierSplit Compute-to-Data RPC**:
+   $$\text{Traffic}_{\text{disagg}} = L \times T_{\text{gen}} \times (Q_{\text{bytes}} + A_{p,\text{bytes}} + \text{framing}) + \text{Uploads}_{\text{initial}} + \text{Commits}_{\text{reasoning}}$$
+
+- **Instantaneous Single-Layer Decode Step**:
+  Transfers $24.99\text{ KB}$ roundtrip vs. $409.6\text{ MB}$ raw KV migration $\to \mathbf{16{,}390\times}$ reduction in wire transfer for that step.
+- **Multi-Turn Generation Example ($T_{\text{gen}} = 10$ tokens with warm prefix)**:
+  - Cache migration: transfers $13.11\text{ GB}$ upfront before generating.
+  - FrontierSplit: transfers $32\text{ layers} \times 10\text{ tokens} \times 24.99\text{ KB} \approx \mathbf{8.00\text{ MB}}$ total roundtrip traffic $\to \mathbf{1{,}638\times}$ overall bandwidth reduction.
+- **Long Generation Regime**:
+  As $T_{\text{gen}}$ scales into tens of thousands of tokens without prompt reuse, total RPC traffic grows linearly with $T_{\text{gen}} \times L$, defining the operational crossover point where local KV caching or turn-boundary commits are favored.
 
 ---
 
@@ -116,22 +142,21 @@ During autoregressive generation ($M=1$ token):
 2. **$K$ is streamed in chunks**:
    - The memory bus streams chunks of $K$ past the stationary $Q$.
    - Each byte of $K$ is read from VRAM/HBM **only once**.
-3. **Execution is 100% Memory-Bandwidth Bound**:
-   - Compute FLOPs take nanoseconds; latency is determined solely by the speed of reading the KV cache from off-chip memory.
+3. **Execution is Memory-Bandwidth Bound**:
+   - Compute FLOPs execute in nanoseconds; latency is determined predominantly by reading the KV cache from off-chip memory.
+   - Memory controller throughput relies on wide burst accesses (typically 64-byte or 128-byte cache lines); fine-grained, arbitrary pointer-chasing introduces address translation and bus turnaround penalties, making contiguous chunking essential.
 
-### 3.2 TPU Systolic Array Realities ($128 \times 128$ MXU)
-- A single TPU Matrix Multiply Unit (MXU) contains a physical grid of $128 \times 128 = 16{,}384$ physical multiplier units.
-- **Contracting Dimension ($d=128$)**: The head dimension of standard LLMs ($128$) matches the hardware width of the MXU array directly.
-- **Token Dimension ($N$)**: Sizing KV cache blocks in multiples of 128 tokens ensures that $K^T$ $[128, N]$ tiles evenly across the 128-column grid with zero unused multiplier columns.
-- **XLA Static Shape Requirement**: If chunk lengths vary dynamically (e.g. 1,843 tokens vs. 1,844 tokens), Google's XLA compiler halts execution to compile new machine code graphs. Quantizing cache storage into **128-token blocks** eliminates XLA recompilation entirely: the kernel for shape $[128, 128]$ is compiled once and reused across all sessions.
+### 3.2 TPU Systolic Array Considerations & Matrix Architecture
+- **Systolic Array Mechanics**: Unlike general-purpose CPU cores or GPU thread schedulers where 128 rows represent independently schedulable program counters, a TPU Matrix Multiply Unit (MXU) is a physical 2D grid of multiplier-accumulators operating in rigid lockstep dataflow.
+- **TPU Hardware Generations**: Hardware configurations vary across generations. TPU v2 and v3 feature $128 \times 128$ physical systolic arrays. In contrast, newer generations such as TPU v4, TPU v5e, and TPU v5p deploy evolved matrix execution units (e.g., dual $128 \times 128$ arrays in v4, smaller or specialized dimensional tiles in v5e).
+- **Tiling Alignment**: Sizing KV cache blocks in uniform multiples (such as 128 tokens) aligns with contracting dimensions and hardware tile boundaries, amortizing padding waste.
+- **XLA Graph Compilation**: Google XLA compiles static computational graphs for fixed tensor dimensions. Using quantized, predictable chunk sizes minimizes the frequency of dynamic shape recompilations across conversational turns.
 
 ---
 
-## 4. The Two-Tier Chunking Architecture (Derivation of Split-K)
+## 4. The Two-Tier Chunking Architecture (Relation to Split-K & Flash-Decoding)
 
-When $M = 1$, a single user only supplies 1 row to the 128-tall hardware multiplier array. Running a single row leaves the remaining 127 rows idle.
-
-This motivates **Two-Tier Chunking**:
+Partitioning the sequence dimension during decode attention and reducing partial accumulators using online softmax was pioneered by **Flash-Decoding (Dao et al., 2023)**. FrontierSplit extends this sequence-partitioning principle from within a single GPU SM to a distributed multi-tenant context fabric.
 
 ```
                        KV Cache Sequence (e.g. 16,384 tokens)
@@ -142,7 +167,7 @@ This motivates **Two-Tier Chunking**:
           │              │              │                             │
           ▼              ▼              ▼                             ▼
      ┌─────────┐    ┌─────────┐    ┌─────────┐                   ┌─────────┐
-     │  Row 0  │    │  Row 1  │    │  Row 2  │                   │ Row 127 │
+     │  Part 0 │    │  Part 1 │    │  Part 2 │                   │ Part 127│
      └────┬────┘    └────┬────┘    └────┬────┘                   └────┬────┘
           │              │              │                             │
           ▼              ▼              ▼                             ▼
@@ -154,20 +179,18 @@ This motivates **Two-Tier Chunking**:
                                Final Attention Output
 ```
 
-1. **Tier 1 (Horizontal / Tile Size)**: Sized to 128 tokens to saturate the inner contracting dimension of the multiplier line.
-2. **Tier 2 (Vertical / Spatial Parallelism - Split-K)**: Instead of a single row processing Chunk 0 through Chunk 127 sequentially, the 128 chunks are dispatched across **128 parallel compute lines / cores simultaneously for that single user**.
-3. **The Unification**: The reduction of those 128 partial results on-chip uses the **exact same Online Softmax operator ($\oplus$)** as FrontierSplit's cross-machine reduction.
+1. **Tier 1 (Horizontal / Tile Size Alignment)**: Sized to 128 tokens to saturate the inner contracting dimension of the multiplier line.
+2. **Tier 2 (Vertical / Spatial Parallelism - Split-K) [Proposed Architecture]**: Instead of evaluating chunks sequentially on a single thread, partitions are dispatched across parallel execution units simultaneously. *(Current prototype implementation: evaluates chunks iteratively in PyTorch on the Context Server without requiring custom kernel dependencies).*
+3. **The Unification**: The reduction of partial attention results on-chip (Flash-Decoding) and across distributed network nodes (FrontierSplit) shares the **exact same associative Online Softmax operator ($\oplus$)**.
 
 ---
 
-## 5. Memory Management: Radix Nodes vs. Page Tables (Review 4.1)
+## 5. Memory Management: Radix Nodes vs. Page Tables
 
-### The PyTorch Strided Memory Constraint
-Physical silicon has no requirement that memory be contiguous; the memory controller can read from arbitrary non-sequential addresses with zero latency penalty.
+### Memory Access Realities & Contiguity Trade-offs
+Standard DRAM and HBM memory controllers achieve theoretical bandwidth peaks when accessing sequentially aligned cache lines (typically 64 or 128 contiguous bytes). Random scattered memory access across arbitrary memory pointers incurs memory bus turnaround and TLB lookup overhead.
 
-The requirement for contiguity is an artifact of high-level software libraries:
-- Standard PyTorch `torch.matmul` requires uniform strides ($\text{Address} = \text{Base} + i \cdot \text{Stride}$).
-- PyTorch has no native tensor constructor for arbitrary scattered memory pointers.
+In deep learning frameworks like PyTorch, tensor operations (`torch.matmul`, `F.scaled_dot_product_attention`) enforce uniform strided layouts ($\text{Address} = \text{Base} + i \cdot \text{Stride}$).
 
 ### Architectural Approaches to Non-Contiguous Caching
 
@@ -183,7 +206,7 @@ flowchart TD
         P1 & P2 & P3 --> BT --> CK
     end
 
-    subgraph FrontierSplitApproach ["Approach B: FrontierSplit Online Softmax (4.1)"]
+    subgraph FrontierSplitApproach ["Approach B: FrontierSplit Online Softmax"]
         N1["Node A (System Prompt: 2,000 tok)\nContiguous Tensor 1"]
         N2["Node B (Repo / Doc: 30,000 tok)\nContiguous Tensor 2"]
         N3["Node C (Turn 1: 500 tok)\nContiguous Tensor 3"]
@@ -196,18 +219,18 @@ flowchart TD
     end
 ```
 
-- **vLLM PagedAttention**: Chops memory into tiny 16-token physical blocks. Because a 10k prompt has 625 pages, a Python loop is impossible; it requires thousands of lines of custom C++/CUDA kernels to traverse the block table on the GPU.
-- **FrontierSplit Radix Node Attention (4.1)**:
-  - Chunks are **large semantic nodes** (e.g. 2k-token system prompt, 30k-token repository).
-  - Each individual node is an internally contiguous PyTorch tensor.
-  - A request spans only 2 or 3 nodes.
-  - Calling PyTorch on Node A and Node B and merging with `merge_two_partial_attentions` takes **microseconds**, with **zero custom C++ dependencies** and **zero `torch.cat` memory copying**.
+- **vLLM PagedAttention**: Chops memory into tiny 16-token physical blocks. Because a 10k prompt spans 625 pages, standard Python dispatch is impossible; it requires thousands of lines of custom C++/CUDA kernels to traverse the block table on the GPU.
+- **FrontierSplit Radix Node Attention [Implemented in Current System]**:
+  - Chunks correspond to **semantic nodes** in a prefix trie (e.g. system prompt, repository context, turn history).
+  - Each individual node is an internally contiguous PyTorch tensor, preserving burst memory bandwidth.
+  - A typical request spans only 2 to 4 nodes.
+  - Calling standard PyTorch GEMMs on each node and merging with `merge_two_partial_attentions` runs with microsecond overhead, requiring **zero custom C++ dependencies** and **zero `torch.cat` memory copying**.
 
 ---
 
 ## 6. Distributed Context Fabric: Cloud Topology, Sizing, and Multi-User Scheduling
 
-This section establishes the operational methodology for deploying, sizing, and scheduling a distributed FrontierSplit cluster across multi-tenant production traffic.
+This section details the operational methodology for deploying, sizing, and scheduling a distributed FrontierSplit cluster across multi-tenant traffic, explicitly delineating current implementation from proposed architectural extensions.
 
 ### 6.1 Model Slicing & Vertical Layer Allocation ($L_c$)
 The cluster administrator sizes compute nodes according to model weight footprint and hardware bandwidth:
@@ -215,98 +238,56 @@ The cluster administrator sizes compute nodes according to model weight footprin
 - **Execution Boundary**: Each compute stage executes its assigned layers in local GPU VRAM. The boundary between compute stages is strictly the intermediate activation tensor ($\sim 16\text{ KB}$ per token).
 - While compute stages host model weights, Key-Value caches for all $L_c$ layers are disaggregated to the Context Fabric.
 
-### 6.2 Separation of Compute & Context, and the Remainder Optimization ($N \pmod{128}$)
-Compute workers (model weight nodes) and Context Servers remain strictly disaggregated:
-- Compute workers hold model weights and maintain a **small, volatile local KV cache** (`LocalOutputKVCache` / `DynamicCache`) dedicated to newly generated output tokens and incoming delta prefill tokens.
-- **The Remainder Optimization**: When an arbitrary prompt of $N$ tokens is registered:
-  $$\text{Tiled Context} = \lfloor N / 128 \rfloor \times 128$$
-  $$\text{Remainder} = N \pmod{128}$$
-  - The clean $128$-token blocks are offloaded to the Context Server, guaranteeing 100% hardware tile saturation with **zero masked positions**.
-  - The ragged remainder tokens ($< 128$) are retained directly in the compute worker's existing local volatile cache, alongside newly generated tokens.
-  - The attention merge becomes:
-    $$O = \operatorname{Remote}(\text{Tiled Context}) \oplus \operatorname{Local}(\text{Remainder} + \text{Output Tokens})$$
-  - This eliminates tail padding waste and XLA recompilation on the Context Server without requiring any new local memory structures.
+### 6.2 Separation of Compute & Context, and the Remainder Optimization
+- **Current Implementation**: Compute workers hold model weights and maintain a volatile local output cache (`DynamicCache`) for newly generated decode tokens. Prompts and delta prefill suffixes are offloaded in full to the Context Server, which executes partial attention over stored prompt KV chunks.
+- **Proposed Optimization: Remainder Retention ($N \pmod{128}$)**:
+  - Clean 128-token blocks are offloaded to the Context Server ($\lfloor N / 128 \rfloor \times 128$), ensuring exact tile alignment with zero tail padding.
+  - The ragged remainder ($N \pmod{128} < 128$ tokens) is retained directly on the compute worker's volatile local cache alongside newly generated tokens.
+  - Merge: $O = \operatorname{Remote}(\text{Tiled Context}) \oplus \operatorname{Local}(\text{Remainder} + \text{Output Tokens})$.
 
-### 6.3 Analytical Multi-Machine Sharding Trigger
-The decision to keep a prompt on a single Context Machine vs. sharding across $P$ machines is governed by an analytical roofline cost model:
-
-Let:
-- $K = \text{number of 128-token blocks in the prompt}$.
-- $T_{\text{cycle}} = \text{time to stream one 128-token block from local VRAM/HBM}$.
-- $T_{\text{network}} = \text{persistent binary TCP RPC roundtrip latency } (\approx 0.5\text{ ms})$.
-
-$$\text{Latency on 1 Machine: } T_{\text{single}} = K \times T_{\text{cycle}}$$
-$$\text{Latency Sharded across } P \text{ Machines: } T_{\text{sharded}} = \left(\frac{K}{P} \times T_{\text{cycle}}\right) + T_{\text{network}}$$
-
-The Gateway shards across $P$ machines if and only if the memory streaming savings exceed the network latency tax:
+### 6.3 Analytical Multi-Machine Sharding Trigger [Proposed Architecture]
+The decision to partition a single prompt across $P$ context servers vs. hosting on 1 machine is governed by an analytical roofline model:
 
 $$\left(1 - \frac{1}{P}\right) K \times T_{\text{cycle}} > T_{\text{network}}$$
 
-If a prompt is small, network latency dominates $\to$ **retain on 1 machine**. If a prompt is massive (e.g. 500k–1M+ tokens), memory streaming dominates $\to$ **shard across $P$ machines**, dropping single-stream decode latency by nearly $P\times$.
+- Small to moderate prompts ($< 100\text{k}$ tokens): Network latency dominates $\to$ retain on a single shard.
+- Massive contexts ($> 500\text{k}$ tokens): Memory streaming time dominates $\to$ shard across $P$ nodes to reduce single-stream decode latency by nearly $P\times$.
+- *(Current prototype implementation: The Gateway routes each request to a single target shard selected via `PrefixRouter` consistent hashing).*
 
-### 6.4 Layer Stacking & Deterministic Temporal Interleaving
-For a single conversational stream, transformer layers are evaluated strictly sequentially:
-$$L_0 \to \text{MLP}_0 \to L_1 \to \text{MLP}_1 \to \dots \to L_{31} \to \text{MLP}_{31}$$
+### 6.4 Layer Stacking & Deterministic Temporal Interleaving [Architectural Model]
+For a single conversational stream, transformer layers are evaluated strictly sequentially ($L_0 \to \text{MLP}_0 \to L_1 \to \dots$).
+- **Layer Stacking**: A user session's KV caches for all $L$ layers are co-located on the same Context Server.
+- **Temporal Interleaving**: During the feed-forward MLP computation ($T_{\text{MLP}}$) on the compute worker, the Context Server interleaves queries from other staggered streams, achieving high memory bus saturation without multi-batch synchronization stalls.
 
-- **Layer Stacking**: A user session's KV caches for all $L$ layers are co-located on the same Context Server. At any given instant, that session only queries a single layer.
-- **Eliminating the Idle Bubble**: While the compute worker evaluates the feed-forward MLP ($\text{MLP}_i$) and layer norms, the Context Server experiences a deterministic idle window of duration $T_{\text{MLP}}$.
-- By staggering concurrent user requests by phase offsets of $\Delta t \approx T_{\text{MLP}}$, the Context Server interleaves Layer $j$ of User B into the idle window of User A:
-  ```text
-  Context Server: [User A: L0] ──► [User B: L4] ──► [User C: L12] ──► [User A: L1] ...
-  ```
-  The Context Server’s memory bus and compute cores achieve 100% continuous temporal utilization.
+### 6.5 Multi-User Allocation: Sizing Spectrum & Lockstep Prevention [Architectural Model]
+Let $K_{\text{sat}}$ be the hardware saturation threshold—the number of chunks that saturates a machine's execution bandwidth in a single parallel pass:
+1. **Under-Saturation (1 Chunk per Machine)**: Susceptible to spatial convoys / lockstep queuing in multi-user systems.
+2. **Saturated Allocation ($K_{\text{sat}}$ Chunks per Machine) — [Target Architecture]**: Prompts allocated in units of $K_{\text{sat}}$ chunks per node, eliminating lockstep convoys and minimizing network RPC fan-out.
+3. **Oversubscription ($> K_{\text{sat}}$ Chunks per Machine)**: Machine holds multiple passes of chunks, trading single-user latency for zero network fan-out.
 
-### 6.5 Multi-User Allocation: The $K_{\text{sat}}$ Sizing Spectrum & Lockstep Prevention
-In multi-tenant environments, the distribution of chunks per machine dictates cluster queuing stability. We define $K_{\text{sat}}$ as the **hardware saturation threshold**—the exact number of chunks that saturates a machine's execution cores/bandwidth in a single parallel pass (e.g. 16 blocks of 128 tokens $\approx 2{,}048$ tokens).
+### 6.6 Hot Prefix Replication via Active Reader Counting [Proposed Architecture]
+- In high-concurrency environments, popular shared prefixes (system prompts, repository indexes) track an `active_reader_count`.
+- When reader concurrency exceeds a provisioned threshold, the Context Fabric clones the node to secondary Context Servers as **Read Replicas**, and `PrefixRouter` distributes incoming queries via Power-of-Two choices.
+- *(Current prototype implementation: `PrefixRouter` tracks shard memory load factors and sheds traffic to candidate replicas; automatic active-reader-triggered node cloning is proposed work).*
 
-The architecture identifies three distinct allocation regimes:
-
-```text
-1. Under-Saturation (1 Chunk per Machine):
-   • Each machine only holds 1 chunk of a user's KV cache.
-   • Disaster in multi-user systems: If 10 users share the same chunk placement,
-     they all queue up for their first chunk on Machine 1 simultaneously.
-   • Accidental Lockstep / Spatial Convoy: Machine 1 is 100% crushed while Machine 2
-     and Machine 3 sit at 0% idle. As requests finish, the convoy marches to Machine 2,
-     leaving Machine 1 dead.
-   • Excessive network fan-out (16–64 network RPCs per step).
-
-2. Saturated Allocation (Exactly K_sat Chunks per Machine) — [TARGET ARCHITECTURE]:
-   • A user's prompt is allocated in discrete units of K_sat chunks per machine.
-   • Single-user decode runs at 100% hardware efficiency in a single parallel pass.
-   • Zero fractional bubbles; minimizes network RPC fan-out to ceil(Prompt / K_sat).
-   • Eliminates the lockstep convoy: each machine processes a self-contained, fully
-     saturated compute slice without inter-node micro-synchronization stalls.
-
-3. Oversubscription (> K_sat Chunks per Machine):
-   • Machine holds multiple passes of chunks (e.g., 4 x K_sat), cycling through them
-     sequentially in 4 passes.
-   • Trades higher single-user latency (4x slower) for zero multi-machine network overhead.
-   • Optimal for low-cost clusters with slow network interconnects.
-```
-
-### 6.6 Hot Prefix Replication via Active Reader Reference Counting
-Popular shared prefixes (e.g., standard system prompts, repository codebases in SWE-bench swarms) create hotspot read bottlenecks if pinned to a single machine:
-- Every cached node in the `RadixPrefixCache` tracks an `active_reader_count`.
-- When `active_reader_count` exceeds a provisioned threshold (e.g. $> 64$ concurrent streams), the Context Fabric automatically clones the node to secondary Context Servers as **Read Replicas**.
-- The Gateway's `PrefixRouter` distributes incoming 8 KB queries across replicas using Power-of-Two choices or weighted round-robin.
-- When `active_reader_count` subsides, replicas expire gracefully under their standard sliding TTL window.
-
-### 6.7 Reasoning Trace Commit Policy (Review 4.3)
+### 6.7 Reasoning Trace Commit Policy [Implemented in Current System]
 During multi-turn conversational interactions (e.g., chain-of-thought code generation):
-- **Short Assistant Replies ($< 500$ tokens)**: Retained locally on the compute worker's volatile cache; discarded from Context Server on stream completion. Worker folds them into Delta Prefill on Turn 2, avoiding distributed network synchronization overhead on exit.
-- **Long Reasoning Traces ($> 4{,}000$ tokens)**: Committed via `append_kv` to the Context Server at turn completion as clean 128-token blocks. Subsequent conversational turns avoid re-running delta prefill over thousands of reasoning tokens.
+- **Turn-Boundary & Mid-Generation Commits**: When generated output tokens exceed a configurable threshold (`reasoning_commit_threshold`, default 4,000 tokens), output KV slices are committed to the Context Server via `append_kv`.
+- **Zero-Copy Radix Extension**: Suffix tokens are attached directly under the matched prefix node using `insert_delta`, preserving canonical prefix tensor storage sharing across branching sessions without full-history tensor concatenation.
+- **Request-Bound Context Isolation**: The Gateway binds the selected `ContextClient` to the request's execution context via `contextvars`, guaranteeing that concurrent requests on a shared model singleton never cross-bleed or target the wrong server.
 
 ---
 
-## 7. Summary for Paper Framing
+## 7. Implementation Status & Paper Framing Summary
 
-| Architectural Dimension | Traditional Industry Approach | FrontierSplit Approach | Primary Advantage |
+| Architectural Dimension | Traditional Industry Approach | FrontierSplit Approach | Implementation Status |
 | :--- | :--- | :--- | :--- |
-| **KV Disaggregation** | RDMA KV Migration (Data-to-Compute) | Online Softmax RPC (Compute-to-Data) | $98{,}461\times$ less network traffic; runs on standard VPC Ethernet |
-| **Context Node Attention** | Physical tensor concatenation (`torch.cat`) | Associative reduction ($\oplus$) over Radix nodes | Zero memory duplication; instant $O(1)$ prefix branching |
-| **Compute Parallelism** | Batching multiple users ($M \gg 1$) | Two-tier chunking (Split-K across rows/shards) | High hardware saturation even for single-user ($M=1$) decode |
-| **Hardware Portability** | Custom vendor-specific CUDA/C++ kernels | Pure PyTorch with tile-aligned blocks | Runs natively on GPUs, TPUs, CPUs without compilation churn |
-| **Tail Padding Handling** | Zero-padding with attention masks | Remainder Optimization ($N \pmod{128}$) on Worker | 100% hardware efficiency on Context Server; zero padding bubbles |
-| **Multi-Machine Sizing** | Heuristic / arbitrary chunk scatter | $K_{\text{sat}}$ Saturated Allocation Spectrum | Prevents spatial convoy / lockstep; saturates single-pass compute |
-| **Hot Prefix Scaling** | Static single-node pinning | Active Reader Ref-Counting with Read Replicas | Eliminates query queue congestion on popular shared prefixes |
+| **KV Disaggregation** | RDMA KV Migration (Data-to-Compute) | Online Softmax RPC (Compute-to-Data) | **Implemented** (Binary TCP protocol; $\sim 16.7\text{ KB}$ response) |
+| **Context Node Attention** | Physical tensor concatenation (`torch.cat`) | Associative reduction ($\oplus$) over Radix nodes | **Implemented** (`RadixPrefixCache`, `insert_delta`, zero-copy chunks) |
+| **Concurrency Isolation** | Global model mutation / single-client lock | Per-request `contextvars` client binding | **Implemented** (Zero cross-shard bleed; strict request isolation) |
+| **Reasoning Trace Policy** | Discard all or migrate full cache | Threshold-triggered delta commit policy | **Implemented** (Mid-generation & turn-boundary commits) |
+| **Prefix Shard Routing** | Static pinning or round-robin | Prefix fingerprint consistent hash ring | **Implemented** (`PrefixRouter` with session affinity & load shedding) |
+| **Single-User Split-K** | Batching multiple users ($M \gg 1$) | On-chip Split-K parallel chunk reduction | **Proposed Architecture** (Current prototype evaluates sequentially) |
+| **Remainder Modulo 128** | Dynamic zero-padding with attention masks | Local volatile cache remainder retention | **Proposed Optimization** (Current prototype offloads full prompt) |
+| **Multi-Machine Sharding** | Fixed sequence tensor parallelism | Analytical roofline sharding trigger ($P$) | **Proposed Architecture** (Current prototype routes to single shard) |
+| **Hot Prefix Scaling** | Static single-node pinning | Active reader count dynamic read replicas | **Proposed Architecture** (Current prototype load-sheds to ring replicas) |

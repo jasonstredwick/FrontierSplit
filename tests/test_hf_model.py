@@ -403,3 +403,119 @@ def test_disaggregated_model_reasoning_commit_threshold(
     finally:
         client.close_sync()
         server.stop_thread()
+
+
+def test_decode_multi_commit_positional_stability(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify that multiple mid-generation reasoning commits do not corrupt token positions.
+
+    Review finding P1.2: Commits incremented prompt_len while step also counted generated tokens,
+    causing positions to jump (e.g. 5, 6, 9, 10, 13, 14...) and changing the generated output.
+    With the fix, generation through multiple commits (threshold=2 for 8 tokens) must match
+    the uncommitted baseline exactly bit-for-bit.
+    """
+    base_model, prompt, _ = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    try:
+        disagg = DisaggregatedModel(model=model, context_client=client)
+
+        # Baseline: generate 8 tokens without mid-generation commits
+        baseline_tokens = disagg.generate(
+            input_ids=prompt,
+            max_new_tokens=8,
+            session_id="baseline-pos-session",
+            reasoning_commit_threshold=0,
+            release_on_completion=True,
+        )
+        assert len(baseline_tokens) == 8
+
+        # Multi-commit run: generate 8 tokens with threshold=2 (commits at tokens 2, 4, 6, etc.)
+        multi_commit_tokens = disagg.generate(
+            input_ids=prompt,
+            max_new_tokens=8,
+            session_id="multicommit-pos-session",
+            reasoning_commit_threshold=2,
+            release_on_completion=True,
+        )
+        assert len(multi_commit_tokens) == 8
+
+        # The generated token sequence MUST be identical to the baseline
+        assert multi_commit_tokens == baseline_tokens
+    finally:
+        client.close_sync()
+        server.stop_thread()
+
+
+def test_retained_session_first_token_eos_and_early_close(
+    llama_model_and_prompt: tuple[LlamaForCausalLM, torch.Tensor, list[int]],
+) -> None:
+    """Verify that retained sessions do not raise UnboundLocalError on first-token EOS or early close.
+
+    Review finding P1.3: generated_tokens and local_cache were defined after the first yield;
+    first-token EOS or early generator closure caused UnboundLocalError in finally, leaving
+    the active session set on model patchers.
+    """
+    base_model, prompt, _ = llama_model_and_prompt
+    model = copy.deepcopy(base_model)
+    server = ContextServer()
+    port = server.start_in_thread(host="127.0.0.1", port=0)
+    client = ContextClient(host="127.0.0.1", port=port)
+
+    async def _run() -> None:
+        try:
+            disagg = DisaggregatedModel(model=model, context_client=client)
+
+            # 1. First-token EOS: configure max_new_tokens=1 with release_on_completion=False
+            out = disagg.generate(
+                input_ids=prompt,
+                max_new_tokens=1,
+                session_id="eos-early-sess",
+                release_on_completion=False,
+                reasoning_commit_threshold=4,
+            )
+            assert len(out) == 1
+            # Patchers must have active_session_id cleared
+            for p in disagg._patchers:
+                assert p.active_session_id is None
+
+            # 2. Synchronous stream early close after 1 yield
+            gen = disagg.generate_stream(
+                input_ids=prompt,
+                max_new_tokens=10,
+                session_id="sync-early-close",
+                release_on_completion=False,
+                reasoning_commit_threshold=4,
+            )
+            first_tok = next(gen)
+            assert isinstance(first_tok, int)
+            gen.close()  # Generator closed early -> triggers finally block
+            for p in disagg._patchers:
+                assert p.active_session_id is None
+
+            # 3. Asynchronous stream early close after 1 yield
+            agen = disagg.generate_stream_async(
+                input_ids=prompt,
+                max_new_tokens=10,
+                session_id="async-early-close",
+                release_on_completion=False,
+                reasoning_commit_threshold=4,
+            )
+            first_async_tok = await anext(agen)
+            assert isinstance(first_async_tok, int)
+            await (
+                agen.aclose()
+            )  # Async generator closed early -> triggers finally block
+            for p in disagg._patchers:
+                assert p.active_session_id is None
+
+        finally:
+            client.close_sync()
+            await client.close()
+            server.stop_thread()
+
+    asyncio.run(_run())

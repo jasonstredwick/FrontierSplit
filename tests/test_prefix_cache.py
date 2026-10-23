@@ -151,3 +151,60 @@ def test_lru_eviction_and_pinning():
     # t2 MUST NOT be evicted because session_count > 0!
     _, m2_after = cache.match(t2)
     assert m2_after == 8  # t2 was protected by pin!
+
+
+def test_insert_delta_preserves_canonical_prefix_storage_sharing():
+    """Verify that insert_delta and insert preserve canonical prefix tensor identity without clones.
+
+    Review finding P2.4: Appending triggered full concatenation and insert replaced existing
+    prefix tensors with clones, breaking memory sharing between readers bound before and after publication.
+    """
+    cache = RadixPrefixCache(max_cached_tokens=10_000)
+
+    # 1. Register canonical prefix: [1, 2, 3, 4, 5]
+    prefix_tokens = [1, 2, 3, 4, 5]
+    k_prefix = {0: torch.randn(1, 2, len(prefix_tokens), 16)}
+    v_prefix = {0: torch.randn(1, 2, len(prefix_tokens), 16)}
+    cache.insert(prefix_tokens, k_prefix, v_prefix)
+
+    # Reader 1 binds to this prefix
+    nodes_before, len_before = cache.match(prefix_tokens)
+    assert len_before == 5
+    assert len(nodes_before) == 1
+    canonical_k_node0 = nodes_before[0].k_cache[0]
+    canonical_v_node0 = nodes_before[0].v_cache[0]
+
+    # 2. Append suffix tokens [6, 7] using insert_delta (delta tensors only)
+    suffix_tokens = [6, 7]
+    k_delta = {0: torch.randn(1, 2, len(suffix_tokens), 16)}
+    v_delta = {0: torch.randn(1, 2, len(suffix_tokens), 16)}
+
+    cache.insert_delta(
+        base_tokens=prefix_tokens,
+        suffix_tokens=suffix_tokens,
+        k_delta_by_layer=k_delta,
+        v_delta_by_layer=v_delta,
+    )
+
+    # Reader 2 binds to the full sequence [1, 2, 3, 4, 5, 6, 7]
+    full_tokens = prefix_tokens + suffix_tokens
+    nodes_after, len_after = cache.match(full_tokens)
+    assert len_after == 7
+    assert len(nodes_after) == 2  # Prefix node + suffix node
+
+    # The prefix node MUST retain the exact same canonical tensor instance (zero clone / zero copy)
+    assert nodes_after[0].k_cache[0] is canonical_k_node0
+    assert nodes_after[0].v_cache[0] is canonical_v_node0
+
+    # Also verify that subsequent insert() calls on an overlapping sequence do not overwrite existing prefix tensors
+    k_full = {
+        0: torch.cat([k_prefix[0], torch.randn(1, 2, 2, 16)], dim=-2),
+    }
+    v_full = {
+        0: torch.cat([v_prefix[0], torch.randn(1, 2, 2, 16)], dim=-2),
+    }
+    cache.insert(prefix_tokens + [8, 9], k_full, v_full)
+
+    nodes_branch, _ = cache.match(prefix_tokens)
+    assert nodes_branch[0].k_cache[0] is canonical_k_node0
+    assert nodes_branch[0].v_cache[0] is canonical_v_node0

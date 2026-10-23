@@ -208,14 +208,16 @@ class RadixPrefixCache:
             for node in nodes:
                 node_len = node.num_tokens
                 for layer, k in k_by_layer.items():
-                    node.k_cache[layer] = (
-                        k[..., offset : offset + node_len, :].contiguous().clone()
-                    )
-                    node.v_cache[layer] = (
-                        v_by_layer[layer][..., offset : offset + node_len, :]
-                        .contiguous()
-                        .clone()
-                    )
+                    if layer not in node.k_cache:
+                        node.k_cache[layer] = (
+                            k[..., offset : offset + node_len, :].contiguous().clone()
+                        )
+                    if layer not in node.v_cache:
+                        node.v_cache[layer] = (
+                            v_by_layer[layer][..., offset : offset + node_len, :]
+                            .contiguous()
+                            .clone()
+                        )
                 offset += node_len
 
         if matched_len == len(seq):
@@ -237,6 +239,66 @@ class RadixPrefixCache:
         curr.children[rem_tokens[0]] = new_node
         nodes.append(new_node)
 
+        self.evict_if_needed()
+        return nodes
+
+    def insert_delta(
+        self,
+        base_tokens: list[int] | tuple[int, ...],
+        suffix_tokens: list[int] | tuple[int, ...],
+        k_delta_by_layer: dict[int, torch.Tensor],
+        v_delta_by_layer: dict[int, torch.Tensor],
+    ) -> list[RadixNode]:
+        """Extends an existing cached prefix with suffix tokens and delta KV slices.
+
+        Avoids full-history concatenation by directly attaching suffix nodes
+        under the matched base prefix node and preserving existing canonical
+        prefix tensors.
+
+        Args:
+            base_tokens: Base prefix token sequence already in the cache.
+            suffix_tokens: Suffix token IDs being appended.
+            k_delta_by_layer: Mapping of layer_idx to delta Key tensor of shape
+                `[batch, num_kv_heads, len(suffix_tokens), head_dim]`.
+            v_delta_by_layer: Mapping of layer_idx to delta Value tensor of shape
+                `[batch, num_kv_heads, len(suffix_tokens), head_dim]`.
+
+        Returns:
+            List of RadixNodes representing the complete token sequence.
+        """
+        full_seq = tuple(base_tokens) + tuple(suffix_tokens)
+        nodes, matched_len = self.match(full_seq)
+
+        if matched_len == len(full_seq):
+            return nodes
+
+        base_len = len(base_tokens)
+        curr = nodes[-1] if nodes else self.root
+
+        if matched_len >= base_len:
+            delta_offset = matched_len - base_len
+            rem_tokens = full_seq[matched_len:]
+            rem_k = {
+                l_i: k[..., delta_offset:, :].contiguous().clone()
+                for l_i, k in k_delta_by_layer.items()
+            }
+            rem_v = {
+                l_i: v[..., delta_offset:, :].contiguous().clone()
+                for l_i, v in v_delta_by_layer.items()
+            }
+            new_node = RadixNode(rem_tokens, rem_k, rem_v)
+            curr.children[rem_tokens[0]] = new_node
+            nodes.append(new_node)
+            self.evict_if_needed()
+            return nodes
+
+        # Fallback if base prefix was evicted from the Radix tree
+        rem_tokens = tuple(suffix_tokens)
+        rem_k = {l_i: k.contiguous().clone() for l_i, k in k_delta_by_layer.items()}
+        rem_v = {l_i: v.contiguous().clone() for l_i, v in v_delta_by_layer.items()}
+        new_node = RadixNode(rem_tokens, rem_k, rem_v)
+        curr.children[rem_tokens[0]] = new_node
+        nodes.append(new_node)
         self.evict_if_needed()
         return nodes
 
