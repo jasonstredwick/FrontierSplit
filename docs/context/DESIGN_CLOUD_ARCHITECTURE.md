@@ -114,46 +114,37 @@ API clients or automated agent tools can occasionally submit empty message paylo
 - **Strict Ingress Validation**: An empty messages array (`messages: []`) is rejected immediately at Tier 1 with HTTP 400 Bad Request (`InvalidRequestError: 'messages' cannot be empty`), adhering to standard OpenAI API specifications.
 - **Graceful Zero-Length Content Fallback**: If an agent sends an empty content string (`content: ""`) with only role markers, the router defaults to a canonical BOS (Beginning-of-Sequence) token fingerprint (`0x00000000`). This avoids division-by-zero, hash exceptions, or cluster routing thrashing.
 
-### 2.4 Multi-Tiered Inference Caching: Exact Output vs. Probability Distribution vs. KV Prefix
+### 2.4 Unified Radix KV Caching & Ragged-Edge Output Coalescing
 
-A key architectural insight in large-scale serving is that **not all caching belongs at the KV tensor layer**:
-When two requests are identical (or short messages like single-word greetings or standard system checks), the system evaluates caching across three tiers:
+In a causal transformer, Key-Value $(K, V)$ activations for any fixed sequence of tokens $[t_0, t_1, \dots, t_{k}]$ are **100% deterministic functions of the token IDs and their positions**, regardless of sampling parameters (`temperature`, `top_p`). Sampling stochasticity only affects which token ID is chosen from the final layer's logit distribution at the end of a step; once a token is emitted, its KV state is constant. Consequently, separate "Exact Response Caches" (Tier 0) or "Probability Distribution Caches" (Tier 1) are unnecessary—a single **Radix Tree KV Prefix Cache** handles both deterministic (`temperature == 0.0`) and stochastic (`temperature > 0.0`) workloads uniformly.
+
+To maintain hardware tile alignment (e.g., $C = 128$ tokens) across multi-turn conversations and branching outputs without accumulating fragmented runt chunks, the Context Engine distinguishes between **branching at the prompt's ragged edge** and **continuing from generated output**:
 
 ```
-                  Incoming Prompt Request
-                             │
-            ┌────────────────┴────────────────┐
-            ▼                                 ▼
-   Temperature == 0.0                Temperature > 0.0
- (Deterministic Greedy)            (Stochastic Sampling)
-            │                                 │
-     Exact Match in                    Exact Match in
-   Exact Response Cache?             Probability Cache?
-     ├── YES: Return Output (0 FLOPs)  ├── YES: Sample 1st token from
-     │        Latency: < 0.5 ms        │        precomputed top-k logits
-     └── NO:  Evaluate Prefix Cache    └── NO:  Evaluate Prefix Cache
-                    │                                 │
-                    ▼                                 ▼
-            ┌─────────────────────────────────────────────────┐
-            │ Tier 2: Radix Tree KV Prefix Cache              │
-            │   • Reuses precomputed K & V tensors over TCP   │
-            │   • Skips O(N) prefill matrix multiplications   │
-            │   • Generates fresh stochastic completion       │
-            └─────────────────────────────────────────────────┘
+Prompt Prefill (e.g., 1,050 tokens = 8 x 128 full chunks + 26-token ragged edge):
+
+[Aligned Full Chunks: Tokens 0..1023 (8 x 128)]
+       │
+       ├──► [Ragged Edge Chunk: Tokens 1024..1049 (26 tokens)]
+       │      • Stored on Context Server upon prefill completion
+       │      • Used ONLY when a subsequent request starts at this ragged edge
+       │        (e.g., branching / resampling from the same 1,050-token prompt)
+       │
+       └──► [Coalesced Output Chunk: Tokens 1024..1151 (128 tokens)]
+              • Combines the 26 ragged-edge prompt tokens + first 102 output tokens
+              • Used when the next message is based on the recent output
+              • Eliminates having [26-token ragged edge] + [first output chunk]
+                as separate fragmented chunks along the conversation spine
 ```
 
-1. **Tier 0: Exact Response Cache (Deterministic Zero-Compute)**:
-   - For greedy/deterministic requests (`temperature == 0.0`), an identical prompt will mathematically generate the exact same token sequence every time.
-   - For recurring queries (e.g. "Hello", "Ping", standard test probes, benchmark evaluation prompts), computing forward passes over GPU Tensor Cores is completely redundant.
-   - The Gateway checks an in-memory LRU response cache. On hit, it immediately returns the JSON or streams the pre-generated SSE tokens in $<0.5\text{ ms}$ with **zero GPU compute**.
-2. **Tier 1: Probability Distribution / Logit Caching (Stochastic Randomization)**:
-   - When users require non-deterministic sampling (`temperature > 0.0`), returning the exact same response is undesirable.
-   - However, for an identical prompt, the **first-token logit distribution** (the output vector of vocabulary probabilities) is 100% deterministic.
-   - Instead of re-running the heavy prompt prefill GEMM just to obtain the first token distribution, the Context Server can cache the top-$k$ logits / probability distribution for the prompt.
-   - The Gateway samples the first token directly from this pre-calculated distribution, and then resumes autoregressive decoding from the pre-cached KV state.
-3. **Tier 2: Disaggregated Radix KV Prefix Cache (Partial Common Prefixes)**:
-   - For multi-turn agent threads, document reasoning, and codebases where prompts share a large common prefix (e.g. 5,000-token codebase) but end with unique questions.
-   - Skips the heavy $O(N)$ prefill computation for the shared prefix while executing standard autoregressive decoding for the novel continuation.
+1. **Storing the Ragged Edge for Prompt-Boundary Branching**:
+   - When a prompt of length $N$ is prefilled, it decomposes into $\lfloor N / C \rfloor$ full $C$-token chunks and a ragged tail of $R = N \pmod C$ tokens.
+   - Both the full chunks and the $R$-token ragged edge are stored on the Context Server.
+   - If a subsequent message starts at that exact prompt boundary (sharing the prompt and generating a different output branch), it uses the stored ragged edge directly with zero recomputation.
+2. **Coalescing Output Chunks Starting at the Ragged Edge**:
+   - During autoregressive generation, the Decode Worker seeds its local KV buffer with the $R$-token ragged edge and appends newly generated output tokens to it, while querying the Context Server up to the clean aligned boundary ($\lfloor N / C \rfloor \times C$).
+   - When the output is cached (or extended by a follow-up turn based on that recent output), the new chunk is stored **starting at the beginning of the ragged edge** ($\lfloor N / C \rfloor \times C$), coalescing the $R$ ragged prompt tokens and the first $C - R$ output tokens into a contiguous $C$-token chunk rather than leaving `[Ragged Edge] + [First Output Chunk]` as two separate tensors.
+   - Across long multi-turn agent sessions, the active conversation spine remains packed into uniform $C$-token chunks with at most one ragged tail at the current turn tip.
 
 ---
 

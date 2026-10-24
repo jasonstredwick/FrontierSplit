@@ -253,12 +253,12 @@ The cluster administrator sizes compute nodes according to model weight footprin
 - **Execution Boundary**: Each compute stage executes its assigned layers in local GPU VRAM. The boundary between compute stages is strictly the intermediate activation tensor ($\sim 16\text{ KB}$ per token).
 - While compute stages host model weights, Key-Value caches for all $L_c$ layers are disaggregated to the Context Fabric.
 
-### 6.2 Separation of Compute & Context, and the Remainder Optimization
+### 6.2 Separation of Compute & Context, and Ragged-Edge Output Coalescing
 - **Current Implementation**: Compute workers hold model weights and maintain a volatile local output cache (`DynamicCache`) for newly generated decode tokens. Prompts and delta prefill suffixes are offloaded in full to the Context Server, which executes partial attention over stored prompt KV chunks.
-- **Proposed Optimization: Remainder Retention ($N \pmod{128}$)**:
-  - Clean 128-token blocks are offloaded to the Context Server ($\lfloor N / 128 \rfloor \times 128$), ensuring exact tile alignment with zero tail padding.
-  - The ragged remainder ($N \pmod{128} < 128$ tokens) is retained directly on the compute worker's volatile local cache alongside newly generated tokens.
-  - Merge: $O = \operatorname{Remote}(\text{Tiled Context}) \oplus \operatorname{Local}(\text{Remainder} + \text{Output Tokens})$.
+- **Proposed Optimization: Ragged-Edge Storage & Output Coalescing ($N \pmod C$)**:
+  - When a prompt of length $N$ is prefilled with chunk size $C = 128$, both the aligned blocks ($\lfloor N / C \rfloor \times C$) and the **ragged edge** ($R = N \pmod C$ tokens) are stored on the Context Server.
+  - **Branching at the Ragged Edge**: The standalone ragged-edge chunk is only traversed when a subsequent message branches directly off that exact prompt boundary (e.g., resampling a new completion from the same prompt).
+  - **Continuing from Output (Coalesced Chunks)**: When a subsequent message continues from the generated output, the output is cached **starting at the beginning of the ragged edge**—coalescing the $R$ ragged-edge prompt tokens with the first $C - R$ generated output tokens into a single contiguous $C$-token chunk (siblings to the standalone ragged edge under the last aligned prompt node). This guarantees that all interior chunks along multi-turn conversations remain strictly $C$-token tile-aligned rather than accumulating `[ragged edge] + [first output chunk]` fragmentation at every turn boundary.
 
 ### 6.3 Analytical Multi-Machine Sharding Trigger [Proposed Architecture]
 The decision to partition a single prompt across $P$ context servers vs. hosting on 1 machine is governed by an analytical roofline model:
@@ -362,7 +362,7 @@ where:
 | **Reasoning Trace Policy** | Discard all or migrate full cache | Threshold-triggered delta commit policy | **Implemented** (Mid-generation & turn-boundary commits) |
 | **Prefix Shard Routing** | Static pinning or round-robin | Prefix fingerprint consistent hash ring | **Implemented** (`PrefixRouter` with session affinity & load shedding) |
 | **Single-User Split-K** | Batching multiple users ($M \gg 1$) | On-chip Split-K parallel chunk reduction | **Proposed Architecture** (Current prototype evaluates sequentially) |
-| **Remainder Modulo 128** | Dynamic zero-padding with attention masks | Local volatile cache remainder retention | **Proposed Optimization** (Current prototype offloads full prompt) |
+| **Ragged-Edge Coalescing** | Dynamic zero-padding or fragmented turn chunks | Store ragged edge for prompt-boundary branches; coalesce output starting at ragged edge | **Proposed Optimization** (Current prototype appends output after ragged edge) |
 | **Multi-Machine Sharding** | Fixed sequence tensor parallelism | Analytical roofline sharding trigger ($P$) | **Proposed Architecture** (Current prototype routes to single shard) |
 | **Hot Prefix Scaling** | Static single-node pinning | Active reader count dynamic read replicas | **Proposed Architecture** (Current prototype load-sheds to ring replicas) |
 | **Heterogeneous Timing & Work-Ratio Scheduling** | Uniform thread-pool / blind round-robin | Per-layer compute-to-context timing ratio ($R_{\text{balance}}$) multi-tenant packing | **Proposed Architecture** (Current prototype uses uniform session affinity) |

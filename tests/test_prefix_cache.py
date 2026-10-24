@@ -156,12 +156,13 @@ def test_lru_eviction_and_pinning():
 def test_insert_delta_preserves_canonical_prefix_storage_sharing():
     """Verify that insert_delta and insert preserve canonical prefix tensor identity without clones.
 
-    Review finding P2.4: Appending triggered full concatenation and insert replaced existing
-    prefix tensors with clones, breaking memory sharing between readers bound before and after publication.
+    Aligned chunks retain their exact canonical tensor instance when extended, while ragged
+    edges preserve their canonical tensor for prompt-boundary branches and coalesce output
+    continuations starting at the ragged edge.
     """
-    cache = RadixPrefixCache(max_cached_tokens=10_000)
+    cache = RadixPrefixCache(max_cached_tokens=10_000, chunk_size=5)
 
-    # 1. Register canonical prefix: [1, 2, 3, 4, 5]
+    # 1. Register canonical aligned prefix: [1, 2, 3, 4, 5] (matches chunk_size=5)
     prefix_tokens = [1, 2, 3, 4, 5]
     k_prefix = {0: torch.randn(1, 2, len(prefix_tokens), 16)}
     v_prefix = {0: torch.randn(1, 2, len(prefix_tokens), 16)}
@@ -190,9 +191,9 @@ def test_insert_delta_preserves_canonical_prefix_storage_sharing():
     full_tokens = prefix_tokens + suffix_tokens
     nodes_after, len_after = cache.match(full_tokens)
     assert len_after == 7
-    assert len(nodes_after) == 2  # Prefix node + suffix node
+    assert len(nodes_after) == 2  # Aligned prefix node (5) + ragged suffix node (2)
 
-    # The prefix node MUST retain the exact same canonical tensor instance (zero clone / zero copy)
+    # The aligned prefix node MUST retain the exact same canonical tensor instance (zero clone / zero copy)
     assert nodes_after[0].k_cache[0] is canonical_k_node0
     assert nodes_after[0].v_cache[0] is canonical_v_node0
 
@@ -208,6 +209,68 @@ def test_insert_delta_preserves_canonical_prefix_storage_sharing():
     nodes_branch, _ = cache.match(prefix_tokens)
     assert nodes_branch[0].k_cache[0] is canonical_k_node0
     assert nodes_branch[0].v_cache[0] is canonical_v_node0
+
+
+def test_ragged_edge_storage_and_output_coalescing():
+    """Verify ragged-edge storage for prompt-boundary branches vs. coalesced output chunks.
+
+    - Prompt of 300 tokens (2 * 128 + 44 ragged edge) is stored as [128, 128, 44].
+    - When output of 150 tokens is cached on top of that prompt, the output is cached
+      starting at index 256 (the start of the ragged edge) as a 128-token coalesced chunk
+      [256..383] (44 ragged prompt tokens + 84 output tokens) followed by the new 66-token
+      ragged edge [384..449], rather than [44-token ragged edge] + [128-token first output chunk].
+    - Meanwhile, the standalone 44-token ragged edge [256..299] remains stored and is used
+      whenever a subsequent message starts/branches at that 300-token prompt boundary.
+    """
+    cache = RadixPrefixCache(max_cached_tokens=50_000, chunk_size=128)
+
+    prompt_tokens = list(range(300))  # 128 + 128 + 44
+    k_prompt = {0: torch.randn(1, 2, 300, 16)}
+    v_prompt = {0: torch.randn(1, 2, 300, 16)}
+
+    prompt_nodes = cache.insert(prompt_tokens, k_prompt, v_prompt)
+    assert [n.num_tokens for n in prompt_nodes] == [128, 128, 44]
+    canonical_ragged_k = prompt_nodes[2].k_cache[0]
+    canonical_ragged_v = prompt_nodes[2].v_cache[0]
+
+    # Output of 150 tokens [300..449] continuing from prompt_tokens
+    output_tokens = list(range(300, 450))
+    k_output = {0: torch.randn(1, 2, 150, 16)}
+    v_output = {0: torch.randn(1, 2, 150, 16)}
+
+    cont_nodes = cache.insert_delta(
+        base_tokens=prompt_tokens,
+        suffix_tokens=output_tokens,
+        k_delta_by_layer=k_output,
+        v_delta_by_layer=v_output,
+    )
+    assert cont_nodes is not None
+    # Continuation must coalesce [256..299] (44) + [300..383] (84) into [256..383] (128), plus [384..449] (66)
+    assert [n.num_tokens for n in cont_nodes] == [128, 128, 128, 66]
+
+    # 1. Next message based on recent output matches the coalesced 128-token spine
+    next_turn_query = prompt_tokens + output_tokens + [9000, 9001]
+    matched_cont_nodes, matched_cont_len = cache.match(next_turn_query)
+    assert matched_cont_len == 450
+    assert [n.num_tokens for n in matched_cont_nodes] == [128, 128, 128, 66]
+    assembled_k, assembled_v = cache.assemble_kv(matched_cont_nodes)
+    expected_full_k = torch.cat([k_prompt[0], k_output[0]], dim=-2)
+    expected_full_v = torch.cat([v_prompt[0], v_output[0]], dim=-2)
+    assert torch.equal(assembled_k[0], expected_full_k)
+    assert torch.equal(assembled_v[0], expected_full_v)
+
+    # 2. Next message starting at the original ragged edge [0..299] uses the stored 44-token ragged edge
+    branch_query = prompt_tokens + [5000, 5001, 5002]
+    matched_branch_nodes, matched_branch_len = cache.match(branch_query)
+    assert matched_branch_len == 300
+    assert [n.num_tokens for n in matched_branch_nodes] == [128, 128, 44]
+    assert matched_branch_nodes[2].k_cache[0] is canonical_ragged_k
+    assert matched_branch_nodes[2].v_cache[0] is canonical_ragged_v
+
+    # 3. Verify that matching the prompt branch did NOT split the 128-token coalesced output chunk
+    recheck_cont_nodes, recheck_cont_len = cache.match(prompt_tokens + output_tokens)
+    assert recheck_cont_len == 450
+    assert [n.num_tokens for n in recheck_cont_nodes] == [128, 128, 128, 66]
 
 
 def test_insert_delta_evicted_base_does_not_publish_orphan_suffix():
@@ -263,7 +326,6 @@ def test_radix_node_split_preserves_tensor_storage_view():
     orig_v_ptr = orig_node.v_cache[0].untyped_storage().data_ptr()
 
     # Split the node at index 3 (branching with a new sequence [10, 20, 30, 77, 88])
-    tokens_branch = [10, 20, 30, 77, 88]
     k_branch = {0: torch.randn(1, 2, 2, 16)}
     v_branch = {0: torch.randn(1, 2, 2, 16)}
     cache.insert_delta(

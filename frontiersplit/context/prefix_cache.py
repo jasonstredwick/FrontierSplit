@@ -36,8 +36,19 @@ class RadixNode:
         self.k_cache: dict[int, torch.Tensor] = k_cache or {}
         self.v_cache: dict[int, torch.Tensor] = v_cache or {}
         self.children: dict[int, RadixNode] = {}  # first_token -> RadixNode
+        self.ragged_children: dict[tuple[int, ...], RadixNode] = {}
         self.last_access: float = time.time()
         self.session_count: int = 0
+
+    def iter_all_children(self) -> list[RadixNode]:
+        """Returns all child nodes (both primary children and preserved ragged children)."""
+        out = list(self.children.values())
+        seen = {id(n) for n in out}
+        for rc in self.ragged_children.values():
+            if id(rc) not in seen:
+                out.append(rc)
+                seen.add(id(rc))
+        return out
 
     @property
     def num_tokens(self) -> int:
@@ -103,6 +114,7 @@ class RadixNode:
 
         child = RadixNode(suffix_tokens, suffix_k, suffix_v)
         child.children = self.children
+        child.ragged_children = self.ragged_children
         child.session_count = self.session_count
         child.last_access = self.last_access
 
@@ -110,6 +122,7 @@ class RadixNode:
         self.k_cache = prefix_k
         self.v_cache = prefix_v
         self.children = {child.token_ids[0]: child}
+        self.ragged_children = {}
 
         return child
 
@@ -117,29 +130,53 @@ class RadixNode:
 class RadixPrefixCache:
     """Compressed trie managing token-prefix KV caches with LRU eviction."""
 
-    def __init__(self, max_cached_tokens: int = 1_000_000) -> None:
+    def __init__(
+        self,
+        max_cached_tokens: int = 1_000_000,
+        chunk_size: int = 128,
+    ) -> None:
         """Initializes the Radix Prefix Cache.
 
         Args:
             max_cached_tokens: Maximum total tokens to retain across all cached prefixes.
+            chunk_size: Target token chunk alignment size (e.g., 128). Ragged prompt
+                edges smaller than `chunk_size` are preserved for prompt-boundary
+                branches while output continuations coalesce starting at the ragged edge.
         """
         self.root = RadixNode()
         self.max_cached_tokens = max_cached_tokens
+        self.chunk_size = chunk_size
         self.on_compact: Callable[[], None] | None = None
+
+    @staticmethod
+    def _is_prefix_shadowed(parent: RadixNode, node: RadixNode) -> bool:
+        """Returns True if `node` is a leaf ragged-edge snapshot shadowed by a longer coalesced sibling."""
+        if node.children or node.ragged_children:
+            return False
+        n_len = node.num_tokens
+        for other in parent.iter_all_children():
+            if (
+                other is not node
+                and other.num_tokens > n_len
+                and other.token_ids[:n_len] == node.token_ids
+            ):
+                return True
+        return False
 
     @property
     def total_tokens(self) -> int:
         """Calculates total number of tokens stored across all nodes in the tree."""
         count = 0
 
-        def _traverse(node: RadixNode) -> None:
+        def _traverse(parent: RadixNode, node: RadixNode) -> None:
             nonlocal count
-            count += node.num_tokens
-            for child in node.children.values():
-                _traverse(child)
+            if not self._is_prefix_shadowed(parent, node):
+                count += node.num_tokens
+            for child in node.iter_all_children():
+                _traverse(node, child)
 
-        for child in self.root.children.values():
-            _traverse(child)
+        for child in self.root.iter_all_children():
+            _traverse(self.root, child)
 
         return count
 
@@ -153,28 +190,29 @@ class RadixPrefixCache:
         seen_ptrs_by_layer: dict[int, set[int]] = {}
         layer_backing_tokens: dict[int, int] = {}
 
-        def _traverse(node: RadixNode) -> None:
-            for l_idx, t in node.k_cache.items():
-                if t is not None:
-                    seen = seen_ptrs_by_layer.setdefault(l_idx, set())
-                    ptr = t.untyped_storage().data_ptr()
-                    if ptr not in seen:
-                        seen.add(ptr)
-                        token_dim = t.shape[-2]
-                        logical_bytes = t.numel() * t.element_size()
-                        storage_bytes = t.untyped_storage().nbytes()
-                        if logical_bytes > 0:
-                            backing_tokens = int(
-                                token_dim * (storage_bytes / logical_bytes)
-                            )
-                            layer_backing_tokens[l_idx] = (
-                                layer_backing_tokens.get(l_idx, 0) + backing_tokens
-                            )
-            for child in node.children.values():
-                _traverse(child)
+        def _traverse(parent: RadixNode, node: RadixNode) -> None:
+            if not self._is_prefix_shadowed(parent, node):
+                for l_idx, t in node.k_cache.items():
+                    if t is not None:
+                        seen = seen_ptrs_by_layer.setdefault(l_idx, set())
+                        ptr = t.untyped_storage().data_ptr()
+                        if ptr not in seen:
+                            seen.add(ptr)
+                            token_dim = t.shape[-2]
+                            logical_bytes = t.numel() * t.element_size()
+                            storage_bytes = t.untyped_storage().nbytes()
+                            if logical_bytes > 0:
+                                backing_tokens = int(
+                                    token_dim * (storage_bytes / logical_bytes)
+                                )
+                                layer_backing_tokens[l_idx] = (
+                                    layer_backing_tokens.get(l_idx, 0) + backing_tokens
+                                )
+            for child in node.iter_all_children():
+                _traverse(node, child)
 
-        for child in self.root.children.values():
-            _traverse(child)
+        for child in self.root.iter_all_children():
+            _traverse(self.root, child)
 
         if not layer_backing_tokens:
             return 0
@@ -189,7 +227,7 @@ class RadixPrefixCache:
         is_top_level = node is None or node is self.root
         target = node or self.root
         compacted_count = 1 if target.compact() else 0
-        for child in list(target.children.values()):
+        for child in target.iter_all_children():
             compacted_count += self._compact_subtree(child)
         if is_top_level and compacted_count > 0 and self.on_compact is not None:
             self.on_compact()
@@ -197,7 +235,7 @@ class RadixPrefixCache:
 
     def _compact_subtree(self, node: RadixNode) -> int:
         count = 1 if node.compact() else 0
-        for child in list(node.children.values()):
+        for child in node.iter_all_children():
             count += self._compact_subtree(child)
         return count
 
@@ -209,7 +247,10 @@ class RadixPrefixCache:
         """Finds the longest cached prefix matching the query token sequence.
 
         If a match ends midway through a node, that node is automatically split
-        so that the exact matched prefix is represented as a clean node.
+        so that the exact matched prefix is represented as a clean node. When both
+        a standalone ragged-edge node and a coalesced output chunk exist under the
+        same parent, selects the coalesced chunk for output continuations and the
+        standalone ragged edge when branching at the prompt boundary.
 
         Args:
             tokens: Sequence of token IDs to match.
@@ -226,41 +267,152 @@ class RadixPrefixCache:
 
         while matched_len < len(seq):
             first_tok = seq[matched_len]
-            if first_tok not in curr.children:
+            candidates: list[RadixNode] = []
+            primary = curr.children.get(first_tok)
+            if primary is not None:
+                candidates.append(primary)
+            for rc in curr.ragged_children.values():
+                if rc.token_ids and rc.token_ids[0] == first_tok and rc is not primary:
+                    candidates.append(rc)
+
+            if required_layers:
+                candidates = [
+                    c
+                    for c in candidates
+                    if required_layers.issubset(c.k_cache.keys())
+                    and required_layers.issubset(c.v_cache.keys())
+                ]
+
+            if not candidates:
                 break
 
-            child = curr.children[first_tok]
-            if required_layers and not (
-                required_layers.issubset(child.k_cache.keys())
-                and required_layers.issubset(child.v_cache.keys())
-            ):
-                break
             rem_tokens = seq[matched_len:]
+            best_child: RadixNode | None = None
+            best_common = 0
+            best_key: tuple[int, int, int] = (-1, -1, 0)
 
-            common_len = 0
-            for a, b in zip(rem_tokens, child.token_ids, strict=False):
-                if a != b:
-                    break
-                common_len += 1
+            for c in candidates:
+                common_len = 0
+                for a, b in zip(rem_tokens, c.token_ids, strict=False):
+                    if a != b:
+                        break
+                    common_len += 1
+                if common_len > 0:
+                    cand_key = (
+                        common_len,
+                        1 if common_len == c.num_tokens else 0,
+                        -c.num_tokens,
+                    )
+                    if cand_key > best_key:
+                        best_key = cand_key
+                        best_child = c
+                        best_common = common_len
 
-            if common_len == child.num_tokens:
-                # Full match of this child node
-                nodes.append(child)
-                matched_len += common_len
-                curr = child
-                curr.last_access = time.time()
-            elif common_len > 0:
-                # Partial match inside this child node -> split it!
-                child.split(common_len)
-                nodes.append(child)
-                matched_len += common_len
-                curr = child
-                curr.last_access = time.time()
+            if best_child is None or best_common == 0:
                 break
+
+            if best_common == best_child.num_tokens:
+                # Full match of this child node
+                nodes.append(best_child)
+                matched_len += best_common
+                curr = best_child
+                curr.last_access = time.time()
             else:
+                # Partial match inside best_child -> split it!
+                old_tokens = best_child.token_ids
+                best_child.split(best_common)
+                if (
+                    old_tokens in curr.ragged_children
+                    and curr.ragged_children[old_tokens] is best_child
+                ):
+                    del curr.ragged_children[old_tokens]
+                    curr.ragged_children[best_child.token_ids] = best_child
+                nodes.append(best_child)
+                matched_len += best_common
+                curr = best_child
+                curr.last_access = time.time()
                 break
 
         return nodes, matched_len
+
+    def _attach_child(self, parent: RadixNode, new_node: RadixNode) -> None:
+        """Attaches `new_node` to `parent`, preserving any existing child with the same first token in `ragged_children`."""
+        first_tok = new_node.token_ids[0]
+        existing = parent.children.get(first_tok)
+        if existing is not None and existing is not new_node:
+            parent.ragged_children[existing.token_ids] = existing
+        parent.ragged_children.pop(new_node.token_ids, None)
+        parent.children[first_tok] = new_node
+
+    def _append_chunked_nodes(
+        self,
+        curr: RadixNode,
+        rem_tokens: tuple[int, ...],
+        rem_k: dict[int, torch.Tensor],
+        rem_v: dict[int, torch.Tensor],
+        nodes: list[RadixNode],
+    ) -> None:
+        """Slices `rem_tokens` and its KV tensors into `chunk_size` blocks and attaches them under `curr`."""
+        if not rem_tokens:
+            return
+        step = (
+            self.chunk_size
+            if self.chunk_size is not None and self.chunk_size > 0
+            else len(rem_tokens)
+        )
+        for offset in range(0, len(rem_tokens), step):
+            chunk_toks = rem_tokens[offset : offset + step]
+            c_len = len(chunk_toks)
+            chunk_k = {
+                layer: k[..., offset : offset + c_len, :].contiguous().clone()
+                for layer, k in rem_k.items()
+            }
+            chunk_v = {
+                layer: v[..., offset : offset + c_len, :].contiguous().clone()
+                for layer, v in rem_v.items()
+            }
+            new_node = RadixNode(chunk_toks, chunk_k, chunk_v)
+            self._attach_child(curr, new_node)
+            nodes.append(new_node)
+            curr = new_node
+
+    def _coalesce_or_append(
+        self,
+        nodes: list[RadixNode],
+        rem_tokens: tuple[int, ...],
+        rem_k: dict[int, torch.Tensor],
+        rem_v: dict[int, torch.Tensor],
+    ) -> None:
+        """Coalesces `rem_tokens` starting at a trailing ragged edge if applicable, or appends after `nodes[-1]`."""
+        curr = nodes[-1] if nodes else self.root
+        if (
+            nodes
+            and self.chunk_size is not None
+            and self.chunk_size > 0
+            and 0 < curr.num_tokens < self.chunk_size
+            and not curr.children
+            and not curr.ragged_children
+            and all(
+                l_i in curr.k_cache and l_i in curr.v_cache for l_i in rem_k
+            )
+        ):
+            parent = nodes[-2] if len(nodes) >= 2 else self.root
+            parent.ragged_children[curr.token_ids] = curr
+            nodes.pop()
+            coalesced_tokens = curr.token_ids + rem_tokens
+            coalesced_k = {
+                l_i: torch.cat([curr.k_cache[l_i], k], dim=-2)
+                for l_i, k in rem_k.items()
+            }
+            coalesced_v = {
+                l_i: torch.cat([curr.v_cache[l_i], v], dim=-2)
+                for l_i, v in rem_v.items()
+            }
+            self._append_chunked_nodes(
+                parent, coalesced_tokens, coalesced_k, coalesced_v, nodes
+            )
+        else:
+            self._append_chunked_nodes(curr, rem_tokens, rem_k, rem_v, nodes)
 
     def insert(
         self,
@@ -271,7 +423,9 @@ class RadixPrefixCache:
         """Inserts a token sequence and its KV caches into the Radix Tree.
 
         Reuses any existing prefix matches and only allocates new nodes
-        for newly seen suffix tokens.
+        for newly seen suffix tokens. When extending a ragged prompt edge,
+        preserves the standalone ragged edge and coalesces the continuation
+        starting at the ragged edge boundary.
 
         Args:
             tokens: Full token ID sequence.
@@ -305,22 +459,17 @@ class RadixPrefixCache:
         if matched_len == len(seq):
             return nodes
 
-        curr = nodes[-1] if nodes else self.root
         rem_tokens = seq[matched_len:]
-
         rem_k = {
-            layer: k[..., matched_len:, :].contiguous().clone()
+            layer: k[..., matched_len:, :]
             for layer, k in k_by_layer.items()
         }
         rem_v = {
-            layer: v[..., matched_len:, :].contiguous().clone()
+            layer: v[..., matched_len:, :]
             for layer, v in v_by_layer.items()
         }
 
-        new_node = RadixNode(rem_tokens, rem_k, rem_v)
-        curr.children[rem_tokens[0]] = new_node
-        nodes.append(new_node)
-
+        self._coalesce_or_append(nodes, rem_tokens, rem_k, rem_v)
         self.evict_if_needed()
         return nodes
 
@@ -330,12 +479,13 @@ class RadixPrefixCache:
         suffix_tokens: list[int] | tuple[int, ...],
         k_delta_by_layer: dict[int, torch.Tensor],
         v_delta_by_layer: dict[int, torch.Tensor],
-    ) -> list[RadixNode]:
+    ) -> list[RadixNode] | None:
         """Extends an existing cached prefix with suffix tokens and delta KV slices.
 
-        Avoids full-history concatenation by directly attaching suffix nodes
-        under the matched base prefix node and preserving existing canonical
-        prefix tensors.
+        Preserves existing aligned canonical prefix tensors. When `base_tokens` ends
+        in a ragged edge (`< chunk_size` tokens), preserves that standalone ragged edge
+        for future prompt-boundary branches while coalescing the suffix starting at
+        the ragged edge into `chunk_size`-aligned chunks.
 
         Args:
             base_tokens: Base prefix token sequence already in the cache.
@@ -346,7 +496,7 @@ class RadixPrefixCache:
                 `[batch, num_kv_heads, len(suffix_tokens), head_dim]`.
 
         Returns:
-            List of RadixNodes representing the complete token sequence.
+            List of RadixNodes representing the complete token sequence, or None if base was evicted.
         """
         full_seq = tuple(base_tokens) + tuple(suffix_tokens)
         nodes, matched_len = self.match(full_seq)
@@ -355,23 +505,20 @@ class RadixPrefixCache:
             return nodes
 
         base_len = len(base_tokens)
-        curr = nodes[-1] if nodes else self.root
 
         if matched_len >= base_len:
             delta_offset = matched_len - base_len
             rem_tokens = full_seq[matched_len:]
             if rem_tokens:
                 rem_k = {
-                    l_i: k[..., delta_offset:, :].contiguous().clone()
+                    l_i: k[..., delta_offset:, :]
                     for l_i, k in k_delta_by_layer.items()
                 }
                 rem_v = {
-                    l_i: v[..., delta_offset:, :].contiguous().clone()
+                    l_i: v[..., delta_offset:, :]
                     for l_i, v in v_delta_by_layer.items()
                 }
-                new_node = RadixNode(rem_tokens, rem_k, rem_v)
-                curr.children[rem_tokens[0]] = new_node
-                nodes.append(new_node)
+                self._coalesce_or_append(nodes, rem_tokens, rem_k, rem_v)
                 self.evict_if_needed()
             return nodes
 
@@ -387,10 +534,32 @@ class RadixPrefixCache:
         out: list[tuple[float, RadixNode, RadixNode]],
     ) -> None:
         """Helper to collect unpinned leaf nodes in the tree."""
-        if not node.children and node.session_count == 0:
+        if not node.children and not node.ragged_children and node.session_count == 0:
             out.append((node.last_access, parent, node))
-        for child in node.children.values():
+        for child in node.iter_all_children():
             self._find_unpinned_leaves(node, child, out)
+
+    def _remove_child(self, parent: RadixNode, victim: RadixNode) -> None:
+        """Removes `victim` from `parent.children` or `parent.ragged_children`."""
+        if (
+            victim.token_ids in parent.ragged_children
+            and parent.ragged_children[victim.token_ids] is victim
+        ):
+            del parent.ragged_children[victim.token_ids]
+        first_tok = victim.token_ids[0]
+        if parent.children.get(first_tok) is victim:
+            del parent.children[first_tok]
+            # Promote the longest remaining ragged child with the same first_tok if one exists
+            same_first = [
+                rc
+                for rc in parent.ragged_children.values()
+                if rc.token_ids and rc.token_ids[0] == first_tok
+            ]
+            if same_first:
+                same_first.sort(key=lambda n: n.num_tokens, reverse=True)
+                promoted = same_first[0]
+                del parent.ragged_children[promoted.token_ids]
+                parent.children[first_tok] = promoted
 
     def evict_if_needed(self) -> int:
         """Evicts least recently used (LRU) leaf nodes if token count or backing storage exceeds quota.
@@ -406,17 +575,24 @@ class RadixPrefixCache:
             or self.total_backing_tokens > self.max_cached_tokens
         ):
             candidates: list[tuple[float, RadixNode, RadixNode]] = []
-            for child in self.root.children.values():
+            for child in self.root.iter_all_children():
                 self._find_unpinned_leaves(self.root, child, candidates)
 
             if not candidates:
                 # No unpinned leaves eligible for eviction
                 break
 
-            candidates.sort(key=lambda item: item[0])
+            candidates.sort(
+                key=lambda item: (
+                    1 if self._is_prefix_shadowed(item[1], item[2]) else 0,
+                    item[0],
+                )
+            )
             _, parent, victim = candidates[0]
-            del parent.children[victim.token_ids[0]]
-            evicted_tokens += victim.num_tokens
+            was_shadowed = self._is_prefix_shadowed(parent, victim)
+            self._remove_child(parent, victim)
+            if not was_shadowed:
+                evicted_tokens += victim.num_tokens
 
             # Selective compaction on eviction: compact surviving nodes to release dead backing slabs
             self.compact_all()

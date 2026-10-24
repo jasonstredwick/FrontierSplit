@@ -476,10 +476,12 @@ class ContextServer:
         expected_num_layers: int | None = None,
         model_id: str | None = None,
         lease_ttl_seconds: float | None = None,
+        chunk_size: int = 128,
     ) -> None:
         self.device = torch.device(device)
         self.store = ContextStore(ttl_seconds=session_ttl_seconds)
         self.max_cached_tokens = max_cached_tokens
+        self.chunk_size = chunk_size
         self.expected_num_layers = expected_num_layers
         self.model_id = model_id
         self.session_ttl_seconds = session_ttl_seconds
@@ -536,6 +538,7 @@ class ContextServer:
         if effective_id not in self._prefix_caches:
             cache = RadixPrefixCache(
                 max_cached_tokens=self.max_cached_tokens,
+                chunk_size=self.chunk_size,
             )
             cache.on_compact = self._sync_compacted_sessions
             self._prefix_caches[effective_id] = cache
@@ -654,12 +657,32 @@ class ContextServer:
         nodes = []
         while pos < len(seq):
             first_tok = seq[pos]
-            child = curr.children.get(first_tok)
-            if child is None:
+            rem = seq[pos:]
+            candidates = []
+            primary = curr.children.get(first_tok)
+            if primary is not None:
+                candidates.append(primary)
+            for rc in curr.ragged_children.values():
+                if rc.token_ids and rc.token_ids[0] == first_tok and rc is not primary:
+                    candidates.append(rc)
+
+            matched_child = None
+            best_len = -1
+            for c in candidates:
+                c_len = c.num_tokens
+                if (
+                    c_len <= len(rem)
+                    and rem[:c_len] == c.token_ids
+                    and c_len > best_len
+                ):
+                    matched_child = c
+                    best_len = c_len
+
+            if matched_child is None:
                 break
-            nodes.append(child)
-            pos += child.num_tokens
-            curr = child
+            nodes.append(matched_child)
+            pos += matched_child.num_tokens
+            curr = matched_child
         return nodes
 
     def _set_session_pin(

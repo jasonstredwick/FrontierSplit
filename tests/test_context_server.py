@@ -27,7 +27,6 @@ from frontiersplit.context.online_softmax import (
     finalize_attention,
     merge_two_partial_attentions,
 )
-from frontiersplit.context.prefix_cache import RadixPrefixCache
 
 
 def get_free_port() -> int:
@@ -396,7 +395,7 @@ def test_context_store_zero_copy_chunks_registration():
 
 def test_context_server_zero_copy_radix_match_and_chunk_attention():
     """Verify that match_prefix shares RadixNode memory zero-copy and chunk attention is bit-exact."""
-    server = ContextServer()
+    server = ContextServer(chunk_size=3)
     tokens1 = [10, 20, 30]
     tokens2 = [10, 20, 30, 40, 50]
 
@@ -821,6 +820,67 @@ def test_compaction_updates_active_session_chunks_in_store():
     assert chunks_after is not None and len(chunks_after) == 1
     assert chunks_after[0][0].untyped_storage().nbytes() == 128
     assert chunks_after[0][1].untyped_storage().nbytes() == 128
+
+
+def test_context_server_ragged_edge_branch_vs_coalesced_output():
+    """Verify ContextServer stores ragged edge for prompt branches and coalesces output continuations."""
+    server = ContextServer(chunk_size=128)
+    prompt_tokens = list(range(154))  # 128 aligned + 26 ragged edge
+    output_tokens = list(range(154, 304))  # 150 output tokens
+
+    k_full = torch.randn(1, 4, 304, 32)
+    v_full = torch.randn(1, 4, 304, 32)
+
+    k_prompt = k_full[:, :, :154, :]
+    v_prompt = v_full[:, :, :154, :]
+    k_output = k_full[:, :, 154:, :]
+    v_output = v_full[:, :, 154:, :]
+
+    # 1. Register prompt (154 tokens -> 128 aligned + 26 ragged edge)
+    server.register_prompt(
+        "sess-turn1", 0, k_prompt, v_prompt, token_ids=prompt_tokens, num_layers=1
+    )
+    chunks_p = server.store.get_chunks("sess-turn1", 0)
+    assert chunks_p is not None
+    assert [c[0].shape[-2] for c in chunks_p] == [128, 26]
+
+    # 2. Commit 150 output tokens -> coalesces starting at the 26-token ragged edge into [128, 128, 48]
+    server.append_kv(
+        "sess-turn1", 0, k_output, v_output, token_ids=output_tokens, num_layers=1
+    )
+    chunks_cont = server.store.get_chunks("sess-turn1", 0)
+    assert chunks_cont is not None
+    assert [c[0].shape[-2] for c in chunks_cont] == [128, 128, 48]
+
+    # 3. Next message based on recent output matches the coalesced chunks [128, 128, 48]
+    m_cont, sid_cont = server.match_prefix(
+        prompt_tokens + output_tokens + [999], target_session_id="sess-turn2"
+    )
+    assert m_cont == 304
+    assert sid_cont == "sess-turn2"
+    chunks_turn2 = server.store.get_chunks("sess-turn2", 0)
+    assert chunks_turn2 is not None
+    assert [c[0].shape[-2] for c in chunks_turn2] == [128, 128, 48]
+
+    q = torch.randn(1, 4, 1, 32)
+    part_cont = server.query_partial_attention("sess-turn2", 0, q=q)
+    expected_cont = compute_partial_attention(q, k_full, v_full)
+    assert torch.allclose(part_cont.accumulator, expected_cont.accumulator, atol=1e-5)
+
+    # 4. Next message starting at the prompt ragged edge matches [128, 26] directly
+    m_branch, sid_branch = server.match_prefix(
+        prompt_tokens + [777, 888], target_session_id="sess-branch"
+    )
+    assert m_branch == 154
+    assert sid_branch == "sess-branch"
+    chunks_branch = server.store.get_chunks("sess-branch", 0)
+    assert chunks_branch is not None
+    assert [c[0].shape[-2] for c in chunks_branch] == [128, 26]
+
+    part_branch = server.query_partial_attention("sess-branch", 0, q=q)
+    expected_branch = compute_partial_attention(q, k_prompt, v_prompt)
+    assert torch.allclose(part_branch.accumulator, expected_branch.accumulator, atol=1e-5)
+
 
 
 
