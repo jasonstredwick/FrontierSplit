@@ -1,37 +1,27 @@
-# Python
-.venv/
-venv/
+# Python bytecode and tool caches
+.__pycache__/
 __pycache__/
+.pytest_cache/
+.ruff_cache/
 *.py[cod]
 *$py.class
 *.so
-.Python
-env/
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
 wheels/
 *.egg-info/
-.installed.cfg
 *.egg
-
-# Byte-compiled / optimized / DLL files
-*.pyc
 
 # Virtual environments
 .env
-.venv
-env/
+.venv/
 venv/
+env/
 ENV/
+
+# Ephemeral scratch workspace
+scratch/
+stashed_code/
 
 # Model weights & large datasets
 models/
@@ -59,8 +49,7 @@ wandb/
 .system_generated/
 eval_results/
 
-# Cluster & Hardware Configuration (Dynamic Ephemeral State)
+# Cluster & dynamic state
 cluster_config.json
 .env.cluster
 *.local.json
-

@@ -1,221 +1,45 @@
 # FrontierSplit
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
-[![Tests: pytest](https://img.shields.io/badge/tests-pytest-green.svg)](https://docs.pytest.org/)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
 
-**FrontierSplit** is a lightweight, transparent reference architecture for **disaggregated long-context LLM inference**.
-
-It decouples the heavy, static prompt key-value cache from the dynamic token generation loop, using **Online Softmax rescaling** to compute mathematically exact attention across machines with tiny **8 KB network payloads**.
+**FrontierSplit** is a modular Python/PyTorch library and fleet-sizing toolkit for **distributed unquantized 16-bit (`BF16`/`FP16`) LLM inference** across commodity, older, and heterogeneous hardware, targeting **`Mistral-7B`** (Dense) and **`Mixtral-8x7B`** (MoE) as primary baseline models.
 
 ---
 
-## The Problem: The Long-Context VRAM Wall
+## Core Design Principles
 
-In modern Large Language Models (LLMs), long-context prompts (e.g., 50K–100K tokens of documents or code repositories) create massive memory pressure:
-
-* A 100,000-token prompt requires **hundreds of megabytes to gigabytes of KV cache per user** on every GPU.
-* To serve long-context models, teams are forced to buy or rent expensive multi-GPU servers (such as 80GB H100 clusters) simply to prevent Out-Of-Memory (OOM) crashes from the KV cache.
-* During autoregressive token generation, the GPU streams that massive KV cache through memory bandwidth, choking decode throughput and limiting concurrent user capacity.
-
----
-
-## The Solution: Disaggregated Context + Online Softmax
-
-FrontierSplit recognizes a fundamental asymmetry in transformer generation:
-
-1. **The Prompt is Static and Immutable:** Once prefill is finished, the prompt KV cache never changes, never grows, and is 100% read-only.
-2. **The Output is Dynamic and Tiny:** The generated output grows token-by-token (the "ragged edge"), but only reaches a few hundred to a couple thousand tokens.
-
-Instead of keeping both on an expensive GPU:
-
-```
-┌────────────────────────────────────────────────────────┐
-│             Remote Context Server (CPU / RAM / GPU)     │
-│   • Holds 100,000+ token static prompt KV cache        │
-│   • Read-only, zero dynamic memory churn               │
-└───────────────────────────┬────────────────────────────┘
-                            │  ▲ Query vector q (8 KB)
-                            │  │
-                            │  ▼ Partial Attention (A, m, l) (16.39 KB FP32 / 8.25 KB FP16)
-┌───────────────────────────┴────────────────────────────┐
-│             Lightweight Decode Worker (Small GPU)       │
-│   • Holds ONLY the local output tokens (e.g. 32 tokens)│
-│   • Merges prompt + output via Online Softmax          │
-│   • Produces mathematically equivalent attention       │
-└────────────────────────────────────────────────────────┘
-```
+1. **Compute-to-Data KV Disaggregation via Online Softmax:** Keep private per-session Key-Value caches pinned in memory while exchanging compact `8–32 KiB` single-token vectors over persistent zero-pickle binary TCP, merging sequence chunks via FP32 Online Softmax rescaling.
+2. **Composable Layer & Intra-Layer Topologies:** Support consolidated execution, multi-layer pipeline slicing across small-VRAM GPUs, and intra-layer **`Attn+KV` $\to$ KV-Stateless `FFN`** disaggregation (`W_qkv` + aligned KV chunks + ragged-edge tail local to `Attn+KV`; coalesced batching over $\Delta t_{\text{wait}}$ + 1-token fan-out on `FFN`).
+3. **Sequence Chunking & Interruption-Interval Striping:** Align historical KV blocks to fixed chunk boundaries, manage newly generated tokens in an active **ragged-edge** tail chunk, and expose a tunable **interruption-interval** chunk quantum supporting intra-request **self-striping** and inter-request **concurrency-striping**.
+4. **Roofline-Guided Fleet Planning:** Model resident vs. active bytes, physical vs. software-usable VRAM, global in-flight concurrency ($M$) vs. stage batch size ($B$), and idealized weight-only crossover ($B_{\text{crit}} \approx F_{\text{peak}} / \text{BW}_{\text{peak}}$) to identify when to consolidate, when to pipeline, and when to disaggregate.
 
 ---
 
-## The Math: Exact Online Softmax Merging
+## Documentation & Conventions
 
-Rather than sending the giant 200 MB KV cache across the network, the Decode Worker only sends the current token's Query vector $q$ (**8 KB**) to the Context Server.
-
-The Context Server computes partial attention against the prompt and returns three compact objects per head:
-* The partial accumulator vector: $A_p = \sum e^{s_p - m_p} V_p$
-* The local maximum logit: $m_p = \max(s_p)$
-* The sum of exponentials: $\ell_p = \sum e^{s_p - m_p}$
-
-The Decode Worker computes the same on its tiny local output cache ($A_o, m_o, \ell_o$), and merges them with **zero approximation loss** (identical within floating-point associative precision):
-
-$$m_{\text{global}} = \max(m_p, m_o)$$
-
-$$\ell_{\text{global}} = \ell_p \cdot e^{m_p - m_{\text{global}}} + \ell_o \cdot e^{m_o - m_{\text{global}}}$$
-
-$$A_{\text{global}} = A_p \cdot e^{m_p - m_{\text{global}}} + A_o \cdot e^{m_o - m_{\text{global}}}$$
-
-$$\mathbf{O_{\text{final}} = \frac{A_{\text{global}}}{\ell_{\text{global}}}}$$
-
-This merge formula is mathematically identical to computing attention across the entire combined sequence in a single monolithic pass.
+* **[`docs/README.md`](docs/README.md)** — Documentation index.
+* **[`docs/paper/frontiersplit_technical_paper_draft2.md`](docs/paper/frontiersplit_technical_paper_draft2.md)** — Full architectural analysis, intra-layer dataflow, chunking/striping mechanics, and primary-source hardware Roofline models.
+* **[`AGENTS.md`](AGENTS.md)** & **[`style_guide.md`](style_guide.md)** — Workspace execution rules, architectural invariants, and Python 3.14 coding conventions.
 
 ---
 
-## Quickstart
+## Development Setup & Running Commands
 
-### 1. Installation
+Requires **Python 3.14** in `.venv/`. Run scripts and tests from the repository root with bytecode routed to `.__pycache__/`:
 
-```bash
-git clone https://github.com/jasonstredwick/FrontierSplit.git
-cd FrontierSplit
-pip install -e .
+```sh
+# Direct script execution
+PYTHONPATH=. .venv/bin/python -X pycache_prefix=.__pycache__ path/to/script.py
+
+# Run test suite
+PYTHONPATH=. .venv/bin/python -X pycache_prefix=.__pycache__ -m pytest
 ```
 
-### 2. Run the Disaggregated Demo
-
-Experience the architecture in action: a standalone Context Server holding 10,000 prompt tokens while a Decode Worker generates tokens with 8 KB socket round-trips:
-
-```bash
-python examples/disaggregated_demo.py
-```
-
-Sample output:
-```text
-======================================================================
- FrontierSplit: Disaggregated Long-Context Inference Demo
-======================================================================
-
-[Architecture Specs]
-  • Prompt Length:       10,000 tokens
-  • Prompt KV Footprint: 39.06 MB
-  • Network Query Size:  8.00 KB (Send)
-  • Network Return Size: 8.25 KB (Receive)
-  • Merge Algorithm:     Exact Online Softmax Rescaling
-
-[1/4] Context Server started on 127.0.0.1:49299
-[2/4] Offloading 10,000 prompt tokens to Context Server...
-      Prompt registered in 152.04 ms
-
-[3/4] Initializing Decode Worker...
-[4/4] Generating 10 tokens with disaggregated attention...
-----------------------------------------------------------------------
- Step | Local Output Tokens | Query RTT | Verification vs. Native
-----------------------------------------------------------------------
-   1  |       1 tokens      | 35.70 ms  | ✓ Bit-for-bit Exact
-   2  |       2 tokens      | 32.63 ms  | ✓ Bit-for-bit Exact
-   3  |       3 tokens      | 30.49 ms  | ✓ Bit-for-bit Exact
-  ...
-----------------------------------------------------------------------
-✓ Demo completed successfully.
-  The Decode Worker held only 10 output tokens in local memory,
-  yet computed exact attention over the entire 10,010-token context!
-======================================================================
-```
-
----
-
-## HuggingFace Integration
-
-You can wrap any standard HuggingFace causal language model (Llama, Mistral, Qwen2, Gemma) with `DisaggregatedModel` to run disaggregated long-context inference out of the box with zero model surgery:
-
-```python
-from transformers import AutoModelForCausalLM
-from frontiersplit import ContextClient, ContextServer, DisaggregatedModel
-
-# 1. Load any standard HuggingFace model
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-
-# 2. Connect to remote Context Server
-client = ContextClient(host="10.0.0.1", port=50055)
-disagg_model = DisaggregatedModel(model=model, context_client=client)
-
-# 3. Generate tokens natively (prompts offloaded, attention merged via Online Softmax)
-tokens = disagg_model.generate(
-    input_ids=prompt_tokens,
-    max_new_tokens=64,
-    session_id="chat-session-123",
-)
-```
-
-Run the runnable HuggingFace causal LM demo:
-```bash
-python examples/hf_disaggregated_demo.py
-```
-
----
-
-## Running Unit Tests
-
-We enforce strict open-source standards with 100% type annotations and Ruff linting:
-
-```bash
-# Run the test suite (all 12 numerical & integration tests)
-pytest tests/test_online_softmax.py tests/test_context_server.py tests/test_decode_worker.py tests/test_hf_model.py -v
-
-# Audit code formatting and linting
-ruff check frontiersplit tests examples
-ruff format --check frontiersplit tests examples
-```
-
----
-
-## Project Structure
-
-```text
-FrontierSplit/
-├── pyproject.toml                         # Packaging, dependencies, and Ruff configuration
-├── README.md                              # Project overview, math formulation, and guides
-├── ARCHITECTURE.md                        # Master system architecture & design traceability
-├── docs/                                  # Architectural specifications & design documents
-│   ├── README.md                          # Design-to-Implementation Traceability Matrix
-│   ├── context/                           # Disaggregated Context Engine design specifications
-│   │   └── DESIGN_CLOUD_ARCHITECTURE.md   # Cloud scaling, Online Softmax, Delta Prefill, Sharding
-│   └── pipeline/                          # Pipeline Parallel Engine design specifications
-│       ├── DESIGN_MIXTRAL_8X7B.md         # 8-node MoE pipeline parallel slicing & layer distribution
-│       └── DESIGN_KV_CACHE.md             # Worker-level KV cache store & 1F1B scheduling
-├── frontiersplit/
-│   ├── __init__.py                        # Top-level public package exports
-│   ├── gateway.py                         # OpenAI-compatible REST & SSE Ingress Gateway
-│   ├── context/                           # Disaggregated Context & Online Softmax Engine
-│   │   ├── __init__.py                    # Context package exports
-│   │   ├── online_softmax.py              # Pure PyTorch Online Softmax merging kernel
-│   │   ├── context_server.py              # Weightless Context Server & TCP protocol (sliding TTL)
-│   │   ├── decode_worker.py               # Decode Worker with DisaggregatedAttention module
-│   │   ├── hf_model.py                    # HuggingFace DisaggregatedModel patcher & Delta Prefill
-│   │   ├── prefix_cache.py                # Radix tree prefix caching
-│   │   └── routing.py                     # Consistent hash ring & prefix router
-│   └── pipeline/                          # 1F1B Pipeline Parallel Slicing Engine
-│       ├── __init__.py                    # Pipeline package exports
-│       ├── worker.py                      # Pipeline stage forward worker & local KV store
-│       ├── scheduler.py                   # 1F1B micro-batch continuous pipeline scheduler
-│       ├── protocol.py                    # Activation packet schemas & binary framing
-│       ├── transport.py                   # Persistent binary TCP client/server
-│       ├── slicer.py                      # Model weight slicer & memory profiler
-│       ├── shard_planner.py               # Stage layer partitioning
-│       ├── tpu_runner.py                  # Cloud TPU v5e multi-core runner
-│       └── models.py                      # Model architecture specifications
-├── examples/                              # Runnable end-to-end demonstrations
-│   ├── disaggregated_demo.py              # 10k-token offload with 8 KB payloads
-│   ├── hf_disaggregated_demo.py          # HuggingFace causal LM generation with remote context
-│   ├── gateway_demo.py                    # Live OpenAI REST API streaming demo
-│   └── prefix_caching_demo.py             # Multi-tenant radix prefix cache demo
-├── tests/                                 # 91 unit and integration tests (100% passing)
-└── experiments/                           # Historical empirical benchmarks (8-Node Mixtral FP16)
-```
+*(Note: `frontiersplit/` currently holds the v0.1 prototype modules backed up on branch `archive/v0.1-prototypes` while v2 prescriptive specifications and module refactoring are underway).*
 
 ---
 
 ## License
 
-This project is licensed under the Apache 2.0 License.
+Apache License 2.0.
