@@ -42,4 +42,4 @@ PYTHONPATH=. .venv/bin/python -X pycache_prefix=.__pycache__ -m pytest
 
 ## License
 
-Apache License 2.0.
+Apache License 2.0 — see [`LICENSE`](LICENSE).
