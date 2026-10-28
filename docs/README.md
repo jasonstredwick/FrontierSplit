@@ -4,6 +4,8 @@ This directory holds the architectural analysis and prescriptive engineering spe
 
 ## Current Documents
 
+* **[`evals.md`](evals.md)** — Evaluation suite (`LM Evaluation Harness`, `RULER`, `GuideLLM`), reference parity methodology, and per-eval considerations.
+* **[`API.md`](API.md)** — `vLLM`-compatible OpenAI HTTP and streaming interface specification.
 * **[`paper/frontiersplit_technical_paper_draft2.md`](paper/frontiersplit_technical_paper_draft2.md)** — Analytical foundation, model/layer/KV byte anatomy, intra-layer `Attn+KV` $\to$ `FFN` partitioning, sequence chunking & interruption-interval striping, primary-source hardware Roofline modeling, and related-work comparison (`FlashDecoding`, `DistServe`, `Mooncake`, `vLLM afd-plugin` / `StepMesh`, `SGLang AFD`, `DeepInfer`).
 
 ## Project Conventions & Agent Rules
