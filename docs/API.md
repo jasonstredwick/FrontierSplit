@@ -217,10 +217,9 @@ configured chat renderer. Callers must pass raw message content rather than pre-
 
 * **Messages:** Non-empty list of objects with `role: "system" | "user" | "assistant"` and `content`. Content accepts
   either a string or a non-empty array of text parts, each shaped as `{"type": "text", "text": string}`. Text-part
-  arrays follow the active chat renderer's content format (matching vLLM): string-content HuggingFace Jinja templates
-  skip empty-string parts and join remaining text parts in array order with `"\n"` (`"\n".join`, yielding `""` if all
-  parts are empty), whereas structured-content Jinja templates and native Mistral rendering (`mistral_common`) pass the
-  ordered text-part objects directly to the renderer without inserting newline separators. Non-text parts, malformed
+  arrays follow the active chat renderer's content format: string-content renderers skip empty-string parts and join
+  remaining text parts in array order with `"\n"` (yielding `""` if all parts are empty), whereas structured-content
+  renderers pass the ordered text-part objects directly without inserting newline separators. Non-text parts, malformed
   parts, and null content return HTTP `400`. Role and turn-sequence constraints follow the active chat renderer; invalid
   turn sequences also return HTTP `400`.
 * **Template & special-token controls:** `add_generation_prompt` (`bool`, default `true`) requests an assistant turn
@@ -299,11 +298,11 @@ response on that same HTTP request with `200 OK` and `Content-Type: text/event-s
 * **Chat chunk schema (`POST /v1/chat/completions`):** Uses `object: "chat.completion.chunk"`. The opening chunk sends
   `delta: {"role": "assistant", "content": ""}` with `finish_reason: null`, content chunks send
   `delta: {"content": "..."}`, and the closing choice chunk sends `delta: {}` with `finish_reason: "stop" | "length"`.
-* **Usage reporting:** Matching vLLM's `should_include_usage` rule, `continuous_usage_stats` depends on `include_usage`:
-  when both `stream_options.include_usage` and `stream_options.continuous_usage_stats` are `true`, each choice chunk
-  (including the opening chat role chunk) includes cumulative `usage` (`prompt_tokens`, `completion_tokens`,
-  `total_tokens`) through that event. When `stream_options.include_usage` is `true`, a final chunk with `choices: []`
-  and total `usage` is emitted immediately before `data: [DONE]`.
+* **Usage reporting:** `continuous_usage_stats` depends on `include_usage`: when both `stream_options.include_usage`
+  and `stream_options.continuous_usage_stats` are `true`, each choice chunk (including the opening chat role chunk)
+  includes cumulative `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`) through that event. When
+  `stream_options.include_usage` is `true`, a final chunk with `choices: []` and total `usage` is emitted immediately
+  before `data: [DONE]`.
 * **Mid-stream failure and disconnect:** If backend execution fails after HTTP `200` headers are committed, the server
   emits an SSE `data: {"error": {"message": "...", "type": "server_error", "param": null, "code": "stream_interrupted"}}`
   event followed by `data: [DONE]` and closes the connection. If the client disconnects early, the API server cancels
@@ -314,10 +313,9 @@ response on that same HTTP request with `200 OK` and `Content-Type: text/event-s
 ## Tokenization and Context Limits
 
 * **Checkpoint and renderer fidelity:** Tokenization, detokenization, special tokens, EOS IDs, and chat rendering
-  follow the served checkpoint and the server's configured tokenizer/renderer mode (`hf` Jinja chat-template rendering
-  vs. `mistral` native rendering via `mistral_common`). Context accounting uses the exact token IDs produced after chat
-  rendering and special-token insertion, and pre-tokenized integer prompts validate every token ID against the served
-  vocabulary (`0 <= id < vocab_size`, returning HTTP `400` otherwise).
+  follow the served checkpoint and the server's configured tokenizer and chat renderer. Context accounting uses the
+  exact token IDs produced after chat rendering and special-token insertion, and pre-tokenized integer prompts validate
+  every token ID against the served vocabulary (`0 <= id < vocab_size`, returning HTTP `400` otherwise).
 * **Context capacity (no prompt truncation):** The deployment's effective limit `max_model_len` (configured at or below
   the checkpoint's native limit) is exposed via `GET /v1/models`. Prompts are never silently truncated: after
   tokenization, including template and special-token insertion, reject any prompt longer than `max_model_len` with HTTP

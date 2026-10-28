@@ -52,11 +52,11 @@ compatible reference server, changing the endpoint and served-model identifier w
 For chat templates, exactly one side owns rendering: either the harness renders a prompt for `/v1/completions`, or the
 server renders structured messages sent to `/v1/chat/completions`. The chosen benchmark protocol determines which is
 appropriate; an Instruct checkpoint alone does not determine the evaluation's formatting. When comparing FrontierSplit
-against a reference server on `/v1/chat/completions`, both deployments must match the active tokenizer mode, chat
-template, and message content-part normalization path, and runs should verify identical prompt token IDs on the rendered
-inputs before attributing differences to model execution. Because the HTTP contract caps generation budgets to remaining
-context capacity rather than rejecting oversized budgets, fixed-length evaluation configurations must validate beforehand
-that prompts leave the full required output capacity within `max_model_len`.
+against a reference server on `/v1/chat/completions`, both deployments must use a matching chat rendering path and
+verify identical prompt token IDs on the rendered inputs before attributing differences to model execution. Because the
+HTTP contract caps generation budgets to remaining context capacity rather than rejecting oversized budgets,
+fixed-length evaluation configurations must validate beforehand that prompts leave the full required output capacity
+within `max_model_len`.
 
 ## References and Reproducibility
 
@@ -71,9 +71,9 @@ Each evaluation configuration and report should record:
 
 | Area | Required Record |
 | :--- | :--- |
-| Model | Checkpoint and tokenizer revisions, explicit tokenizer/renderer mode (such as `hf` vs. `mistral`), chat template and content-normalization path, precision, effective context limit |
+| Model | Checkpoint and tokenizer revisions, tokenizer/renderer mode, chat template, precision, effective context limit |
 | Evaluation | Harness version/commit, exact task identifiers, dataset revision and split, sample count, few-shot settings, prompt/chat-template configuration, generation settings, scoring metric |
-| Execution | Reference or FrontierSplit implementation revision, relevant runtime and tokenizer/template library versions (such as `vllm`, `transformers`, `tokenizers`, `mistral_common`, `jinja2`), hardware and device layout |
+| Execution | Reference or FrontierSplit implementation revision, relevant runtime and tokenizer library versions, hardware and device layout |
 | Serving workload | Input/output length distribution, arrival profile, concurrency, turn/history policy, streaming mode, warmup and measurement interval |
 | Evidence | Invocation/configuration, rendered prompt-token-ID parity check, per-example results or request traces, aggregate metrics, failures, and reference-result source |
 
@@ -126,8 +126,7 @@ Different evaluations rely on distinct server capabilities covered in [`API.md`]
 | `mistralai/Mistral-7B-Instruct-v0.3` | Dense baseline | Unquantized FP16 or BF16, explicitly selected per configuration |
 | `mistralai/Mixtral-8x7B-Instruct-v0.1` | MoE baseline | Unquantized FP16 or BF16, explicitly selected per configuration |
 
-Each run must pin the checkpoint revision, tokenizer revision, and explicit tokenizer/renderer mode. Automatic Mistral
-tokenizer selection in reference servers such as vLLM depends on repository files (for example `tekken.json` or
-`tokenizer.model.v*`) at the selected revision; record any observed model-name defaults as observations for that pinned
-configuration rather than permanent guarantees. FP16 and BF16 runs are separate configurations. Published results for
-base models or other checkpoint versions are not interchangeable with results for these Instruct models.
+Each run must pin the checkpoint revision, tokenizer revision, and explicit tokenizer/renderer configuration rather than
+relying on automatic defaults, which can change across repository revisions; record any observed defaults as part of
+that pinned configuration rather than permanent guarantees. FP16 and BF16 runs are separate configurations. Published
+results for base models or other checkpoint versions are not interchangeable with results for these Instruct models.

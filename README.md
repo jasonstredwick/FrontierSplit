@@ -36,7 +36,7 @@ PYTHONPATH=. .venv/bin/python -X pycache_prefix=.__pycache__ path/to/script.py
 PYTHONPATH=. .venv/bin/python -X pycache_prefix=.__pycache__ -m pytest
 ```
 
-*(Note: `frontiersplit/` currently holds the v0.1 prototype modules backed up on branch `archive/v0.1-prototypes` while v2 prescriptive specifications and module refactoring are underway).*
+*(Historical v0.1 prototype modules and experiments are preserved on the `archive/v0.1-prototypes` Git branch.)*
 
 ---
 
