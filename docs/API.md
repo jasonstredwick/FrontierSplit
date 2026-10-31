@@ -1,6 +1,6 @@
 # FrontierSplit HTTP API
 
-**Status: interface specification (pre-implementation).** This document defines the HTTP contract that the FrontierSplit
+**Status: interface specification.** This document defines the HTTP contract that the FrontierSplit
 API server implements; examples illustrate wire formats rather than recorded output from a running deployment.
 
 FrontierSplit specifies an OpenAI-compatible text and chat API, with selected vLLM extensions needed by existing
@@ -117,9 +117,9 @@ All non-`200` HTTP responses on `/v1/*` routes use the standard OpenAI error JSO
 | `model` | `string` | *(required)* | Must match a served `id` in `GET /v1/models` (`404` otherwise). |
 | `prompt` | `string \| list[string] \| list[int] \| list[list[int]]` | *(required)* | Non-empty single prompt or batch of non-empty prompts as UTF-8 text or integer token-ID lists (`0 <= id < vocab_size`, `400` otherwise). |
 | `max_tokens` | `int \| null` | `16` | `null` uses the default (`16`). Otherwise `0 <= max_tokens <= max_model_len`; explicit `0` runs prompt prefill only (`stream: false`), and positive upper bounds cap to remaining context; see [Tokenization and Context Limits](#tokenization-and-context-limits). |
-| `temperature` | `float \| null` | `1.0` | `null` uses the default. Otherwise finite `0.0 <= temperature <= 2.0`; `0.0` selects greedy (`argmax`) decoding. |
+| `temperature` | `float \| null` | `1.0` | `null` uses the default. Otherwise finite `0.0 <= temperature <= 2.0`; `0.0` selects greedy (`argmax`) decoding. Positive values below `0.01` normalize to `0.01`, matching vLLM. |
 | `top_p` | `float \| null` | `1.0` | `null` uses the default. Otherwise finite `0.0 < top_p <= 1.0`. Applied when `temperature > 0.0`. |
-| `seed` | `int \| null` | `null` | Signed 64-bit integer (`-2^63 <= seed <= 2^63 - 1`) per-request PRNG seed, or `null`. Reproducibility holds only under identical backend hardware, precision, and execution batching. |
+| `seed` | `int \| null` | `null` | Signed 64-bit integer (`-2^63 <= seed <= 2^63 - 1`) per-request PRNG seed, or `null`. The sentinel `-1` normalizes to `null` (no per-request seed), matching vLLM; other integers are preserved. Reproducibility holds only under identical backend hardware, precision, and execution batching. |
 | `stop` | `string \| list[string] \| null` | `null` | Non-empty string or list of non-empty strings. `null` or `[]` disables string stopping; empty strings and null list entries return `400`. Matched stop text is excluded from output. |
 | `ignore_eos` | `bool` | `false` | `vLLM` extension: when `true`, ignores the checkpoint's EOS token and continues generating until the effective token budget or a `stop` string is reached. |
 | `add_special_tokens` | `bool` | `true` | Controls tokenizer special-token insertion (such as BOS) for string prompts; ignored for pre-tokenized integer prompts. |
@@ -190,7 +190,11 @@ vLLM's general acceptance of extra fields.
   distribution. Each score conditions on the preceding token IDs in that sequence.
 * **`logprobs` structure:** Each `choices[].logprobs` object contains four equal-length arrays—`tokens` (detokenized
   token piece strings), `token_logprobs` (`FP32` natural log-probabilities $\ln P$), `top_logprobs` (maps from candidate
-  token strings to $\ln P$), and `text_offset` (cumulative character offsets from the start of `choices[].text`).
+  token strings to $\ln P$), and `text_offset` (cumulative character lengths of the reported token pieces, starting at
+  zero). Following vLLM, `text_offset[i] = sum(len(piece) for piece in tokens[:i])`; these offsets are not guaranteed to
+  index `choices[].text`. Special tokens, tokenizer normalization, and stripped stop text can make the token pieces
+  differ from the returned text. For example, echoed text `"Hello world"` can have pieces `["<s>", " Hello", " world"]`
+  and offsets `[0, 3, 9]`.
   `token_logprobs[i]` always records the score of the actual selected token ID (for echoed prompt positions, the actual
   prompt token ID being scored). Each conditioned position in `top_logprobs` includes the top `N` candidate token IDs
   and the selected token ID, yielding up to `N + 1` map entries (`1` entry when `N = 0`). If multiple included token IDs
@@ -339,3 +343,41 @@ For example, a completion prompt leaving eight tokens available with omitted or 
 succeeds with its effective generation budget capped to `8`. A completion or chat prompt that fills the context window
 (`remaining = 0`) returns HTTP `400` for any generative request, since its effective generation budget is `0`, whereas a
 full-context completion prompt with explicit `max_tokens: 0` and `stream: false` remains valid.
+
+---
+
+## Serving Implementation
+
+The eval-compatible interface lives in `frontiersplit/openai_api/`. Its serving, rendering, and output-processing
+responsibilities follow vLLM's organization, adapted to this API's scope. The backend contract and the adapter that
+connects it to these components are FrontierSplit-specific.
+
+| Module | Responsibility |
+| :--- | :--- |
+| `openai_api/protocol.py`, `errors.py`, `server.py` | HTTP schemas, validation, routing, authentication, error responses, and disconnect handling. |
+| `openai_api/renderer.py` | Chat templates, tokenization, prompt validation, and effective budget resolution. |
+| `openai_api/serving.py` | Request coordination, prompt echo, response formatting, usage, and SSE events. |
+| `openai_api/generation.py`, `detokenizer.py` | Token-stream adaptation, text stops, and incremental decoding. |
+| `openai_api/logprobs.py` | Prompt and generated-token score alignment and decoded log-probabilities. |
+| `openai_api/types.py` | Compatibility-layer generation settings and text-bearing outputs. |
+| `backend/types.py` | Token-level requests, resolved sampling controls, raw scores, execution completion causes, and the `InferenceBackend` protocol. |
+
+`InferenceBackend.Submit()` accepts token IDs and resolved execution settings and returns an async generator of
+`GenerationStep` deltas. API defaults, text stops, chat messages, decoded strings, and HTTP/SSE formatting stay in
+`openai_api/`. The backend reports `eos` or `budget`; `GenerationAdapter` maps these to API finish reasons and cancels
+execution when a text stop matches. Raw scores remain full-vocabulary FP32 log-probabilities before sampling
+transformations. The detailed score alignment and stream lifecycle contract is defined in `backend/types.py`.
+
+Given a backend implementation and its matching tokenizer, the application is assembled explicitly:
+
+```python
+from frontiersplit.openai_api import generation as fs_generation
+from frontiersplit.openai_api import server as fs_server
+
+engine = fs_generation.GenerationAdapter(backend=backend, tokenizer=tokenizer)
+app = fs_server.BuildApp(engine=engine)
+```
+
+The backend contract depends only on the Python standard library. Another serving interface can submit token-level
+work directly without importing the eval-compatible interface. This separation supplies the contract and compatibility
+adapter; a concrete inference backend must be supplied by the application.

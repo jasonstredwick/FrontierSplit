@@ -43,3 +43,6 @@ PYTHONPATH=. .venv/bin/python -X pycache_prefix=.__pycache__ -m pytest
 ## License
 
 Apache License 2.0 — see [`LICENSE`](LICENSE).
+
+Portions of the serving layer are adapted from vLLM and its credited upstream sources.
+See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for attribution and source references.

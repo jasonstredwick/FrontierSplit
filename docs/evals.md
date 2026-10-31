@@ -14,10 +14,10 @@ the public interface:
 2. **Serving behavior under load:** Measure throughput and latency under specified concurrent and multi-turn workloads,
    alongside a single-request baseline.
 
-The plan is to reuse established evaluation and load harnesses (**LM Evaluation Harness**, **RULER**, and **GuideLLM**).
-Together, this list covers general knowledge and commonsense (`MMLU`, `HellaSwag`, `ARC-Challenge`), multi-step
-reasoning (`GSM8K`), objectively verifiable instruction following without an LLM judge (`IFEval`), long-context
-retrieval (`RULER`), and concurrent serving performance (`GuideLLM`).
+The active plan uses **LM Evaluation Harness** and **GuideLLM**. Together, they cover general knowledge and commonsense
+(`MMLU`, `HellaSwag`, `ARC-Challenge`), multi-step reasoning (`GSM8K`), objectively verifiable instruction following
+without an LLM judge (`IFEval`), and concurrent serving performance (`GuideLLM`). **RULER** long-context evaluation is
+on hold because its existing clients do not directly support the FrontierSplit HTTP contract.
 
 The harnesses provide existing tasks and scoring or load-generation machinery. Project-specific workload profiles and
 session-lifecycle checks may be added where needed. Benchmark agreement provides evidence on the tested tasks; it does
@@ -34,14 +34,14 @@ not establish identical behavior for every possible input.
 | **ARC-Challenge** | Science question answering and reasoning | LM Evaluation Harness | Initial baseline |
 | **GSM8K** | Mathematical problem solving | LM Evaluation Harness | Initial baseline |
 | **IFEval** | Following objectively verifiable instructions | LM Evaluation Harness | Initial baseline |
-| **RULER** | Retrieval and reasoning across long contexts | [RULER](https://github.com/NVIDIA/RULER) | Before & after context/KV changes |
+| **RULER** | Retrieval and reasoning across long contexts | [RULER](https://github.com/NVIDIA/RULER) | Deferred — incompatible client API |
 | **Concurrent & multi-turn workloads** | Throughput, response latency, streaming latency, and behavior under load | [GuideLLM](https://vllm-project.github.io/guidellm/stable/getting-started/benchmark/) | Serving baseline & distribution work |
 
 ---
 
 ## Harness Integration
 
-The intended integration runs each harness out-of-process against the HTTP contract in [`API.md`](API.md), using a
+The intended integration runs each active harness out-of-process against the HTTP contract in [`API.md`](API.md), using a
 supported client backend. Compatible endpoint names alone are insufficient: the server must provide the response fields
 and scoring capabilities required by that backend.
 
@@ -88,11 +88,12 @@ are sufficiently matched.
 ## Configuration and Results Status
 
 Pinned harness configurations, executable invocations, reference-result links, and report locations remain to be added
-for LM Evaluation Harness, RULER, and GuideLLM. The suite table is a selection of evaluations, not a runnable preset.
+for LM Evaluation Harness and GuideLLM. RULER integration is deferred. The suite table is a selection of evaluations,
+not a runnable preset.
 Those artifacts will define the exact task variants and metrics; this document does not substitute for them.
 
 The intended progression is an unmodified reference run, a straightforward single-machine FrontierSplit run, and then
-distributed execution. Add RULER before context/KV changes and retain the reference configurations for later comparisons.
+distributed execution. Retain the reference configurations for later comparisons.
 
 ---
 
@@ -107,10 +108,12 @@ Different evaluations rely on distinct server capabilities covered in [`API.md`]
 * **Generative and instruction evaluations (`GSM8K`, `IFEval`):** Score generated responses using the selected task's
   prompting, decoding, stop conditions, and answer processing. Greedy decoding is a configuration choice, not a universal
   property of these benchmarks. Endpoint selection must follow the template-rendering policy above.
-* **Long-context evaluations (`RULER`):** Vary sequence length and task complexity to test capabilities that short-prompt
-  benchmarks may miss. Record tested lengths and reserve space for generated output within the effective context limit.
-  Do not silently truncate inputs or describe untested lengths as validated
-  ([context limits](API.md#tokenization-and-context-limits)).
+* **Long-context evaluations (`RULER`, deferred):** RULER's built-in `VLLMClient` sends `PUT /generate`, which is outside
+  this API. Its OpenAI client also assumes hosted-model names and tokenization; it is not a drop-in client for our
+  checkpoints ([RULER client implementations](https://github.com/NVIDIA/RULER/blob/main/scripts/pred/client_wrappers.py)).
+  Integration is on hold pending a compatible client path. When resumed, record tested lengths and reserve space for
+  generated output within the effective context limit. Do not silently truncate inputs or describe untested lengths as
+  validated ([context limits](API.md#tokenization-and-context-limits)).
 * **Concurrent serving workloads (`GuideLLM`):** Measure responsiveness and capacity across concurrent streams and
   multi-turn conversations. Record client-observed time-to-first-token, streaming latency, throughput, and token usage;
   streaming event timing is not necessarily individual model-token timing ([streaming contract](API.md#streaming)).
