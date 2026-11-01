@@ -47,6 +47,9 @@ data/
 !experiments/**/logs/
 wandb/
 .system_generated/
+
+# Evaluation datasets and run results
+eval_data/
 eval_results/
 
 # Cluster & dynamic state
