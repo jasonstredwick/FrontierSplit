@@ -1,0 +1,18 @@
+{
+  "adapter": "local-completions",
+  "apply_chat_template": false,
+  "dataset": {
+    "repository": "google/IFEval",
+    "revision": "966cd89545d6b6acfd7638bc708b98261ca58e84"
+  },
+  "display_name": "IFEval",
+  "id": "ifeval",
+  "max_gen_toks": 1280,
+  "num_fewshot": 0,
+  "schema_version": 1,
+  "task": "ifeval",
+  "task_files": [
+    "ifeval/ifeval.yaml"
+  ],
+  "task_version": 4.0
+}

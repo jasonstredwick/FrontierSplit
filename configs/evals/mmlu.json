@@ -1,0 +1,18 @@
+{
+  "adapter": "local-completions",
+  "apply_chat_template": false,
+  "dataset": {
+    "repository": "cais/mmlu",
+    "revision": "c30699e8356da336a370243923dbaf21066bb9fe"
+  },
+  "display_name": "MMLU",
+  "id": "mmlu",
+  "max_gen_toks": 256,
+  "num_fewshot": 5,
+  "schema_version": 1,
+  "task": "mmlu",
+  "task_files": [
+    "mmlu/default/mmlu_*.yaml"
+  ],
+  "task_version": 1.0
+}

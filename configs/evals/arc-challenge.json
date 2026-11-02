@@ -1,0 +1,18 @@
+{
+  "adapter": "local-completions",
+  "apply_chat_template": false,
+  "dataset": {
+    "repository": "allenai/ai2_arc",
+    "revision": "210d026faf9955653af8916fad021475a3f00453"
+  },
+  "display_name": "ARC Challenge",
+  "id": "arc-challenge",
+  "max_gen_toks": 256,
+  "num_fewshot": 0,
+  "schema_version": 1,
+  "task": "arc_challenge",
+  "task_files": [
+    "arc/arc_challenge.yaml"
+  ],
+  "task_version": 1.0
+}

@@ -1,0 +1,18 @@
+{
+  "adapter": "local-completions",
+  "apply_chat_template": false,
+  "dataset": {
+    "repository": "Rowan/hellaswag",
+    "revision": "218ec52e09a7e7462a5400043bb9a69a41d06b76"
+  },
+  "display_name": "HellaSwag",
+  "id": "hellaswag",
+  "max_gen_toks": 256,
+  "num_fewshot": 0,
+  "schema_version": 1,
+  "task": "hellaswag",
+  "task_files": [
+    "hellaswag/hellaswag.yaml"
+  ],
+  "task_version": 1.0
+}

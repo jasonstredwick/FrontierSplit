@@ -1,0 +1,5 @@
+lm-eval[api,ifeval]==0.4.13
+# Tokenization and the harness's API adapter require these even without local inference.
+transformers==5.20.2
+torch==2.14.1
+sentencepiece==0.2.1

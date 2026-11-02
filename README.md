@@ -19,6 +19,7 @@
 ## Documentation & Conventions
 
 * **[`docs/README.md`](docs/README.md)** — Documentation index.
+* **[`evals/README.md`](evals/README.md)** — Evaluation runner setup, configuration, and commands.
 * **[`docs/paper/frontiersplit_technical_paper_draft2.md`](docs/paper/frontiersplit_technical_paper_draft2.md)** — Full architectural analysis, intra-layer dataflow, chunking/striping mechanics, and primary-source hardware Roofline models.
 * **[`AGENTS.md`](AGENTS.md)** & **[`style_guide.md`](style_guide.md)** — Workspace execution rules, architectural invariants, and Python 3.14 coding conventions.
 
@@ -27,6 +28,9 @@
 ## Development Setup & Running Commands
 
 Requires **Python 3.14** in `.venv/`. Run scripts and tests from the repository root with bytecode routed to `.__pycache__/`:
+
+The full test suite includes harness integration tests and requires the dependencies in
+[`evals/requirements.lock`](evals/requirements.lock); installation is described in the [runner guide](evals/README.md).
 
 ```sh
 # Direct script execution

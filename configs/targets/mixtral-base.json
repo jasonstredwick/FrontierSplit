@@ -1,0 +1,10 @@
+{
+  "api_base_url": "http://127.0.0.1:8000/v1",
+  "api_key_env": null,
+  "backend": "mixtral-base",
+  "deployment": "gcp-ref",
+  "display_name": "Mixtral baseline API",
+  "id": "mixtral-base",
+  "schema_version": 1,
+  "served_model": "mistralai/Mixtral-8x7B-Instruct-v0.1"
+}

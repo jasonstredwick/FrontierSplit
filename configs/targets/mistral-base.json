@@ -1,0 +1,10 @@
+{
+  "api_base_url": "http://127.0.0.1:8000/v1",
+  "api_key_env": null,
+  "backend": "mistral-base",
+  "deployment": "gcp-ref",
+  "display_name": "Mistral baseline API",
+  "id": "mistral-base",
+  "schema_version": 1,
+  "served_model": "mistralai/Mistral-7B-Instruct-v0.3"
+}

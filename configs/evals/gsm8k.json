@@ -1,0 +1,18 @@
+{
+  "adapter": "local-completions",
+  "apply_chat_template": false,
+  "dataset": {
+    "repository": "openai/gsm8k",
+    "revision": "740312add88f781978c0658806c59bc2815b9866"
+  },
+  "display_name": "GSM8K",
+  "id": "gsm8k",
+  "max_gen_toks": 512,
+  "num_fewshot": 5,
+  "schema_version": 1,
+  "task": "gsm8k",
+  "task_files": [
+    "gsm8k/gsm8k.yaml"
+  ],
+  "task_version": 3.0
+}

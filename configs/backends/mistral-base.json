@@ -1,0 +1,13 @@
+{
+  "add_bos_token": true,
+  "display_name": "mistralai/Mistral-7B-Instruct-v0.3 FP16 baseline",
+  "id": "mistral-base",
+  "max_model_len": 32768,
+  "model": "mistralai/Mistral-7B-Instruct-v0.3",
+  "model_revision": "c170c708c41dac9275d15a8fff4eca08d52bab71",
+  "precision": "fp16",
+  "schema_version": 1,
+  "software": {},
+  "tokenizer": "mistralai/Mistral-7B-Instruct-v0.3",
+  "tokenizer_revision": "c170c708c41dac9275d15a8fff4eca08d52bab71"
+}

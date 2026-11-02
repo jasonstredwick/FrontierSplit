@@ -1,0 +1,12 @@
+{
+  "display_name": "Initial quality evaluations",
+  "evaluations": [
+    "mmlu",
+    "hellaswag",
+    "arc-challenge",
+    "gsm8k",
+    "ifeval"
+  ],
+  "id": "quality",
+  "schema_version": 1
+}

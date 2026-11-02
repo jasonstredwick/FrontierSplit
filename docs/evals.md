@@ -2,7 +2,8 @@
 
 FrontierSplit changes how model inference is run. Evaluations measure whether those changes affect model quality. We first evaluate the selected model using the baseline backend. When published scores include enough information to reproduce the evaluation, we use them to check that baseline. We then evaluate the same model with changes to the backend. Both runs use the same API, evaluation questions, prompting, and scoring settings. Comparing their scores shows whether the backend changes affect performance on those evaluations.
 
-**Status:** The evaluation tools and baseline results described in this document are not yet available.
+**Status:** The initial LM Evaluation Harness runner is available. Model baseline results and comparison-report
+generation are not yet available. See the [runner guide](../evals/README.md) for setup and commands.
 
 ## Evaluations
 
@@ -109,10 +110,14 @@ configs/
   suites/                # Lists of evaluations
   comparisons/           # Saved results to compare and analysis settings
 evals/
+  __main__.py            # Evaluation CLI (python -m evals)
+  runner.py              # Evaluation orchestration
+  harness.py             # LM Evaluation Harness integration
+  prepare.py             # Dataset preparation
+  config.py              # Configuration schemas
+  records.py             # Run records and checksums
   requirements.lock      # Exact harness dependency versions
   reports/               # Comparison reports and links to saved results
-scripts/
-  run_eval.py            # Evaluation runner
 eval_data/               # Saved dataset versions; outside Git
 eval_results/            # Run results; outside Git
 ```
