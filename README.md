@@ -20,6 +20,7 @@
 
 * **[`docs/README.md`](docs/README.md)** — Documentation index.
 * **[`evals/README.md`](evals/README.md)** — Evaluation runner setup, configuration, and commands.
+* **[`frontiersplit/models/experiments/README.md`](frontiersplit/models/experiments/README.md)** — Hugging Face reference and local baseline model experiments.
 * **[`docs/paper/frontiersplit_technical_paper_draft2.md`](docs/paper/frontiersplit_technical_paper_draft2.md)** — Full architectural analysis, intra-layer dataflow, chunking/striping mechanics, and primary-source hardware Roofline models.
 * **[`AGENTS.md`](AGENTS.md)** & **[`style_guide.md`](style_guide.md)** — Workspace execution rules, architectural invariants, and Python 3.14 coding conventions.
 
@@ -48,5 +49,5 @@ PYTHONPATH=. .venv/bin/python -X pycache_prefix=.__pycache__ -m pytest
 
 Apache License 2.0 — see [`LICENSE`](LICENSE).
 
-Portions of the serving layer are adapted from vLLM and its credited upstream sources.
-See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for attribution and source references.
+Portions of FrontierSplit are adapted from third-party open-source projects; see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for attribution and source references.

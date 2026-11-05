@@ -1,11 +1,11 @@
 {
   "add_bos_token": true,
-  "display_name": "mistralai/Mixtral-8x7B-Instruct-v0.1 FP16 baseline",
+  "display_name": "mistralai/Mixtral-8x7B-Instruct-v0.1 BF16 baseline",
   "id": "mixtral-base",
   "max_model_len": 32768,
   "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
   "model_revision": "eba92302a2861cdc0098cc54bc9f17cb2c47eb61",
-  "precision": "fp16",
+  "precision": "bf16",
   "schema_version": 1,
   "software": {},
   "tokenizer": "mistralai/Mixtral-8x7B-Instruct-v0.1",

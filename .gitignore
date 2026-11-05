@@ -23,16 +23,6 @@ ENV/
 scratch/
 stashed_code/
 
-# Model weights & large datasets
-models/
-weights/
-checkpoints/
-data/
-*.bin
-*.pt
-*.safetensors
-*.gguf
-
 # IDE & OS
 .DS_Store
 .idea/
@@ -40,19 +30,7 @@ data/
 *.swp
 *~
 
-# Logs & monitoring
-*.log
-!experiments/**/logs/*.log
-/logs/
-!experiments/**/logs/
-wandb/
-.system_generated/
-
 # Evaluation datasets and run results
 eval_data/
 eval_results/
 
-# Cluster & dynamic state
-cluster_config.json
-.env.cluster
-*.local.json

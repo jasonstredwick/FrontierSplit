@@ -1,6 +1,6 @@
 # Third-party notices
 
-FrontierSplit includes portions of the projects identified below, modified for its serving and backend interfaces.
+FrontierSplit includes portions of the projects identified below, modified for its serving interfaces and model experiments.
 These portions are licensed under Apache License 2.0; the license text is included in [LICENSE](LICENSE).
 The notices below identify incorporated source code, including attribution inherited through vLLM. They are not
 an inventory of separately installed dependencies.
@@ -40,6 +40,24 @@ not a claim about the commit at which each adaptation was first made.
 - Most referenced vLLM files match commit `900b8b08e2552c28a004e075866b5e1a39b99ac3`.
 - `vllm/renderers/hf.py` matches commit `60a7d568f46851992a364074cbfd96e10ccd68a6`.
 - `vllm/sampling_params.py` matches commit `e1e77a279d68a9601be062cb267a5f9911c422c7`.
+
+## Hugging Face Transformers model implementations
+
+The local baseline adapts model code from Hugging Face Transformers `5.20.2`:
+
+| FrontierSplit file | Upstream source path |
+| --- | --- |
+| `frontiersplit/models/experiments/baseline/mistral.py` | `src/transformers/models/mistral/modeling_mistral.py` |
+| `frontiersplit/models/experiments/baseline/mixtral.py` | `src/transformers/models/mixtral/modeling_mixtral.py` |
+
+- Project: [Hugging Face Transformers](https://github.com/huggingface/transformers)
+- License: Apache License 2.0 (included in [LICENSE](LICENSE))
+- Upstream copyright notice: Copyright 2023 Mistral AI and the HuggingFace Inc. team. All rights reserved.
+
+Original distribution file paths and SHA-256 hashes are recorded in each file's header. FrontierSplit modifications
+reorganize and rename symbols to match project conventions, remove unused task heads and optional configuration or
+training scaffolding, and narrow execution to the project's target inference path while retaining the upstream model
+computation.
 
 ## Attribution inherited through vLLM
 
