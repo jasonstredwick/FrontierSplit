@@ -4,9 +4,10 @@ This directory holds the architectural analysis and prescriptive engineering spe
 
 ## Current Documents
 
+* **[`architecture.md`](architecture.md)** — Current primary system architecture for high-bandwidth `TPU` / `HBM` `GPU` execution (coarse `L_stage`-layer stages, 4-chip sharding, bucketed Online Softmax wave containers, piggybacked prefill, tiered Host-RAM KV caching, and Stage-1 correctness contracts).
 * **[`evals.md`](evals.md)** — Evaluation suite (`LM Evaluation Harness`, `GuideLLM`; `RULER` deferred), reference parity methodology, and per-eval considerations.
 * **[`API.md`](API.md)** — `vLLM`-compatible OpenAI HTTP and streaming interface specification.
-* **[`paper/frontiersplit_technical_paper_draft2.md`](paper/frontiersplit_technical_paper_draft2.md)** — Analytical foundation, model/layer/KV byte anatomy, intra-layer `Attn+KV` $\to$ `FFN` partitioning, sequence chunking & interruption-interval striping, primary-source hardware Roofline modeling, and related-work comparison (`FlashDecoding`, `DistServe`, `Mooncake`, `vLLM afd-plugin` / `StepMesh`, `SGLang AFD`, `DeepInfer`).
+* **[`paper/frontiersplit_technical_paper_draft2.md`](paper/frontiersplit_technical_paper_draft2.md)** — Analytical Roofline foundation, model/layer/KV byte anatomy, Online Softmax math, related-work comparison, and prior intra-layer `Attn+KV` $\to$ `FFN` disaggregation analysis for lower-bandwidth / local hardware.
 
 ## Project Conventions & Agent Rules
 

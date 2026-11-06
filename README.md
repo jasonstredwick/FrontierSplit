@@ -3,25 +3,26 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
 
-**FrontierSplit** is a modular Python/PyTorch library and fleet-sizing toolkit for **distributed unquantized 16-bit (`BF16`/`FP16`) LLM inference** across commodity, older, and heterogeneous hardware, targeting **`Mistral-7B`** (Dense) and **`Mixtral-8x7B`** (MoE) as primary baseline models.
+**FrontierSplit** is a modular Python/PyTorch library for **distributed unquantized 16-bit (`BF16`) LLM inference** on high-bandwidth **`TPU`** and **`GPU`** clusters, targeting **`Mistral-7B`** (Dense) and **`Mixtral-8x7B`** (MoE) as primary baseline models.
 
 ---
 
 ## Core Design Principles
 
-1. **Compute-to-Data KV Disaggregation via Online Softmax:** Keep private per-session Key-Value caches pinned in memory while exchanging compact `8–32 KiB` single-token vectors over persistent zero-pickle binary TCP, merging sequence chunks via FP32 Online Softmax rescaling.
-2. **Composable Layer & Intra-Layer Topologies:** Support consolidated execution, multi-layer pipeline slicing across small-VRAM GPUs, and intra-layer **`Attn+KV` $\to$ KV-Stateless `FFN`** disaggregation (`W_qkv` + aligned KV chunks + ragged-edge tail local to `Attn+KV`; coalesced batching over $\Delta t_{\text{wait}}$ + 1-token fan-out on `FFN`).
-3. **Sequence Chunking & Interruption-Interval Striping:** Align historical KV blocks to fixed chunk boundaries, manage newly generated tokens in an active **ragged-edge** tail chunk, and expose a tunable **interruption-interval** chunk quantum supporting intra-request **self-striping** and inter-request **concurrency-striping**.
-4. **Roofline-Guided Fleet Planning:** Model resident vs. active bytes, physical vs. software-usable VRAM, global in-flight concurrency ($M$) vs. stage batch size ($B$), and idealized weight-only crossover ($B_{\text{crit}} \approx F_{\text{peak}} / \text{BW}_{\text{peak}}$) to identify when to consolidate, when to pipeline, and when to disaggregate.
+1. **Coarse Multi-Layer Flow Stages & Intra-Host Sharding:** Partition models into contiguous full-layer stages sized above host/network submission overhead, sharded intra-host across `TPU` (`ICI`) or `GPU` (`NVLink`) chips and connected across stages via persistent zero-pickle binary TCP.
+2. **Static-Shape KV Containers & `FP32` Online Softmax:** Manage session history in contiguous fixed-size KV blocks and execute mixed-bucket waves inside pre-compiled static containers via `FP32` Online Softmax reduction without runtime XLA graph recompilation.
+3. **Piggybacked Chunked Prefill & Tiered KV Caching:** Pack bounded prefill chunks into unused systolic batch rows alongside live decode waves, and offload/reload idle multi-turn KV blocks between device `HBM` and pinned Host CPU RAM at block granularity.
+4. **Explicit Roofline & Capacity Accounting:** Separate global pipeline concurrency ($M$) from stage batch size ($B$), resident weights from per-step active bytes read, and usable memory from physical stack sizes across high-bandwidth flow pipelines and prior low-bandwidth disaggregated topologies.
 
 ---
 
 ## Documentation & Conventions
 
 * **[`docs/README.md`](docs/README.md)** — Documentation index.
+* **[`docs/architecture.md`](docs/architecture.md)** — Primary system architecture for high-bandwidth `TPU` / `HBM` `GPU` flow execution and Stage-1 correctness contracts.
 * **[`evals/README.md`](evals/README.md)** — Evaluation runner setup, configuration, and commands.
 * **[`frontiersplit/models/experiments/README.md`](frontiersplit/models/experiments/README.md)** — Hugging Face reference and local baseline model experiments.
-* **[`docs/paper/frontiersplit_technical_paper_draft2.md`](docs/paper/frontiersplit_technical_paper_draft2.md)** — Full architectural analysis, intra-layer dataflow, chunking/striping mechanics, and primary-source hardware Roofline models.
+* **[`docs/paper/frontiersplit_technical_paper_draft2.md`](docs/paper/frontiersplit_technical_paper_draft2.md)** — Analytical Roofline foundations, Online Softmax math, and prior intra-layer `Attn+KV` $\to$ `FFN` disaggregation modeling for lower-bandwidth hardware.
 * **[`AGENTS.md`](AGENTS.md)** & **[`style_guide.md`](style_guide.md)** — Workspace execution rules, architectural invariants, and Python 3.14 coding conventions.
 
 ---

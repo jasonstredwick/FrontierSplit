@@ -15,8 +15,9 @@ These project-specific instructions override defaults that conflict with them.
   measurements, propose benchmarks, and design scenarios that test or falsify performance hypotheses.
 - Code represents the current architectural design, and benchmarks test where that design wins or loses. Keep claims
   grounded in explicit assumptions and measured behavior.
-- Use `docs/paper/frontiersplit_technical_paper_draft2.md` as the current architectural and analytical reference for
-  intra-layer partitioning, sequence chunking, transport math, and hardware Roofline modeling.
+- Use `docs/architecture.md` as the current system architecture specification (and
+  `docs/paper/frontiersplit_technical_paper_draft2.md` for analytical Roofline foundations and prior low-bandwidth
+  disaggregation modeling).
 
 ## Workspace boundary and execution
 
@@ -55,29 +56,20 @@ PYTHONPATH=. .venv/bin/python -X pycache_prefix=.__pycache__ path/to/script.py
 
 ## Architecture direction and invariants
 
-FrontierSplit is a modular distributed LLM inference library and fleet-sizing toolkit focused on unquantized 16-bit
-(`BF16` / `FP16`) execution across commodity, older, or heterogeneous hardware, using `Mistral-7B` (Dense) and
-`Mixtral-8x7B` (MoE) as the primary baseline models.
+FrontierSplit is a modular distributed LLM inference library focused on unquantized 16-bit (`BF16`) execution, using
+`Mistral-7B` (Dense) and `Mixtral-8x7B` (MoE) as the primary baseline models. Stage partitioning, static container
+execution, KV block management, and scheduling are specified in `docs/architecture.md` (with analytical Roofline
+foundations and prior low-bandwidth disaggregation design in `docs/paper/frontiersplit_technical_paper_draft2.md`).
 
-Core architectural invariants are:
+Repo-wide engineering invariants are:
 
 1. **Single coherent transport and protocol:** Use one explicit, zero-pickle binary TCP framing protocol across stages.
    Do not duplicate framing stacks across modules, depend on `numpy`, or wrap core dependencies (`torch`) in optional
    `try/except` import fallbacks.
-2. **Explicit separation of `Attn+KV` state from `FFN` execution:**
-   - `Attn+KV` stages own attention projections ($W_q, W_k, W_v, W_o$) and per-session KV caches. Historical KV blocks
-     align to fixed chunk boundaries, while newly generated tokens append to an active **ragged-edge** tail chunk that
-     migrates into the aligned store once full.
-   - `FFN` / expert stages hold zero KV state, coalesce ready activations over an explicit arrival window
-     ($\Delta t_{\text{wait}}$) to reuse resident weights across batch size $B$, and fan out single-token outputs to
-     each session's next-stage host.
-3. **Sequence chunking vs. request batching:** Distinguish cross-request weight batching ($B$ on `FFN` stages, bounded
-   deterministically by Dense layers and reduced stochastically on MoE layers) from per-session KV sequence chunking
-   along $S$ (supporting intra-request **self-striping** and inter-request **concurrency-striping** across a tunable
-   **interruption-interval** chunk quantum).
-4. **Explicit accounting:** Keep global in-flight pipeline concurrency ($M$) distinct from stage batch size ($B$),
+2. **Explicit accounting:** Keep global in-flight pipeline concurrency ($M$) distinct from stage batch size ($B$),
    resident model weights distinct from per-step active bytes read, physical memory stack sizes distinct from
-   software-usable VRAM, and binary byte units (`KiB`, `MiB`, `GiB`) distinct from decimal link rates (`GB/s`, `Gbps`).
+   software-usable accelerator memory, and binary byte units (`KiB`, `MiB`, `GiB`) distinct from decimal link rates
+   (`GB/s`, `Gbps`).
 
 ## Code style
 
